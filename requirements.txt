@@ -1,0 +1,9 @@
+mujoco>=3.3.0
+gymnasium>=1.0
+numpy>=1.24
+torch>=2.2
+robot_descriptions>=1.12
+tensorboard
+imageio
+imageio-ffmpeg
+pytest
