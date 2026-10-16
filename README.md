@@ -92,6 +92,54 @@ Run every command from the project root.
    python evaluate.py --ckpt runs/<name>/ckpt_latest.pt --render human --realtime
    ```
 
+## Command-line flags
+
+Defaults marked `PPOCfg` come from `config.py`.
+
+### `train.py`
+
+| flag | default | description |
+|---|---|---|
+| `--device {auto,cpu,cuda}` | `auto` | Torch device; `auto` uses CUDA when available |
+| `--num-envs N` | `16` (`PPOCfg.num_envs`) | Number of parallel envs |
+| `--rollout-steps N` | `64` (`PPOCfg.rollout_steps`) | Steps per env per PPO iteration |
+| `--total-steps N` | `200000000` (`PPOCfg.total_steps`) | Total env steps to train for |
+| `--lr LR` | `3e-4` (`PPOCfg.lr`) | Learning rate |
+| `--seed N` | `0` | Seed for torch, numpy and the envs (env `i` gets `seed*1000 + i`) |
+| `--level L` | `0.0` | Initial curriculum level, from 0 to 1 |
+| `--fixed-level` | off | Disable the automatic curriculum and stay at `--level` |
+| `--serial` | off | Run envs in the main process instead of subprocesses, for debugging (always on when `--num-envs 1`) |
+| `--logdir DIR` | `runs` | Parent directory for runs |
+| `--name NAME` | `posevel_<timestamp>` | Run name; output goes to `<logdir>/<name>` |
+| `--resume CKPT` | none | Checkpoint to resume from; its env config is used instead of `config.py` |
+| `--save-every N` | `50` (`PPOCfg.save_every`) | Checkpoint interval in iterations |
+| `--eps-p LEVEL0 LEVEL1` | `0.08 0.03` | Success position tolerance in meters at curriculum level 0 and 1. Also overrides a resumed checkpoint's config |
+| `--sigma-p S` | `0.05` | Position scale in meters of the phase distance D used by the goal reward. Also overrides a resumed checkpoint's config |
+
+### `evaluate.py`
+
+| flag | default | description |
+|---|---|---|
+| `--ckpt CKPT` | none | Checkpoint to load; the env config and curriculum level are taken from it |
+| `--policy {ckpt,random,zero}` | `ckpt` if `--ckpt` is given, else `random` | Which policy drives the robot |
+| `--episodes N` | `5` | Number of episodes |
+| `--render {none,human,rgb_array}` | `none` | Render mode; `human` opens the viewer |
+| `--video PATH` | none | Write an mp4 (implies `--render rgb_array`) |
+| `--level L` | from checkpoint, else `0` | Curriculum level |
+| `--stochastic` | off | Sample actions instead of using the mean |
+| `--realtime` | off | Slow down to real time in the viewer |
+| `--seed N` | `0` | Seed for the env and the random policy |
+| `--device DEVICE` | `cpu` | Torch device for the policy |
+| `--table-start` | off | Every episode starts with a new tool on the table (no in-hand starts, no soft resets); the arm still stays where the previous episode left it |
+
+### `scene.py`
+
+| flag | default | description |
+|---|---|---|
+| `--view` | off | Open the interactive MuJoCo viewer |
+| `--seed N` | `0` | Seed for the tool and goal |
+| `--level L` | `0.0` | Curriculum level (affects in-hand starts) |
+
 ## Files
 
 | file | contents |
