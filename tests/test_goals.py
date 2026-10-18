@@ -1,6 +1,14 @@
 import numpy as np
 
-from goals import segment_point_distance
+from goals import plane_crossing, segment_point_distance
+
+
+def test_plane_crossing():
+    d = np.array([1.0, 0, 0])
+    assert np.isclose(plane_crossing([-0.1, 0.02, 0], [0.1, 0.02, 0], [0, 0, 0], d), 0.02)
+    assert plane_crossing([0.1, 0, 0], [-0.1, 0, 0], [0, 0, 0], d) is None  # backward
+    assert plane_crossing([-0.2, 0, 0], [-0.1, 0, 0], [0, 0, 0], d) is None  # not reached
+    assert np.isclose(plane_crossing([-0.1, 0, 0], [0.0, 0, 0], [0, 0, 0], d), 0.0)  # landing on it counts
 
 
 def test_segment_distance():

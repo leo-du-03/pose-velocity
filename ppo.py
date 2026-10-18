@@ -103,21 +103,41 @@ class ReturnScaler:
 
 
 class PPO:
+    """Separate Adam optimizers (and gradient clipping) for the actor and the critic, so large value
+    gradients can't crowd out the policy gradient under a shared norm clip."""
+
     def __init__(self, agent: ActorCritic, cfg: PPOCfg):
         self.agent, self.cfg = agent, cfg
-        self.opt = torch.optim.Adam(agent.parameters(), lr=cfg.lr, eps=1e-5)
+        self.actor_params = list(agent.actor.parameters()) + [agent.log_std]
+        self.critic_params = list(agent.critic.parameters())
+        self.opt_actor = torch.optim.Adam(self.actor_params, lr=cfg.lr, eps=1e-5)
+        self.opt_critic = torch.optim.Adam(self.critic_params, lr=cfg.lr, eps=1e-5)
         self.lr = cfg.lr
 
-    def update(self, b: dict) -> dict:
-        """b: flattened rollout tensors (obs, priv already normalized)."""
+    def set_lr(self, lr: float) -> None:
+        self.lr = lr
+        for opt in (self.opt_actor, self.opt_critic):
+            for g in opt.param_groups:
+                g["lr"] = lr
+
+    def state_dict(self) -> dict:
+        return {"actor": self.opt_actor.state_dict(), "critic": self.opt_critic.state_dict()}
+
+    def load_state_dict(self, s: dict) -> None:
+        self.opt_actor.load_state_dict(s["actor"])
+        self.opt_critic.load_state_dict(s["critic"])
+
+    def update(self, b: dict, update_actor: bool = True) -> dict:
+        """b: flattened rollout tensors (obs, priv already normalized).
+
+        update_actor=False trains only the critic (critic warmup after behavior cloning: advantages from an
+        untrained critic would otherwise push a cloned actor off the demonstrated behavior)."""
         cfg = self.cfg
         n = b["obs"].shape[0]
         mb_size = max(1, n // cfg.minibatches)
         stats = {"pg_loss": [], "v_loss": [], "entropy": [], "kl": [], "clipfrac": []}
-        # KL is measured against the rollout policy, so it grows over the update. It is used two ways:
-        # stop stepping once it passes kl_stop_mult * kl_target, and adapt lr once at the end from the
-        # final value. (Adapting per minibatch made lr ramp from the floor and overshoot inside every update.)
-        kl_stop = cfg.kl_stop_mult * cfg.kl_target
+        # KL is measured against the rollout policy, so it grows over the update. Stepping stops once it
+        # passes kl_stop; with adaptive_lr the final value also adapts lr once per update.
         final_kl, steps, early_stop = 0.0, 0, False
         for _ in range(cfg.epochs):
             if early_stop:
@@ -134,7 +154,7 @@ class PPO:
                     kl = ((ratio - 1) - log_ratio).mean()
                     clipfrac = ((ratio - 1.0).abs() > cfg.clip).float().mean()
                 final_kl = float(kl)
-                if final_kl > kl_stop:
+                if final_kl > cfg.kl_stop:
                     early_stop = True
                     break
 
@@ -147,31 +167,34 @@ class PPO:
                 v_clipped = v_old + (v - v_old).clamp(-cfg.value_clip, cfg.value_clip)
                 v_loss = 0.5 * torch.max((v - ret) ** 2, (v_clipped - ret) ** 2).mean()
 
-                loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * entropy
-                self.opt.zero_grad(set_to_none=True)
+                # The actor and critic share no parameters, so one backward fills both gradient sets.
+                loss = v_loss + (pg_loss - cfg.ent_coef * entropy if update_actor else 0.0)
+                self.opt_actor.zero_grad(set_to_none=True)
+                self.opt_critic.zero_grad(set_to_none=True)
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.agent.parameters(), cfg.max_grad_norm)
-                self.opt.step()
+                if update_actor:
+                    nn.utils.clip_grad_norm_(self.actor_params, cfg.max_grad_norm)
+                    self.opt_actor.step()
+                nn.utils.clip_grad_norm_(self.critic_params, cfg.max_grad_norm)
+                self.opt_critic.step()
                 steps += 1
 
                 for k, val in (("pg_loss", pg_loss), ("v_loss", v_loss), ("entropy", entropy), ("kl", kl),
                                ("clipfrac", clipfrac)):
-                    stats[k].append(float(val))
+                    stats[k].append(float(val.detach()))
 
         if cfg.adaptive_lr:
             # Hitting the stop counts as too large a step, else lr could sit too high with every update cut short.
             if early_stop or final_kl > 2.0 * cfg.kl_target:
-                self.lr = max(self.lr / 1.5, 1e-6)
+                self.set_lr(max(self.lr / 1.5, 1e-5))
             elif final_kl < 0.5 * cfg.kl_target:
-                self.lr = min(self.lr * 1.5, 1e-2)
-            for g in self.opt.param_groups:
-                g["lr"] = self.lr
+                self.set_lr(min(self.lr * 1.5, 1e-2))
 
         out = {k: float(np.mean(v)) for k, v in stats.items()}
         out["final_kl"] = final_kl
         out["steps"] = steps
         out["lr"] = self.lr
-        out["std"] = float(torch.exp(self.agent.log_std).mean())
+        out["std"] = float(torch.exp(self.agent.log_std.detach()).mean())
         return out
 
 

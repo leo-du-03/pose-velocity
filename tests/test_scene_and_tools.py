@@ -27,8 +27,18 @@ def test_tools_compile_with_mass_bounds():
         assert np.isclose(np.linalg.norm(tool.head_axis), 1.0)
 
 
-def test_tools_rest_on_table(env):
+def test_weld_compiles_with_grip_constraint():
+    b = SceneBuilder(SceneCfg())
+    tool = sample_tool(np.random.default_rng(0), ToolCfg())
+    m = b.compile(tool, weld=True)
+    assert m.neq == 1 and m.eq(0).name == "grip"
+    np.testing.assert_allclose(m.eq_data[0, :3], 0.0)  # the anchor must be zero (MjSpec defaults it to 0 1 0)
+    assert b.compile(tool, weld=False).neq == 0
+
+
+def test_tools_rest_on_table(physical_env):
     """Respawned tools should settle on the table without flying off."""
+    env = physical_env
     env.set_curriculum(1.0)  # no in-hand starts
     for _ in range(15):
         env.reset(options={"kind": "respawn"})

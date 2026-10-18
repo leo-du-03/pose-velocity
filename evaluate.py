@@ -3,6 +3,7 @@
 Examples:
   python evaluate.py --policy random --render human            # watch random actions live
   python evaluate.py --policy zero --episodes 3 --video zero.mp4
+  python evaluate.py --policy oracle --episodes 50             # scripted strike: checks goals are feasible
   python evaluate.py --ckpt runs/<name>/ckpt_latest.pt --render human --level 1.0
 """
 from __future__ import annotations
@@ -14,13 +15,18 @@ import numpy as np
 
 from config import EnvCfg
 from env import PoseVelocityEnv
+from oracle import Oracle
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", default=None)
-    p.add_argument("--policy", default=None, choices=["ckpt", "random", "zero"],
+    p.add_argument("--policy", default=None, choices=["ckpt", "random", "zero", "oracle"],
                    help="defaults to ckpt if --ckpt is given, else random")
+    p.add_argument("--grip-mode", default=None, choices=["weld", "physical"],
+                   help="override the grip mode (default: from checkpoint, else config.py)")
+    p.add_argument("--action-mode", default=None, choices=["head_twist", "joint"],
+                   help="override the action mode (default: from checkpoint, else config.py)")
     p.add_argument("--episodes", type=int, default=5)
     p.add_argument("--render", default="none", choices=["none", "human", "rgb_array"])
     p.add_argument("--video", default=None, help="write an mp4 (implies --render rgb_array)")
@@ -30,8 +36,8 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     p.add_argument("--table-start", action="store_true",
-                   help="every episode starts with a new tool on the table (no in-hand starts, no soft resets); "
-                        "the arm still stays where the previous episode left it")
+                   help="physical grip: every episode starts with a new tool on the table (no in-hand starts, "
+                        "no soft resets); the arm still stays where the previous episode left it")
     args = p.parse_args()
 
     policy = args.policy or ("ckpt" if args.ckpt else "random")
@@ -48,8 +54,15 @@ def main():
         agent.eval()
     if args.level is not None:
         level = args.level
+    if args.grip_mode is not None:
+        cfg.grip_mode = args.grip_mode
+    if args.action_mode is not None:
+        cfg.action_mode = args.action_mode
     if args.table_start:
+        if cfg.grip_mode != "physical":
+            p.error("--table-start needs --grip-mode physical")
         cfg.curriculum.start_in_hand_prob = (0.0, 0.0)
+    oracle = Oracle() if policy == "oracle" else None
 
     render_mode = "rgb_array" if args.video else (None if args.render == "none" else args.render)
     env = PoseVelocityEnv(cfg, render_mode=render_mode)
@@ -72,6 +85,8 @@ def main():
                 action = rng.uniform(-1, 1, env.action_space.shape)
             elif policy == "zero":
                 action = np.zeros(env.action_space.shape)
+            elif policy == "oracle":
+                action = oracle(env)
             else:
                 import torch
 
@@ -90,12 +105,16 @@ def main():
                 time.sleep(max(0.0, dt - (time.time() - t0)))
         e = info["episode"]
         results.append(e)
+        ps = e["pass"]
+        pass_txt = (f"pass d {ps['d_perp'] * 100:4.1f}cm v {ps['dv_frac']:.2f}xv axis {ps['theta_deg']:3.0f}deg"
+                    if ps else "no pass")
         print(f"episode {ep}: start {start_kind:7s}  return {ep_ret:8.2f}  len {e['length']:4d}  "
-              f"success {bool(e['success'])}  dropped {bool(e['dropped'])}  grasped {bool(e['ever_grasped'])}  "
-              f"d_min {e['d_min']:.2f}")
+              f"success {bool(e['success'])}  dropped {bool(e['dropped'])}  {pass_txt}  "
+              f"d_min {e['d_min'] * 100:.1f}cm")
         obs, info = env.reset(options=reset_opts)
 
     print(f"\nsuccess rate {np.mean([r['success'] for r in results]):.2f}  "
+          f"pass rate {np.mean([r['passed'] for r in results]):.2f}  "
           f"drop rate {np.mean([r['dropped'] for r in results]):.2f}  "
           f"mean return {np.mean([r['return'] for r in results]):.2f}")
     if args.video and frames:

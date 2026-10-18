@@ -297,10 +297,27 @@ class SceneBuilder:
         self.cfg = cfg
         self.base_spec, self.info = build_base_spec(cfg)
 
-    def compile(self, tool: ToolParams) -> mujoco.MjModel:
+    def compile(self, tool: ToolParams, weld: bool = False) -> mujoco.MjModel:
+        """weld=True adds an equality "grip" (palm -> tool) and turns off hand-tool collisions.
+
+        The weld's relative pose is set at runtime (eq_data[3:10], tool pose in the palm frame, see
+        PoseVelocityEnv._weld_tool); its anchor eq_data[0:3] must stay zero.
+        """
         spec = self._copy_base()
         add_tool(spec, tool, park_pos=(float(self.info.table_center[0]), float(self.info.table_center[1]), 3.0))
-        return spec.compile()
+        if weld:
+            eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_WELD, name="grip", name1=self.info.palm_body,
+                                   name2="tool", objtype=mujoco.mjtObj.mjOBJ_BODY)
+            eq.solref = list(self.cfg.weld_solref)
+            for name in self.info.robot_bodies:
+                if name.startswith(HAND_PREFIX):
+                    spec.add_exclude(bodyname1=name, bodyname2="tool")
+        m = spec.compile()
+        if weld:
+            m.eq_data[0, :] = 0.0
+            m.eq_data[0, 6] = 1.0  # identity quaternion until the grasp is set
+            m.eq_data[0, 10] = 1.0  # torquescale
+        return m
 
     def _copy_base(self) -> mujoco.MjSpec:
         try:
