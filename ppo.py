@@ -114,7 +114,14 @@ class PPO:
         n = b["obs"].shape[0]
         mb_size = max(1, n // cfg.minibatches)
         stats = {"pg_loss": [], "v_loss": [], "entropy": [], "kl": [], "clipfrac": []}
+        # KL is measured against the rollout policy, so it grows over the update. It is used two ways:
+        # stop stepping once it passes kl_stop_mult * kl_target, and adapt lr once at the end from the
+        # final value. (Adapting per minibatch made lr ramp from the floor and overshoot inside every update.)
+        kl_stop = cfg.kl_stop_mult * cfg.kl_target
+        final_kl, steps, early_stop = 0.0, 0, False
         for _ in range(cfg.epochs):
+            if early_stop:
+                break
             perm = torch.randperm(n, device=b["obs"].device)
             for start in range(0, n, mb_size):
                 idx = perm[start:start + mb_size]
@@ -126,6 +133,10 @@ class PPO:
                 with torch.no_grad():
                     kl = ((ratio - 1) - log_ratio).mean()
                     clipfrac = ((ratio - 1.0).abs() > cfg.clip).float().mean()
+                final_kl = float(kl)
+                if final_kl > kl_stop:
+                    early_stop = True
+                    break
 
                 adv = b["adv"][idx]
                 adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -141,19 +152,24 @@ class PPO:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.agent.parameters(), cfg.max_grad_norm)
                 self.opt.step()
-
-                if cfg.adaptive_lr:
-                    if kl > 2.0 * cfg.kl_target:
-                        self.lr = max(self.lr / 1.5, 1e-6)
-                    elif kl < 0.5 * cfg.kl_target:
-                        self.lr = min(self.lr * 1.5, 1e-2)
-                    for g in self.opt.param_groups:
-                        g["lr"] = self.lr
+                steps += 1
 
                 for k, val in (("pg_loss", pg_loss), ("v_loss", v_loss), ("entropy", entropy), ("kl", kl),
                                ("clipfrac", clipfrac)):
                     stats[k].append(float(val))
+
+        if cfg.adaptive_lr:
+            # Hitting the stop counts as too large a step, else lr could sit too high with every update cut short.
+            if early_stop or final_kl > 2.0 * cfg.kl_target:
+                self.lr = max(self.lr / 1.5, 1e-6)
+            elif final_kl < 0.5 * cfg.kl_target:
+                self.lr = min(self.lr * 1.5, 1e-2)
+            for g in self.opt.param_groups:
+                g["lr"] = self.lr
+
         out = {k: float(np.mean(v)) for k, v in stats.items()}
+        out["final_kl"] = final_kl
+        out["steps"] = steps
         out["lr"] = self.lr
         out["std"] = float(torch.exp(self.agent.log_std).mean())
         return out

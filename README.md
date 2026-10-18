@@ -82,7 +82,8 @@ Run every command from the project root.
    python train.py --device cpu --num-envs 4 --total-steps 20000
    ```
    - The output should show iterations with `sps`, return, success and grasp rates.
-   - It saves `runs/<name>/ckpt_latest.pt`.
+   - It saves `runs/<name>/ckpt_latest.pt`, and `runs/<name>/ckpt_best.pt` whenever the success rate over the
+     last 200 episodes beats the previous best at the same or a higher curriculum level.
    - `--device auto` uses CUDA when available.
 
 6. **Real training run and monitoring**

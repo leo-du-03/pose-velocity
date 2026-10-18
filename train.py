@@ -15,12 +15,13 @@ import time
 from collections import defaultdict, deque
 
 import numpy as np
-import torch
 
 from config import EnvCfg, PPOCfg
 from env import make_env
-from ppo import PPO, ActorCritic, ReturnScaler, compute_gae
 from vec_env import SerialVecEnv, SubprocVecEnv
+
+# torch / ppo are imported inside the functions that use them: env workers are started with "spawn",
+# which re-imports this module in every worker, and a top-level torch import costs ~350 MB per worker.
 
 
 class Curriculum:
@@ -81,6 +82,8 @@ def episode_diagnostics(ep_stats, cc, level: float) -> dict:
 
 
 def resolve_device(name: str) -> torch.device:
+    import torch
+
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if name == "cuda" and not torch.cuda.is_available():
@@ -111,17 +114,28 @@ def parse_args():
     return p.parse_args()
 
 
-def save_checkpoint(path, agent, ppo, scaler, env_cfg, ppo_cfg, curriculum, global_step, iteration):
+def save_checkpoint(path, agent, ppo, scaler, env_cfg, ppo_cfg, curriculum, ep_stats, global_step, iteration,
+                    best):
+    import torch
+
     torch.save({
+        "best": best,
         "agent": agent.state_dict(), "optimizer": ppo.opt.state_dict(), "lr": ppo.lr,
         "return_scaler": scaler.state_dict(), "env_cfg": env_cfg, "ppo_cfg": ppo_cfg,
         "obs_dim": agent.obs_rms.mean.shape[0], "priv_dim": agent.priv_rms.mean.shape[0],
         "act_dim": agent.log_std.shape[0], "level": curriculum.level,
+        # Recent-episode windows: without them a resumed run reports (and lets the curriculum react to)
+        # stats from only the first few, mostly-dropped episodes after the synchronized full reset.
+        "curriculum_window": list(curriculum.window), "ep_stats": list(ep_stats),
         "global_step": global_step, "iteration": iteration,
     }, path)
 
 
 def main():
+    import torch
+
+    from ppo import PPO, ActorCritic, ReturnScaler, compute_gae
+
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -169,6 +183,12 @@ def main():
     scaler = ReturnScaler(args.num_envs, ppo_cfg.gamma)
     curriculum = Curriculum(env_cfg.curriculum, args.level)
     global_step, start_iter = 0, 0
+    # ckpt_best.pt is ranked by (curriculum level, success over the last ep_stats.maxlen episodes): a policy
+    # that has advanced the curriculum beats any at a lower level. Only full windows count.
+    best_path = os.path.join(run_dir, "ckpt_best.pt")
+    best = None
+    if ckpt is not None and os.path.exists(best_path):
+        best = ckpt.get("best")  # only meaningful if that best checkpoint is in this run dir
     if ckpt is not None:
         agent.load_state_dict(ckpt["agent"])
         ppo.opt.load_state_dict(ckpt["optimizer"])
@@ -190,6 +210,12 @@ def main():
         "dones": torch.zeros((T, N), **f32),
     }
     ep_stats = deque(maxlen=200)
+    if ckpt is not None:
+        # Older checkpoints predate these keys; they resume with empty windows as before.
+        curriculum.window.extend(ckpt.get("curriculum_window", []))
+        ep_stats.extend(ckpt.get("ep_stats", []))
+    # Episodes finished since the last level change; ckpt_best only considers windows entirely at one level.
+    eps_at_level = len(ep_stats)
     num_iters = ppo_cfg.total_steps // (T * N)
     t_start = time.time()
 
@@ -220,6 +246,7 @@ def main():
                 if e is not None:
                     ep_stats.append(e)
                     curriculum.record(e["success"])
+                    eps_at_level += 1
         global_step += T * N
 
         with torch.no_grad():
@@ -236,6 +263,7 @@ def main():
 
         if not args.fixed_level and curriculum.update():
             venv.call("set_curriculum", curriculum.level)
+            eps_at_level = 0
             print(f"  curriculum level -> {curriculum.level:.2f}")
 
         sps = T * N / (time.time() - t_iter)
@@ -261,7 +289,8 @@ def main():
         print(f"it {it:5d} step {global_step:10d} | sps {sps:7.0f} | lvl {curriculum.level:.2f} | "
               f"ret {log.get('ep/return', float('nan')):8.2f} | succ {log.get('ep/success', float('nan')):.3f} | "
               f"drop {log.get('ep/dropped', float('nan')):.3f} | grasp {log.get('ep/ever_grasped', float('nan')):.3f} | "
-              f"kl {train_stats['kl']:.4f} lr {train_stats['lr']:.1e} std {train_stats['std']:.3f}")
+              f"kl {train_stats['final_kl']:.4f} ({train_stats['steps']} steps) lr {train_stats['lr']:.1e} "
+              f"std {train_stats['std']:.3f}")
         if it % 10 == 0 and "closest/dp_cm" in log:
             g = lambda k: log.get(k, float("nan"))  # noqa: E731
             print(f"  succ by start: soft {g('by_start/soft/success'):.2f} in_hand {g('by_start/in_hand/success'):.2f} "
@@ -269,9 +298,17 @@ def main():
                   f"closest: {g('closest/dp_cm'):.1f}cm {g('closest/dv_frac'):.2f}xv {g('closest/theta_deg'):.0f}deg | "
                   f"ok pos {g('closest/ok_pos'):.2f} vel {g('closest/ok_vel'):.2f} axis {g('closest/ok_axis'):.2f}")
 
+        if eps_at_level >= ep_stats.maxlen:
+            score = (curriculum.level, log["ep/success"])
+            if best is None or score > tuple(best):
+                best = score
+                save_checkpoint(best_path, agent, ppo, scaler, env_cfg, ppo_cfg, curriculum, ep_stats,
+                                global_step, it, best)
+                print(f"  new best: level {score[0]:.2f} success {score[1]:.3f} -> saved {best_path}")
+
         if (it + 1) % ppo_cfg.save_every == 0 or it == num_iters - 1:
             path = os.path.join(run_dir, "ckpt_latest.pt")
-            save_checkpoint(path, agent, ppo, scaler, env_cfg, ppo_cfg, curriculum, global_step, it)
+            save_checkpoint(path, agent, ppo, scaler, env_cfg, ppo_cfg, curriculum, ep_stats, global_step, it, best)
             print(f"  saved {path}")
 
     if num_iters <= start_iter:

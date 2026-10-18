@@ -149,7 +149,11 @@ class PPOCfg:
     ent_coef: float = 0.0
     max_grad_norm: float = 1.0
     kl_target: float = 0.016
+    # lr is adapted once per update from the KL the whole update produced: /1.5 if the update was stopped early
+    # or ended above 2 x target, x1.5 if it ended below 0.5 x target.
     adaptive_lr: bool = True
+    # Stop the update's remaining minibatch steps once KL to the rollout policy exceeds this multiple of kl_target.
+    kl_stop_mult: float = 1.5
     actor_hidden: Tuple[int, ...] = (512, 256, 128)
     critic_hidden: Tuple[int, ...] = (512, 512, 256)
     init_log_std: float = -0.7
