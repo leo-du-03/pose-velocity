@@ -67,3 +67,18 @@ def angle_between(a, b) -> float:
 def rot6d(mat) -> np.ndarray:
     """Continuous 6D rotation representation: first two columns of the rotation matrix."""
     return np.asarray(mat).reshape(3, 3)[:, :2].T.reshape(-1)
+
+
+def mat_to_quat(mat) -> np.ndarray:
+    q = np.empty(4)
+    mujoco.mju_mat2Quat(q, np.asarray(mat, dtype=np.float64).reshape(-1))
+    return q
+
+
+def rotation_error(q_from, q_to) -> np.ndarray:
+    """Rotation vector (world frame, axis * angle in [0, pi]) that takes orientation q_from onto q_to."""
+    e = quat_mul(q_to, np.array([q_from[0], -q_from[1], -q_from[2], -q_from[3]]))
+    if e[0] < 0.0:
+        e = -e
+    s = float(np.linalg.norm(e[1:]))
+    return np.zeros(3) if s < 1e-12 else 2.0 * np.arctan2(s, e[0]) * e[1:] / s

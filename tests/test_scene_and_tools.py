@@ -36,6 +36,22 @@ def test_weld_compiles_with_grip_constraint():
     assert b.compile(tool, weld=False).neq == 0
 
 
+def test_grasp_scene_starts_floating():
+    """Grasp grip: the grip weld and the holder start inactive, the tool is gravity compensated, and only the hand
+    lacks collision bit 2 (so the weld can switch off hand-tool contacts alone)."""
+    b = SceneBuilder(SceneCfg())
+    tool = sample_tool(np.random.default_rng(0), ToolCfg())
+    m = b.compile(tool, weld=True, grasp=True)
+    assert [m.eq(i).name for i in range(m.neq)] == ["grip", "hold"]
+    assert not m.eq_active0.any()
+    np.testing.assert_allclose(m.eq_data[:, :3], 0.0)
+    assert m.body_gravcomp[m.body("tool").id] == 1.0
+    for g in range(m.ngeom):
+        if m.geom_contype[g]:
+            in_hand = m.body(int(m.geom_bodyid[g])).name.startswith("hand/")
+            assert bool(m.geom_contype[g] & 2) != in_hand
+
+
 def test_tools_rest_on_table(physical_env):
     """Respawned tools should settle on the table without flying off."""
     env = physical_env

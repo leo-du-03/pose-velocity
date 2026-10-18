@@ -54,7 +54,9 @@ def episode_diagnostics(ep_stats, cc, level: float) -> dict:
     """Breakdowns that show where the policy is stuck.
 
     by_start/<type>/*  episodes split by how they started: weld "soft" (next goal, same grip), "regrip" or
-                       "full"; physical "soft", "in_hand" (scripted grasp at respawn) or "table"
+                       "full"; grasp "soft", "float" (floating tool to grasp; ever_grasped is the grasp rate,
+                       dropped the knock rate) or "regrip" (welded start); physical "soft", "in_hand" (scripted
+                       grasp at respawn) or "table"
     pass/*             error components at each pass (goal-plane crossing): crossing distance, velocity error
                        as a fraction of goal speed, axis error, and the fraction of passes meeting each tolerance
     """
@@ -112,8 +114,10 @@ def parse_args():
     p.add_argument("--eval-envs", type=int, default=2,
                    help="envs that act deterministically (policy mean) and stay out of the PPO batch; their success "
                         "drives the curriculum and ckpt_best (0: use the stochastic training episodes)")
-    p.add_argument("--grip-mode", default=None, choices=["weld", "physical"],
+    p.add_argument("--grip-mode", default=None, choices=["weld", "physical", "grasp"],
                    help="override EnvCfg.grip_mode (also on --resume)")
+    p.add_argument("--regrip-every", type=int, default=None,
+                   help="override EnvCfg.regrip_every: goals per tool and grip (also on --resume)")
     p.add_argument("--action-mode", default=None, choices=["head_twist", "joint"],
                    help="override EnvCfg.action_mode (also on --resume)")
     p.add_argument("--seed", type=int, default=0)
@@ -193,6 +197,8 @@ def main():
         env_cfg.grip_mode = args.grip_mode
     if args.action_mode is not None:
         env_cfg.action_mode = args.action_mode
+    if args.regrip_every is not None:
+        env_cfg.regrip_every = args.regrip_every
     if args.eps_p is not None:
         env_cfg.curriculum.eps_p = tuple(args.eps_p)
     if args.sigma_p is not None:

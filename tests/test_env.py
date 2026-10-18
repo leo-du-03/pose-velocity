@@ -5,17 +5,19 @@ import pytest
 import mathutils as mu
 
 
-def test_check_env(cfg):
+@pytest.mark.parametrize("grip_mode", ["weld", "grasp"])
+def test_check_env(cfg, grip_mode):
     from gymnasium.utils.env_checker import check_env
 
     from env import PoseVelocityEnv
 
+    cfg.grip_mode = grip_mode
     env = PoseVelocityEnv(cfg)
     check_env(env, skip_render_check=True)
     env.close()
 
 
-@pytest.mark.parametrize("env_fixture", ["env", "physical_env"])
+@pytest.mark.parametrize("env_fixture", ["env", "physical_env", "grasp_env"])
 def test_random_rollout_is_finite(env_fixture, request):
     env = request.getfixturevalue(env_fixture)
     rng = np.random.default_rng(0)
@@ -247,7 +249,7 @@ def test_rushing_hands_back_the_approach_reward(env):
 
 def _speed_scaled_oracle(mult):
     """The oracle, but striking at mult x the goal speed."""
-    from evaluate import Oracle
+    from oracle import Oracle
 
     class Scaled(Oracle):
         def __call__(self, env):
@@ -351,9 +353,9 @@ def test_scripted_pass_through_succeeds(physical_cfg):
 
 
 def test_oracle_succeeds(cfg):
-    """The scripted strike (evaluate.Oracle) succeeds on most weld goals: they are feasible."""
+    """The scripted strike (oracle.Oracle) succeeds on most weld goals: they are feasible."""
     from env import PoseVelocityEnv
-    from evaluate import Oracle
+    from oracle import Oracle
 
     env = PoseVelocityEnv(cfg)
     env.reset(seed=1)

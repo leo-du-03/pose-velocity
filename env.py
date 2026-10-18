@@ -5,6 +5,9 @@ Grip modes (EnvCfg.grip_mode)
 * weld      (Stage A) the tool is welded to the palm at a sampled grasp, fingers are frozen and only the
             arm is controlled. Goals are sampled from arm configurations, so every goal is reachable.
 * physical  the tool starts on the table or in a scripted grasp and must be grasped and held by the hand.
+* grasp     a new tool floats above the table (gravity compensated) until grasped or knocked. Closing the hand
+            (1-D grip action) on its handle turns on the weld at the actual relative pose; from then on it is weld
+            mode. Knocking the floating tool is a drop.
 
 Episode rules (one episode = one goal = one attempt)
 -----------------------------------------------------
@@ -18,6 +21,7 @@ Episode rules (one episode = one goal = one attempt)
 Reset kinds (reported in info["reset_kind"]):
   soft     tool still held: keep the full physics state, resample only the goal.
   regrip   weld: new random tool and grasp every `regrip_every` goals; the arm stays where it is.
+           grasp: new floating tool, after `regrip_every` goals or an episode that ended without a grasp.
   respawn  physical, tool not held: new random tool, rebuild model, copy robot state across, place tool.
   full     re-home the arm, then a new tool (and grasp, for weld).
 
@@ -37,7 +41,7 @@ from gymnasium.utils import seeding
 
 import mathutils as mu
 from config import EnvCfg
-from goals import Goal, GoalSampler, ReachMap, plane_crossing
+from goals import Goal, GoalSampler, ReachMap, plane_crossing, segment_point_distance
 from rewards import approach_distance, grasp_potential, pass_quality, track_quality
 from scene import SceneBuilder
 from tool_gen import ToolParams, sample_tool
@@ -59,11 +63,20 @@ class PoseVelocityEnv(gym.Env):
     def __init__(self, cfg: Optional[EnvCfg] = None, render_mode: Optional[str] = None):
         super().__init__()
         self.cfg = cfg or EnvCfg()
-        if self.cfg.grip_mode not in ("weld", "physical"):
-            raise ValueError(f"grip_mode must be 'weld' or 'physical', got {self.cfg.grip_mode!r}")
+        if self.cfg.grip_mode not in ("weld", "physical", "grasp"):
+            raise ValueError(f"grip_mode must be 'weld', 'physical' or 'grasp', got {self.cfg.grip_mode!r}")
         if self.cfg.action_mode not in ("head_twist", "joint"):
             raise ValueError(f"action_mode must be 'head_twist' or 'joint', got {self.cfg.action_mode!r}")
-        self.weld = self.cfg.grip_mode == "weld"
+        # Grasp mode is weld mode with a grasp phase in front: self.weld covers both, self.welded says whether the
+        # weld is on right now (always in weld mode).
+        self.grasp_mode = self.cfg.grip_mode == "grasp"
+        self.weld = self.cfg.grip_mode in ("weld", "grasp")
+        self.welded = self.cfg.grip_mode == "weld"
+        self.knocked = False
+        self._goal_q_center: Optional[np.ndarray] = None
+        self._pending_goal: Optional[Goal] = None
+        c = self.cfg
+        self.grip_point_local = np.array([*c.grasp_palm_xy, c.grasp_palm_face - 0.02])  # nominal handle center
         self.render_mode = render_mode
         self._np_random, _ = seeding.np_random(self.cfg.seed)
         self.builder = SceneBuilder(self.cfg.scene)
@@ -82,21 +95,24 @@ class PoseVelocityEnv(gym.Env):
         self.tool: ToolParams = sample_tool(self.np_random, self.cfg.tool)
         self._load_model(self.tool, preserve=False)
         self._set_home(noise=False)
+        self.palm_home_quat = self.data.xquat[self.palm_id].copy()  # reference for the canonical grasp's roll
 
         self.reach = ReachMap.cached(self.model, self.arm_qadr, self.arm_range, self.palm_id,
                                      min_z=self.rinfo.table_top + 0.05,
                                      n_samples=self.cfg.goal.reach_samples, voxel=self.cfg.goal.reach_voxel)
         self.goal_sampler = GoalSampler(self.cfg.goal, self.rinfo, self.reach)
 
-        self.n_act = self.n_arm_act + (0 if self.weld else len(self.hand_jids))
+        self.n_act = self.n_arm_act + (1 if self.grasp_mode else 0 if self.weld else len(self.hand_jids))
         self.action_space = spaces.Box(-1.0, 1.0, (self.n_act,), np.float32)
         self.prev_action = np.zeros(self.n_act)
         self._a_filt = np.zeros(self.n_act)
-        if self.weld:
+        self.start_type = "full" if self.weld else "table"
+        if self.grasp_mode:
+            self.start_type = self._place_grasp_tool()
+        elif self.weld:
             self._weld_tool()
         self._update_contacts()
-        self._init_episode_state(keep_grasp=self.weld)
-        self.start_type = "full" if self.weld else "table"
+        self._init_episode_state(keep_grasp=self.welded)
         self._sample_goal()
         obs = self._get_obs()
         self.observation_space = spaces.Box(-np.inf, np.inf, obs.shape, np.float32)
@@ -105,7 +121,8 @@ class PoseVelocityEnv(gym.Env):
     # ------------------------------------------------------------------ model management
     def _load_model(self, tool: ToolParams, preserve: bool) -> None:
         saved = self._save_robot_state() if (preserve and self.model is not None) else None
-        self.model = self.builder.compile(tool, weld=self.weld)
+        self.model = self.builder.compile(tool, weld=self.weld, grasp=self.grasp_mode)
+        self.welded = self.cfg.grip_mode == "weld"  # a new grasp-mode model starts with the weld off
         self.data = mujoco.MjData(self.model)
         self._scratch = mujoco.MjData(self.model)  # for goal sampling FK / collision checks
         self._index_model()
@@ -160,6 +177,8 @@ class PoseVelocityEnv(gym.Env):
         self.hand_open = np.clip(0.0, hlo, hhi)
         symmetric = np.abs(hlo + hhi) < 0.2 * (hhi - hlo)  # e.g. finger abduction joints
         self.hand_closed = np.where(symmetric, np.clip(0.0, hlo, hhi), hlo + 0.6 * (hhi - hlo))
+        self.grip_closed = np.where(symmetric, np.clip(0.0, hlo, hhi), hlo + self.cfg.grip_close_frac * (hhi - hlo))
+        self.grip_joints = ~symmetric
 
         self.palm_id = name2id(OBJ.mjOBJ_BODY, ri.palm_body)
         self.tip_ids = np.array([name2id(OBJ.mjOBJ_BODY, n) for n in ri.fingertip_bodies])
@@ -173,6 +192,7 @@ class PoseVelocityEnv(gym.Env):
         self.arm_body_set = self.robot_body_set - self.hand_body_set
 
         self.tool_id = name2id(OBJ.mjOBJ_BODY, "tool")
+        self.tool_geoms = [g for g in range(m.ngeom) if int(m.geom_bodyid[g]) == self.tool_id]
         tool_jnt = name2id(OBJ.mjOBJ_JOINT, "tool_free")
         self.tool_qadr = int(m.jnt_qposadr[tool_jnt])
         self.tool_dadr = int(m.jnt_dofadr[tool_jnt])
@@ -182,6 +202,7 @@ class PoseVelocityEnv(gym.Env):
         self.floor_gid = name2id(OBJ.mjOBJ_GEOM, "floor")
         self.env_geoms = {self.table_gid, self.floor_gid, name2id(OBJ.mjOBJ_GEOM, "pedestal")}
         self.grip_eq = name2id(OBJ.mjOBJ_EQUALITY, "grip") if self.weld else -1
+        self.hold_eq = name2id(OBJ.mjOBJ_EQUALITY, "hold") if self.grasp_mode else -1
 
         self.goal_mocap = int(m.body_mocapid[name2id(OBJ.mjOBJ_BODY, "goal")])
         self.goal_vel_mocap = int(m.body_mocapid[name2id(OBJ.mjOBJ_BODY, "goal_vel")])
@@ -314,6 +335,10 @@ class PoseVelocityEnv(gym.Env):
         self.grasp_pos, self.grasp_quat = rel_p, rel_q
         self.model.eq_data[self.grip_eq, 3:6] = rel_p
         self.model.eq_data[self.grip_eq, 6:10] = rel_q
+        if self.grasp_mode:
+            self._activate_weld(rel_p, rel_q)
+            self.prev_action[self.n_arm_act:] = 1.0  # grip closed
+            self._a_filt[self.n_arm_act:] = 1.0
         mujoco.mj_forward(self.model, d)
         self.goals_with_grip = 0
 
@@ -350,6 +375,209 @@ class PoseVelocityEnv(gym.Env):
         self._set_hand_targets(self.hand_open)
         self._spawn_on_table()
         return "table"
+
+    # ------------------------------------------------------------------ grasp grip
+    def _grip_point(self) -> np.ndarray:
+        """World position of the palm point the handle is grasped at (head_twist reference before the weld)."""
+        d = self.data
+        return d.xpos[self.palm_id] + d.xmat[self.palm_id].reshape(3, 3) @ self.grip_point_local
+
+    def _handle_grip_point(self) -> np.ndarray:
+        """World position of the point on the handle the canonical grasp holds."""
+        d = self.data
+        slide = self.cfg.grasp_slide_canon * 0.5 * self.tool.handle_len
+        return d.xpos[self.tool_id] - slide * d.xmat[self.tool_id].reshape(3, 3)[:, 2]
+
+    def tool_segment(self):
+        """(handle base, head center) in world: the tool as a segment, for clearance checks."""
+        d = self.data
+        base = d.xpos[self.tool_id] - 0.5 * self.tool.handle_len * d.xmat[self.tool_id].reshape(3, 3)[:, 2]
+        return base, d.site_xpos[self.head_site].copy()
+
+    def hand_points(self) -> np.ndarray:
+        """Palm, fingertips and grip point in world (all observed)."""
+        d = self.data
+        return np.vstack([d.xpos[self.palm_id], d.xpos[self.tip_ids], self._grip_point()])
+
+    _ROLLS = np.linspace(-np.pi, np.pi, 72, endpoint=False)
+
+    def _canonical_grasp(self, tool_pos, tool_quat):
+        """Palm pose that grasps the tool at this pose, as a function of the tool pose and shape alone.
+
+        The handle (tool z, head end) runs along palm -y, so the head is on the pinky side; of the rolls about the
+        handle, the palm orientation closest to the home pose is taken. The handle surface sits grasp_gap off the
+        palm face. Behavior cloning needs the oracle's target to follow from the observation, so no random draw.
+        Returns (palm_pos, palm_quat, tool pos in the palm frame, tool quat in the palm frame).
+        """
+        cfg, tool = self.cfg, self.tool
+        c, s = np.cos(self._ROLLS), np.sin(self._ROLLS)
+        zero = np.zeros_like(c)
+        # Columns: the tool's x, y, z axes in the palm frame; tool x at angle roll in the palm's x-z plane.
+        R_rel = np.stack([np.stack([c, zero, s], -1), np.stack([-s, zero, c], -1),
+                          np.broadcast_to([0.0, -1.0, 0.0], (len(c), 3))], -1)
+        R_palm = mu.quat_to_mat(tool_quat) @ np.transpose(R_rel, (0, 2, 1))
+        k = int(np.argmax(np.einsum("ij,nij->n", mu.quat_to_mat(self.palm_home_quat), R_palm)))
+        if tool.handle_type == "box":  # half thickness along palm z, which is (sin, cos, 0) in the tool frame
+            half = tool.handle_size[0] * abs(s[k]) + tool.handle_size[1] * abs(c[k])
+        else:
+            half = tool.handle_rad
+        slide = cfg.grasp_slide_canon * 0.5 * tool.handle_len
+        rel_p = np.array([*cfg.grasp_palm_xy, cfg.grasp_palm_face - half - cfg.grasp_gap]) + slide * R_rel[k][:, 2]
+        palm_p = np.asarray(tool_pos) - R_palm[k] @ rel_p
+        return palm_p, mu.mat_to_quat(R_palm[k]), rel_p, mu.mat_to_quat(R_rel[k])
+
+    def grasp_targets(self):
+        """(grip point target, pregrasp grip point, palm quat target): the canonical grasp chosen at spawn, applied to
+        the tool where it is now. Choosing it once avoids flips between near-tied rolls when the tool is nudged; the
+        targets are in the observation, so the oracle's labels still follow from it."""
+        d = self.data
+        rel_p, rel_q = self.canon_rel
+        palm_q = mu.quat_mul(d.xquat[self.tool_id], _conj(rel_q))
+        palm_p = d.xpos[self.tool_id] - mu.rotate(palm_q, rel_p)
+        target = palm_p + mu.rotate(palm_q, self.grip_point_local)
+        return target, target + self.cfg.pregrasp_dist * mu.rotate(palm_q, [0.0, 0.0, 1.0]), palm_q
+
+    def _grasp_distance(self) -> float:
+        target, _, palm_q = self.grasp_targets()
+        rc = self.cfg.reward
+        return float(np.linalg.norm(target - self._grip_point()) / rc.approach_scale
+                     + np.linalg.norm(mu.rotation_error(self.data.xquat[self.palm_id], palm_q)) / rc.approach_theta_scale)
+
+    def _grasp_approach_reward(self) -> float:
+        D = self._grasp_distance()
+        r = self.cfg.reward.w_grasp_approach * max(0.0, self.grasp_best - D)
+        self.grasp_best = min(self.grasp_best, D)
+        self.grasp_earned += r
+        return r
+
+    def _ik_palm(self, q0, palm_p, palm_q, iters: int = 60) -> Optional[np.ndarray]:
+        """Damped-least-squares IK from q0 for the palm pose, with the tool where it is in self.data; the joints if
+        it converges (3 mm, ~1 deg) collision-free (hand-tool contact included), else None."""
+        m, sd = self.model, self._scratch
+        q = np.asarray(q0, dtype=np.float64).copy()
+        jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
+        lam2 = self.cfg.ik_damping ** 2
+        for _ in range(iters):
+            sd.qpos[:] = self.data.qpos
+            sd.qpos[self.arm_qadr] = q
+            mujoco.mj_kinematics(m, sd)
+            e = np.concatenate([palm_p - sd.xpos[self.palm_id], mu.rotation_error(sd.xquat[self.palm_id], palm_q)])
+            if np.linalg.norm(e[:3]) < 3e-3 and np.linalg.norm(e[3:]) < 0.02:
+                return None if self._scratch_collides(hand_tool=True) else q
+            mujoco.mj_comPos(m, sd)
+            mujoco.mj_jac(m, sd, jacp, jacr, sd.xpos[self.palm_id], self.palm_id)
+            J = np.vstack([jacp[:, self.arm_dadr], jacr[:, self.arm_dadr]])
+            dq = J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), e)
+            q = np.clip(q + np.clip(dq, -0.3, 0.3), self.arm_range[:, 0], self.arm_range[:, 1])
+        return None
+
+    def _spawn_floating(self) -> bool:
+        """Places the tool in the air over the table where its canonical grasp (and the pregrasp pose behind it) is
+        reachable from the current arm pose, and samples a goal for that grasp. False if no try worked."""
+        cfg, rng, d = self.cfg, self.np_random, self.data
+        speed_max = _lerp(cfg.curriculum.speed_max, self.level)
+        q_now = d.qpos[self.arm_qadr].copy()
+        tilt_max = np.deg2rad(cfg.float_tilt_deg)
+        for _ in range(cfg.float_tries):
+            pos = self.rinfo.table_point(rng.uniform(*cfg.spawn_radial), rng.uniform(*cfg.spawn_lateral),
+                                         rng.uniform(*cfg.float_height))
+            tilt, yaw = rng.uniform(-tilt_max, tilt_max), rng.uniform(-np.pi, np.pi)
+            handle = np.array([np.cos(tilt) * np.cos(yaw), np.cos(tilt) * np.sin(yaw), np.sin(tilt)])
+            quat = mu.quat_mul(mu.quat_from_two_vectors([0, 0, 1], handle), mu.yaw_quat(rng.uniform(-np.pi, np.pi)))
+            self._set_tool_pose(pos, quat)
+            mujoco.mj_forward(self.model, d)
+            self._update_contacts()
+            if self._tool_touches_robot() or self.c_tool_table:
+                continue
+            base, head = self.tool_segment()
+            if min(segment_point_distance(base, head, h) for h in self.hand_points()) < cfg.float_clearance:
+                continue
+            palm_p, palm_q, rel_p, rel_q = self._canonical_grasp(pos, quat)
+            # The whole hand starts behind the grasp along the approach direction (the palm's -z), so getting to the
+            # pregrasp point never means going around the tool.
+            n, target = -mu.rotate(palm_q, [0, 0, 1]), palm_p + mu.rotate(palm_q, self.grip_point_local)
+            if np.max((self.hand_points() - target) @ n) > -cfg.float_behind:
+                continue
+            q_pre = self._ik_palm(q_now, palm_p + cfg.pregrasp_dist * mu.rotate(palm_q, [0, 0, 1]), palm_q)
+            q_grasp = None if q_pre is None else self._ik_palm(q_pre, palm_p, palm_q)
+            if q_grasp is None:
+                continue
+            # Goals for the canonical grasp, near its arm configuration: reachable once the tool is in the hand.
+            self.grasp_pos, self.grasp_quat = rel_p, rel_q
+            self.canon_rel = (rel_p, rel_q)
+            self._goal_q_center = q_grasp
+            goal = self._sample_weld_goal(speed_max)
+            if goal is not None:
+                self._pending_goal = goal
+                return True
+        self._goal_q_center = None
+        return False
+
+    def _place_grasp_tool(self) -> str:
+        """Grasp mode, new tool: floating ("float"), or with probability 1 - float_start_prob already welded at a
+        random grasp as in weld mode ("regrip")."""
+        if self.np_random.random() >= self.cfg.float_start_prob:
+            self._weld_tool()
+            return "regrip"
+        self._set_hand_targets(self.hand_open)
+        self.data.qpos[self.hand_qadr] = self.hand_open
+        self.data.qvel[self.hand_dadr] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+        if not self._spawn_floating():
+            self._set_home(noise=True)  # awkward posture: try again from home
+            self.prev_action[:] = 0.0
+            self._a_filt[:] = 0.0
+            self._spawn_floating()  # if this fails too, the goal comes from the region sampler (goal_fallback)
+        self.data.qvel[self.tool_dadr:self.tool_dadr + 6] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+        if self._pending_goal is None:  # no spawn try worked: the canonical grasp of wherever the tool ended up
+            self.canon_rel = self._canonical_grasp(self.data.xpos[self.tool_id], self.data.xquat[self.tool_id])[2:]
+        self.spawn_pos = self.data.xpos[self.tool_id].copy()
+        self.spawn_quat = self.data.xquat[self.tool_id].copy()
+        self._set_hold(True)
+        self.knocked = False
+        self.prev_action[self.n_arm_act:] = -1.0  # grip open
+        self._a_filt[self.n_arm_act:] = -1.0
+        return "float"
+
+    def _set_hold(self, on: bool) -> None:
+        """Grasp mode: the floating tool held at its spawn pose (soft weld, gravity compensated), or let go."""
+        if on:
+            self.model.eq_data[self.hold_eq, 3:6] = self.spawn_pos
+            self.model.eq_data[self.hold_eq, 6:10] = self.spawn_quat
+        self.data.eq_active[self.hold_eq] = int(on)
+        self.model.body_gravcomp[self.tool_id] = float(on)
+
+    def _activate_weld(self, rel_p, rel_q) -> None:
+        """Grasp mode: weld the tool to the palm at this relative pose, gravity back on, hand-tool contacts off."""
+        m = self.model
+        self.grasp_pos, self.grasp_quat = np.asarray(rel_p, dtype=np.float64), np.asarray(rel_q, dtype=np.float64)
+        m.eq_data[self.grip_eq, 3:6] = self.grasp_pos
+        m.eq_data[self.grip_eq, 6:10] = self.grasp_quat
+        self.data.eq_active[self.grip_eq] = 1
+        self._set_hold(False)
+        for g in self.tool_geoms:  # bit 2 only: everything but the hand still collides with the tool
+            m.geom_contype[g] = 2
+            m.geom_conaffinity[g] = 2
+        self.welded = True
+        self.ever_grasped = True
+        self.goals_with_grip = 0
+        self._goal_q_center = None
+
+    def _weld_trigger(self, grip: float) -> bool:
+        """Grasp mode: the hand is closing on the handle near the palm grip point with enough parts touching it."""
+        parts = float(self.tip_contact.sum() + self.palm_contact)
+        near = np.linalg.norm(self._handle_grip_point() - self._grip_point()) < self.cfg.grasp_handle_tol
+        return bool(grip > self.cfg.grip_close_thresh and parts >= self.cfg.grasp_min_parts and near)
+
+    def _knocked(self, grip: float) -> bool:
+        """Grasp mode: the floating tool moved from its spawn pose (beyond lost_dist even while the hand closes)."""
+        d, cfg = self.data, self.cfg
+        disp = float(np.linalg.norm(d.xpos[self.tool_id] - self.spawn_pos))
+        ang = float(np.linalg.norm(mu.rotation_error(self.spawn_quat, d.xquat[self.tool_id])))
+        if disp > cfg.lost_dist:
+            return True
+        return grip <= cfg.grip_open_thresh and (disp > cfg.knock_pos or ang > np.deg2rad(cfg.knock_deg))
 
     # ------------------------------------------------------------------ contacts / measurements
     def _tool_touches_robot(self) -> bool:
@@ -411,12 +639,12 @@ class PoseVelocityEnv(gym.Env):
         Counts power grasps (tool squeezed against the palm by the fingers) as well as pinch grasps.
         """
         if self.weld:
-            return True
+            return self.welded
         parts = float(self.tip_contact.sum() + self.palm_contact)
         return bool(parts >= self.cfg.grasp_min_parts and self._tool_lift() >= self.cfg.lift_threshold)
 
     def _holding(self) -> bool:
-        return self.weld or (self.ever_grasped and self.c_hand_tool)
+        return self.welded if self.weld else (self.ever_grasped and self.c_hand_tool)
 
     def _head_state(self):
         m, d = self.model, self.data
@@ -434,10 +662,14 @@ class PoseVelocityEnv(gym.Env):
 
     # ------------------------------------------------------------------ control
     def _head_twist_targets(self, a: np.ndarray) -> np.ndarray:
-        """Arm targets that drive the head (as a point rigidly attached to the palm) at the commanded twist."""
+        """Arm targets that drive the head (as a point rigidly attached to the palm) at the commanded twist.
+
+        Before a grasp-mode weld the point is the palm grip point instead: the twist moves the hand, not the tool.
+        """
         m, d = self.model, self.data
         jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
-        mujoco.mj_jac(m, d, jacp, jacr, d.site_xpos[self.head_site], self.palm_id)
+        point = d.site_xpos[self.head_site] if self.welded else self._grip_point()
+        mujoco.mj_jac(m, d, jacp, jacr, point, self.palm_id)
         J = np.vstack([jacp[:, self.arm_dadr], jacr[:, self.arm_dadr]])
         twist = np.concatenate([a[:3] * self.cfg.head_v_max, a[3:6] * self.cfg.head_w_max])
         lam2 = self.cfg.ik_damping ** 2
@@ -469,8 +701,9 @@ class PoseVelocityEnv(gym.Env):
         axis = sd.xmat[self.tool_id].reshape(3, 3) @ self.tool.head_axis
         return sd.site_xpos[self.head_site].copy(), axis, palm_p
 
-    def _scratch_collides(self) -> bool:
-        """Robot or tool touches the table/floor/pedestal, or the tool touches the arm (after _scratch_pose)."""
+    def _scratch_collides(self, hand_tool: bool = False) -> bool:
+        """Robot or tool touches the table/floor/pedestal, or the tool touches the arm (or, with hand_tool, the hand)
+        (after _scratch_pose)."""
         m, sd = self.model, self._scratch
         mujoco.mj_collision(m, sd)
         for i in range(sd.ncon):
@@ -482,14 +715,19 @@ class PoseVelocityEnv(gym.Env):
                     return True
             elif (b1 == self.tool_id and b2 in self.arm_body_set) or (b2 == self.tool_id and b1 in self.arm_body_set):
                 return True
+            elif hand_tool and self.tool_id in (b1, b2) and (b1 in self.hand_body_set or b2 in self.hand_body_set):
+                return True
         return False
 
     def _propose_goal_q(self, rng: np.random.Generator):
-        """Random collision-free arm configuration near the current pose (or home), with the welded tool.
+        """Random collision-free arm configuration near the current pose (or home, or before a grasp-mode weld the
+        canonical grasp's arm configuration), with the welded tool.
 
         Returns (q, head_pos, head_axis, palm_pos), or None if it collides.
         """
-        if rng.random() < self.cfg.goal.goal_q_home_prob:
+        if self._goal_q_center is not None:
+            center = self._goal_q_center
+        elif rng.random() < self.cfg.goal.goal_q_home_prob:
             center = np.asarray(self.cfg.scene.arm_home[: self.n_arm_act], dtype=np.float64)
         else:
             center = self.data.qpos[self.arm_qadr]
@@ -549,7 +787,11 @@ class PoseVelocityEnv(gym.Env):
         speed_max = _lerp(self.cfg.curriculum.speed_max, self.level)
         goal = None
         self.goal_recovery = 0  # weld: 0 found near the current pose, 1 after re-homing, 2 after a new grasp too
-        if self.weld:
+        if self._pending_goal is not None:  # grasp mode: sampled with the spawn (_spawn_floating)
+            goal, self._pending_goal = self._pending_goal, None
+        elif self.weld and not self.welded:  # grasp mode, floating tool: goals for the canonical grasp
+            goal = self._sample_weld_goal(speed_max) if self._goal_q_center is not None else None
+        elif self.weld:
             # Goals near the current pose; if none are reachable (an awkward posture), re-home the arm, then also
             # try a new grasp. A weld goal is therefore always reachable with the current grasp: there is no way
             # to dodge goals by parking the arm somewhere they can't be sampled.
@@ -653,6 +895,11 @@ class PoseVelocityEnv(gym.Env):
         self.ep_terms: dict = {}
         self.diverged = False
         self._prev_head = self.data.site_xpos[self.head_site].copy()
+        floating = self.grasp_mode and not self.welded
+        self.ep_max_steps = self.cfg.max_steps + (self.cfg.grasp_extra_steps if floating else 0)
+        self.grasp_step = -1  # grasp mode: step of this episode at which the weld turned on
+        self.grasp_earned = 0.0  # grasp-approach reward this episode, clawed back by a knock
+        self.grasp_best = self._grasp_distance() if floating else 0.0
         # Phi is continuous across a soft reset (same physical state), so shaping telescopes across episodes.
         self.phi_prev = self._grasp_potential(self._holding())
 
@@ -676,7 +923,7 @@ class PoseVelocityEnv(gym.Env):
         elif self._forced_reset_kind is not None:
             kind = self._forced_reset_kind
         elif self.weld:
-            kind = "regrip" if self.goals_with_grip >= self.cfg.regrip_every else "soft"
+            kind = "regrip" if (not self.welded or self.goals_with_grip >= self.cfg.regrip_every) else "soft"
         else:
             kind = "soft" if (self.ever_grasped and self.c_hand_tool) else "respawn"
         self._forced_reset_kind = None
@@ -694,7 +941,9 @@ class PoseVelocityEnv(gym.Env):
                 self._a_filt[:] = 0.0
             else:
                 self._hold_robot_pose()
-            if self.weld:
+            if self.grasp_mode:
+                start = self._place_grasp_tool()
+            elif self.weld:
                 self._weld_tool()
                 start = kind
             else:
@@ -703,7 +952,8 @@ class PoseVelocityEnv(gym.Env):
             keep_grasp = self._grasp_condition()
         self._update_contacts()
         self._init_episode_state(keep_grasp)
-        self.start_type = start  # "soft", "regrip" or "full" (weld); "soft", "in_hand" or "table" (physical)
+        # "soft", "regrip" or "full" (weld); "soft", "float" or "regrip" (grasp); "soft", "in_hand" or "table" (physical)
+        self.start_type = start
         self._sample_goal()
         info = {"priv": self._get_priv(), "reset_kind": kind}
         self._last_obs = self._get_obs()
@@ -720,7 +970,10 @@ class PoseVelocityEnv(gym.Env):
             self.targets[:na] = self._head_twist_targets(a[:na])
         else:
             self.targets[:na] = self.targets[:na] + a[:na] * self.act_scale[:na]
-        if not self.weld:
+        if self.grasp_mode:
+            if not self.welded:  # 1-D grip: -1 open, +1 closed
+                self.targets[na:] = self.hand_open + 0.5 * (a[na] + 1.0) * (self.grip_closed - self.hand_open)
+        elif not self.weld:
             self.targets[na:] = self.targets[na:] + a[na:] * self.act_scale[na:]
         self.targets = np.clip(self.targets, self.ctrl_lo, self.ctrl_hi)
         self.data.ctrl[self.act_ids] = self.targets
@@ -739,7 +992,21 @@ class PoseVelocityEnv(gym.Env):
             return self._last_obs, 0.0, False, True, info
 
         self._update_contacts()
+        grasped_now = knocked_now = False
+        if self.grasp_mode and not self.welded:
+            if self._weld_trigger(a[na]):
+                d = self.data
+                R_palm = d.xmat[self.palm_id].reshape(3, 3)
+                self._activate_weld(R_palm.T @ (d.xpos[self.tool_id] - d.xpos[self.palm_id]),
+                                    mu.quat_mul(_conj(d.xquat[self.palm_id]), d.xquat[self.tool_id]))
+                self._set_hand_targets(np.clip(d.qpos[self.hand_qadr], self.ctrl_lo[na:], self.ctrl_hi[na:]))
+                grasped_now, self.grasp_step = True, self.t
+            elif self._knocked(a[na]):
+                self._set_hold(False)
+                knocked_now = self.knocked = True
         head, lin, ang, axis = self._head_state()
+        if grasped_now:  # the strike's approach progress counts from the grasp
+            self.approach_best = self._approach_distance(head, axis)
         g = self.goal
         dp, dv = head - g.p, lin - g.v
         theta = mu.angle_between(axis, g.axis)
@@ -761,7 +1028,7 @@ class PoseVelocityEnv(gym.Env):
         passed = bool(held_ok and d_perp is not None and d_perp < cfg.goal.pass_radius)
         success = bool(passed and d_perp < eps_p and np.linalg.norm(dv) < eps_v and theta < eps_th)
 
-        dropped = False
+        dropped = knocked_now
         if not self.weld:
             tool_z = self.data.xpos[self.tool_id][2]
             lost = (self.c_tool_floor or tool_z < self.rinfo.table_top - 0.1
@@ -770,7 +1037,7 @@ class PoseVelocityEnv(gym.Env):
                                                     and self.no_contact >= cfg.drop_no_contact_steps)))
 
         terminated = passed or dropped
-        truncated = (not terminated) and self.t >= cfg.max_steps
+        truncated = (not terminated) and self.t >= self.ep_max_steps
         terms = {"approach": self._approach_reward(head, axis) if holding else 0.0,
                  "waypoint": self._waypoint_reward(head, theta) if holding else 0.0,
                  "track": self._track_reward(head, prev_head, lin, theta) if holding else 0.0,
@@ -793,7 +1060,11 @@ class PoseVelocityEnv(gym.Env):
                               "theta_deg": float(np.degrees(theta)), "quality": q, "paid_quality": paid_q}
         elif dropped:
             terms["clawback"] = -self.approach_earned
-        if not self.weld:
+        if self.grasp_mode:
+            terms["grasp"] = (rc.w_grasp if grasped_now
+                              else 0.0 if self.welded else self._grasp_approach_reward())
+            terms["drop"] = -(rc.drop_penalty + self.grasp_earned) if dropped else 0.0
+        elif not self.weld:
             phi = self._grasp_potential(holding)
             terms["grasp"] = phi - self.phi_prev
             self.phi_prev = phi
@@ -813,7 +1084,7 @@ class PoseVelocityEnv(gym.Env):
         if terminated or truncated:
             self.goals_with_grip += 1
             if self.weld:
-                kind = "regrip" if self.goals_with_grip >= cfg.regrip_every else "soft"
+                kind = "regrip" if (not self.welded or self.goals_with_grip >= cfg.regrip_every) else "soft"
             else:
                 kind = "respawn" if dropped else ("soft" if holding else "respawn")
             self._forced_reset_kind = kind
@@ -828,6 +1099,8 @@ class PoseVelocityEnv(gym.Env):
                 "ever_grasped": float(self.ever_grasped), "diverged": float(self.diverged),
                 "goal_fallback": float(self.goal_fallback), "goal_recovery": float(self.goal_recovery),
                 "waypoint": float(self.waypoint_hit),
+                "grasped": float(self.welded), "grasp_step": float(self.grasp_step),
+                "knocked": float(self.grasp_mode and self.knocked and not self.welded),
                 "next_reset": kind, "level": self.level,
                 "terms": dict(self.ep_terms), "start": self.start_type, "closest": dict(self.closest),
                 "pass": dict(self.pass_info)}
@@ -858,8 +1131,24 @@ class PoseVelocityEnv(gym.Env):
         ]
         if not self.weld:
             parts.append([float(self._holding()), float(self._grasp_condition())])
-        parts.append([1.0 - self.t / self.cfg.max_steps])
+        if self.grasp_mode:
+            parts += self._grasp_obs(palm, R_palm)
+        parts.append([1.0 - self.t / self.ep_max_steps])
         return np.concatenate(parts).astype(np.float32)
+
+    def _grasp_obs(self, palm, R_palm) -> list:
+        """Grasp mode: fingertips (palm frame) and contacts, how closed the hand is, the grip point, and its errors to
+        the canonical grasp of the tool as it is (zero once welded): grip point, pregrasp point, palm rotation."""
+        d = self.data
+        hq = (d.qpos[self.hand_qadr] - self.hand_open) / (self.grip_closed - self.hand_open + 1e-9)
+        gp = self._grip_point()
+        if self.welded:
+            errs = np.zeros(9)
+        else:
+            target, pre, palm_q = self.grasp_targets()
+            errs = np.concatenate([target - gp, pre - gp, mu.rotation_error(d.xquat[self.palm_id], palm_q)])
+        return [((d.xpos[self.tip_ids] - palm) @ R_palm).ravel(), self.tip_contact, [self.palm_contact],
+                [float(np.mean(hq[self.grip_joints]))], gp, errs, [float(self.welded)]]
 
     def _get_priv(self) -> np.ndarray:
         m = self.model
@@ -877,9 +1166,9 @@ class PoseVelocityEnv(gym.Env):
         The oracle is stateful (approach, then strike), so call this once per step, before stepping.
         """
         if self._oracle is None:
-            from oracle import Oracle
+            from oracle import make_oracle
 
-            self._oracle = Oracle()
+            self._oracle = make_oracle(self.cfg)
         return self._oracle(self).astype(np.float32)
 
     # ------------------------------------------------------------------ test / debug helpers

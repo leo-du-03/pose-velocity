@@ -5,6 +5,7 @@ A UR5e arm with a LEAP hand holds a randomly generated tool. It moves the tool s
 Training is staged:
 
 - **Stage A (default, `grip_mode = "weld"`):** the tool is welded to the palm at a random grasp, and the policy controls only the arm. This learns the strike on its own.
+- **Grasp (`grip_mode = "grasp"`):** each new tool floats in the air over the table and stays there until it is grasped or knocked. The policy has to grasp it with the hand. Once the hand closes on the handle, the tool is welded to the palm at the pose it was grasped in, and from then on it works like weld mode. The policy then moves the tool from goal to goal, `regrip_every` goals per tool. A scripted oracle does both the grasp and the strikes, and `bc.py --grip-mode grasp` clones it.
 - **Stage B (`grip_mode = "physical"`):** the hand has to grasp the tool from the table and keep hold of it. This path works but is not tuned yet.
 
 The rest of the stack:
@@ -50,8 +51,8 @@ Run every command from the project root.
    - `arm joints (6)`
    - `hand joints (16)`
    - 4 fingertips, with the thumb last
-   - `action dim: 6` (weld; 22 with `grip_mode = "physical"`)
-   - an obs dim of about 100 (about 170 for physical grip)
+   - `action dim: 6` (weld; 7 with `grip_mode = "grasp"`; 22 with `grip_mode = "physical"`)
+   - an obs dim of about 100 (about 130 for grasp grip, about 170 for physical grip)
 
    The first run downloads Menagerie and builds the reach map, which takes a few seconds.
 
@@ -81,6 +82,13 @@ Run every command from the project root.
    - soft, regrip and respawn reset semantics;
    - a scripted pass-through of the goal triggers success;
    - the scripted oracle succeeds on most goals.
+   - grasp grip:
+     - a floating tool stays put;
+     - a knock drops it;
+     - the canonical grasp depends only on the tool;
+     - a scripted grasp turns on the weld, and the weld holds;
+     - goals chain for `regrip_every` goals after a grasp;
+     - the grasp oracle grasps most tools and succeeds on most goals.
 
 4. **Check that goals are feasible with the scripted oracle**
    ```bash
@@ -88,6 +96,13 @@ Run every command from the project root.
    python evaluate.py --policy oracle --episodes 100 --level 1  # tightest tolerances, fastest goals
    ```
    The oracle flies the head to the lead-in point, aligns the axis, then moves at `v_g` through the goal. It should reach about 90% success at both levels. If it falls well below that after you change the env, the env is broken, not the learner.
+
+   For grasp grip, the oracle first grasps the floating tool (see [How an episode works](#how-an-episode-works)):
+   ```bash
+   python evaluate.py --policy oracle --grip-mode grasp --episodes 100
+   python evaluate.py --policy oracle --grip-mode grasp --episodes 3 --video grasp_oracle.mp4
+   ```
+   It prints a separate line for the floating starts, with their grasp, knock and success rates. Expect about 95% of floating tools grasped, and about 85% success over all episodes.
 
 5. **Watch the env live with random actions**
    ```bash
@@ -121,6 +136,7 @@ Run every command from the project root.
    - `bc.py` uses DAgger, not plain cloning. Each round, the training envs execute the oracle's action with probability `beta_decay^round` and the learner's otherwise, plus PPO's exploration noise. Every visited state is labelled with the oracle's action, and the actor is regressed on the aggregated dataset. Plain cloning only sees the oracle's states, so the learner's small errors lead it to states it never got labels for.
    - The envs are spread over curriculum levels 0 to 1 (`--levels`), because the success tolerances are part of the observation.
    - The oracle's phase (approach, then strike) is a function of the observation, not a hidden flag. With a latched flag, the same state at the lead-in point was labelled "hold" before the flag flipped and "go" after it. The clone averaged the two and stalled there (about 5% success). Instead, the strike continues while the head is in a cone around the strike line and its smoothed commanded velocity (`prev_action`) is committed forward. `Oracle(markov=False)` restores the latched version.
+   - **Grasp, then strike:** `python bc.py --grip-mode grasp --name bc_grasp` clones `GraspOracle`. The same DAgger loop then also covers grasping. A floating tool is grasped, struck through `regrip_every` (8) goals, and then replaced, so about one episode in eight starts with a grasp. Use `--regrip-every` to change that mix. The log adds `float grasp / knock / succ` for the eval envs' floating starts. The checkpoint works with `evaluate.py --ckpt` and `train.py --init-from` as usual.
    - `--init-from` loads the weights and observation normalizers. The optimizer, curriculum and step count start fresh. For the first `--critic-warmup` iterations (20 by default) only the critic trains: advantages from an untrained critic would otherwise push the actor off the cloned behavior before PPO has a useful signal. A lower `--lr` than from scratch also helps keep it close.
 
 ## Command-line flags
@@ -139,7 +155,8 @@ Defaults marked `PPOCfg` come from `config.py`.
 | `--lr-final LR` | `3e-5` (`PPOCfg.lr_final`) | Learning rate at the end; it anneals linearly from `--lr` over this invocation (unless `PPOCfg.adaptive_lr`) |
 | `--epochs N` | `5` (`PPOCfg.epochs`) | PPO epochs per update |
 | `--eval-envs K` | `2` | Envs that act deterministically and stay out of the PPO batch. Their success drives the curriculum and `ckpt_best`; 0 uses the stochastic training episodes instead |
-| `--grip-mode {weld,physical}` | `weld` (`EnvCfg.grip_mode`) | Weld the tool to the palm (Stage A) or grasp it physically (Stage B). Also overrides a resumed checkpoint's config |
+| `--grip-mode {weld,physical,grasp}` | `weld` (`EnvCfg.grip_mode`) | Weld the tool to the palm (Stage A), grasp it physically (Stage B), or grasp a floating tool and then weld it (grasp). Also overrides a resumed checkpoint's config |
+| `--regrip-every N` | `8` (`EnvCfg.regrip_every`) | Goals per tool and grip, for weld and grasp grip. Also overrides a resumed checkpoint's config |
 | `--action-mode {head_twist,joint}` | `head_twist` (`EnvCfg.action_mode`) | Arm actions as a head velocity command, or as joint-target changes. Also overrides a resumed checkpoint's config |
 | `--seed N` | `0` | Seed for torch, numpy and the envs (env `i` gets `seed*1000 + i`) |
 | `--level L` | `0.0` | Initial curriculum level, from 0 to 1 |
@@ -160,8 +177,8 @@ Defaults marked `PPOCfg` come from `config.py`.
 | flag | default | description |
 |---|---|---|
 | `--ckpt CKPT` | none | Checkpoint to load; the env config and curriculum level are taken from it |
-| `--policy {ckpt,random,zero,oracle}` | `ckpt` if `--ckpt` is given, else `random` | Which policy drives the robot. `oracle` is the scripted strike (needs `head_twist` actions) |
-| `--grip-mode {weld,physical}` | from checkpoint, else `config.py` | Grip mode override |
+| `--policy {ckpt,random,zero,oracle}` | `ckpt` if `--ckpt` is given, else `random` | Which policy drives the robot. `oracle` is the scripted strike, plus the scripted grasp with grasp grip (needs `head_twist` actions) |
+| `--grip-mode {weld,physical,grasp}` | from checkpoint, else `config.py` | Grip mode override |
 | `--action-mode {head_twist,joint}` | from checkpoint, else `config.py` | Action mode override |
 | `--episodes N` | `5` | Number of episodes |
 | `--render {none,human,rgb_array}` | `none` | Render mode; `human` opens the viewer |
@@ -175,11 +192,13 @@ Defaults marked `PPOCfg` come from `config.py`.
 
 ### `bc.py`
 
-Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs/<name>/bc_latest.pt` after every round.
+Weld or grasp grip, with `head_twist` actions only (the oracle needs them). It writes `runs/<name>/bc_latest.pt` after every round.
 
 | flag | default | description |
 |---|---|---|
 | `--device {auto,cpu,cuda}` | `auto` | Torch device |
+| `--grip-mode {weld,grasp}` | `config.py` (`weld`) | Clone the strike with the tool starting in the hand, or the grasp of a floating tool followed by the strikes |
+| `--regrip-every N` | `8` (`EnvCfg.regrip_every`) | Goals per tool, which sets the mix of grasp and strike episodes with grasp grip |
 | `--num-envs N` | `32` (`PPOCfg.num_envs`) | Number of parallel envs |
 | `--eval-envs K` | `4` | Envs driven by the deterministic learner alone (no oracle, no noise); their success is reported as `eval succ`. Their states are still labelled and trained on |
 | `--rollout-steps N` | `256` | Steps per env per DAgger round |
@@ -217,7 +236,7 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 | `ppo.py` | Asymmetric actor-critic, observation normalizers, PPO update, GAE |
 | `train.py` | Training: rollouts, curriculum, TensorBoard, checkpoints |
 | `evaluate.py` | Evaluation: viewer, video, success stats |
-| `oracle.py` | The scripted `Oracle` strike (privileged), used by `evaluate.py --policy oracle` and as the `bc.py` expert |
+| `oracle.py` | The scripted `Oracle` strike (privileged) and `GraspOracle` (grasp a floating tool, then strike), used by `evaluate.py --policy oracle` and as the `bc.py` expert |
 | `bc.py` | DAgger behavior cloning of the oracle into the actor, as an initialization for `train.py --init-from` |
 
 ## How an episode works
@@ -225,6 +244,22 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 An episode is one goal, which gets one attempt.
 
 - **Grip (weld, the default):** the fingers are frozen closed. The tool is welded to the palm with its handle across the fingers, slid up to ±30% along the handle, at a random roll, and with the head on a random side. Collisions between the hand and the tool are turned off; the arm, table and floor still collide with the tool.
+- **Grip (grasp):** each new tool spawns floating 15 to 35 cm over the table, with its handle within 30° of horizontal.
+  - **Floating:** the tool is gravity-compensated and held at its spawn pose by a soft weld to the world, so the closing fingers press against it instead of flinging it.
+  - **Canonical grasp:** the target grasp is chosen once, at spawn, from the tool's pose and shape alone. The handle lies across the fingers just off the palm, with the head on the pinky side. Of the rolls about the handle, the one closest to the home palm orientation is taken. The observation includes the errors to it, so the oracle's labels follow from the observation.
+  - **Spawn constraints:** spawns are kept only if all of these hold:
+    - the grasp and a pregrasp pose 8 cm behind it are reachable by IK without collisions;
+    - the hand starts at least 12 cm from the tool and behind it along the approach direction;
+    - a goal can be sampled for that grasp.
+  - **Grasp:** the weld turns on when all of these hold:
+    - the grip action (after the EMA) is above 0.5;
+    - at least 2 hand parts touch the tool;
+    - the handle's grip point is within 4 cm of the palm's.
+
+    It welds the tool at the actual relative pose, turns gravity back on, switches off hand-tool contacts and freezes the fingers.
+  - **Knock:** the episode ends as a drop if the tool moves more than 2 cm or 10° from its spawn pose while the grip is open, or more than 10 cm at any time. A knock also releases the holder and turns gravity on.
+  - **Time limit:** episodes that start with a floating tool get 200 extra steps.
+  - The first goal is sampled at spawn for the canonical grasp, near the arm configuration that reaches it. Later goals come from the actual grasp, as in weld mode.
 - **Goal:** a point `p_g`, a velocity `v_g` and a head axis `a_g`.
   - **Weld:** goals are sampled from arm configurations near the current pose. The goal is the head pose at that configuration, so it is reachable with this grasp by construction. `v_g` runs along the head axis, or within a cone of it with `GoalCfg.axis_mode = "cone"`.
   - The lead-in point (12 cm before `p_g` along the motion) and the follow-through point (8 cm after it) must each be reachable by IK with the same axis, without collisions.
@@ -243,6 +278,7 @@ An episode is one goal, which gets one attempt.
   - **Soft reset:** the whole physics state is kept and only the goal changes. With physical grip this happens only if the tool is still held.
   - **Regrip (weld):** every `regrip_every` (8) goals, a new tool and grasp. With `regrip_rehome` (the default), the arm also returns to home, which stops it drifting into awkward postures.
   - **Respawn (physical):** if the tool isn't held, a new tool is placed on the table (or in the hand, early in the curriculum), and the arm stays where it was.
+  - **Regrip (grasp):** after `regrip_every` goals, a knock or an episode that ended without a grasp, a new tool floats. With `float_start_prob < 1`, some new tools start already welded at a random grasp instead.
   - The arm also returns home on the first reset, on `reset(seed=...)`, and after the physics diverges.
 
 ## Model inputs and outputs
@@ -251,6 +287,8 @@ An episode is one goal, which gets one attempt.
   - Arm, `head_twist` (default): the head's linear velocity (up to 0.8 m/s) and angular velocity (up to 2.5 rad/s). Damped least squares maps this to joint velocities `dq`. The servo target is set to `q + (kv/kp)·dq`, which turns the UR5e's PD position servos into velocity servos.
   - Arm, `joint`: changes to the joint-position targets, up to 0.03 rad per step.
   - Hand (physical grip only): changes to 16 joint targets, up to 0.08 rad per step.
+  - Grip (grasp grip only): one value that sets the hand's joint targets between open (−1) and 85% closed (+1). It is ignored once the tool is welded.
+  - Before a grasp-mode weld, the `head_twist` reference point is a fixed grip point on the palm instead of the tool head, so the twist moves the hand.
   - Actions are smoothed with an EMA (`action_ema = 0.8`). The smoothed action is what goes into the observation.
   - Exploration noise starts at std 0.135 (`init_log_std = −2`). Together with the EMA, that's about 0.05 m/s of head-velocity noise per axis. At the earlier settings (std 0.37, EMA 0.5) the noise was about 0.15 m/s per axis, and even the scripted oracle succeeded only 5% of the time with it added.
 - **Actor observation (about 100 values with weld):**
@@ -260,6 +298,14 @@ An episode is one goal, which gets one attempt.
   - the goal, the position, velocity and axis errors to it, and the offset to the lead-in point;
   - the current success tolerances, and time remaining.
   - Physical grip adds hand joints, fingertip positions, contact flags and grasp flags.
+  - Grasp grip adds:
+    - fingertip positions in the palm frame and contact flags;
+    - how closed the hand is;
+    - the palm grip point;
+    - its errors to the canonical grasp target and to the pregrasp point, and the palm's rotation error (all zero once welded);
+    - a welded flag.
+
+    The time remaining counts down over the longer limit for floating starts.
 - **Critic-only inputs** (`info["priv"]`): tool mass, center of mass and friction; contact forces; closest distance so far; curriculum level.
 - **Networks:**
   - Actor: MLP 512-256-128 (ELU) with a Gaussian output.
@@ -306,6 +352,12 @@ An episode is one goal, which gets one attempt.
     - Exact potential-based shaping can't be exploited, but it gives no advantage signal until real reward exists, so the approach was never learned.
   - **Contact:** −0.1 per step when the robot or tool touches the table, floor or pedestal. With physical grip, only arm links count.
   - **Physical grip adds** a grasp potential (reach, touch, lift, as `Φ' − Φ`) and a −10 drop penalty.
+  - **Grasp grip adds** three terms before the weld:
+    - a grasp-approach reward, paid for each new best `D_grasp = d_grip/0.1 + θ_palm/0.5` with weight 0.3, like the approach reward;
+    - +2 when the weld turns on;
+    - a −10 penalty for a knock, which also claws back that episode's grasp-approach reward.
+
+    The approach, waypoint and track rewards start only once the tool is welded.
   - Only drops and physics divergence cut the PPO return. A pass, a time-out, a new goal or a regrip doesn't, because the world carries on.
 - **PPO:** 32 envs × 256 steps per update, 5 epochs (`--epochs`) of 4 minibatches.
   - The lr anneals linearly from `--lr` to `--lr-final` over each invocation of `train.py`, so a resumed run starts at the `--lr` it's given.

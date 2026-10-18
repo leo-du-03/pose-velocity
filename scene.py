@@ -297,8 +297,13 @@ class SceneBuilder:
         self.cfg = cfg
         self.base_spec, self.info = build_base_spec(cfg)
 
-    def compile(self, tool: ToolParams, weld: bool = False) -> mujoco.MjModel:
+    def compile(self, tool: ToolParams, weld: bool = False, grasp: bool = False) -> mujoco.MjModel:
         """weld=True adds an equality "grip" (palm -> tool) and turns off hand-tool collisions.
+
+        grasp=True (with weld) instead adds the weld inactive, keeps hand-tool collisions and gravity-compensates the
+        tool, so it floats until grasped. A second, soft weld "hold" (world -> tool, pose set at runtime) keeps the
+        floating tool in place against light contact, such as closing fingers. Collision bit 2 is given to the tool and to everything but the hand, so
+        setting the tool's geoms to bit 2 only (PoseVelocityEnv._activate_weld) turns off hand-tool contacts alone.
 
         The weld's relative pose is set at runtime (eq_data[3:10], tool pose in the palm frame, see
         PoseVelocityEnv._weld_tool); its anchor eq_data[0:3] must stay zero.
@@ -309,14 +314,30 @@ class SceneBuilder:
             eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_WELD, name="grip", name1=self.info.palm_body,
                                    name2="tool", objtype=mujoco.mjtObj.mjOBJ_BODY)
             eq.solref = list(self.cfg.weld_solref)
-            for name in self.info.robot_bodies:
-                if name.startswith(HAND_PREFIX):
-                    spec.add_exclude(bodyname1=name, bodyname2="tool")
+            if grasp:
+                eq.active = False
+            else:
+                for name in self.info.robot_bodies:
+                    if name.startswith(HAND_PREFIX):
+                        spec.add_exclude(bodyname1=name, bodyname2="tool")
+        if grasp:
+            _find_body(spec, "tool").gravcomp = 1.0
+            hold = spec.add_equality(type=mujoco.mjtEq.mjEQ_WELD, name="hold", name1="world", name2="tool",
+                                     objtype=mujoco.mjtObj.mjOBJ_BODY)
+            hold.solref = list(self.cfg.hold_solref)
+            hold.active = False
         m = spec.compile()
-        if weld:
-            m.eq_data[0, :] = 0.0
-            m.eq_data[0, 6] = 1.0  # identity quaternion until the grasp is set
-            m.eq_data[0, 10] = 1.0  # torquescale
+        if grasp:
+            hand = {i for i in range(m.nbody) if m.body(i).name.startswith(HAND_PREFIX)}
+            for g in range(m.ngeom):
+                if m.geom_contype[g] or m.geom_conaffinity[g]:
+                    if int(m.geom_bodyid[g]) not in hand:
+                        m.geom_contype[g] |= 2
+                        m.geom_conaffinity[g] |= 2
+        for i in range(m.neq):
+            m.eq_data[i, :] = 0.0
+            m.eq_data[i, 6] = 1.0  # identity quaternion until the grasp / hold pose is set
+            m.eq_data[i, 10] = 1.0  # torquescale
         return m
 
     def _copy_base(self) -> mujoco.MjSpec:

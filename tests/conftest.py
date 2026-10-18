@@ -41,3 +41,19 @@ def physical_env(physical_cfg):
     e.reset(seed=0)
     yield e
     e.close()
+
+
+@pytest.fixture
+def grasp_cfg(cfg):
+    cfg.grip_mode = "grasp"
+    return cfg
+
+
+@pytest.fixture
+def grasp_env(grasp_cfg):
+    from env import PoseVelocityEnv
+
+    e = PoseVelocityEnv(grasp_cfg)
+    e.reset(seed=0)
+    yield e
+    e.close()

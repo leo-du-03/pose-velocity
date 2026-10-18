@@ -30,6 +30,7 @@ class SceneCfg:
     table_half_size: Tuple[float, float, float] = (0.3, 0.45, 0.02)  # (radial, lateral, thickness)
     pedestal_height: float = 0.75  # table top and robot base are both at z = 0; floor at -pedestal_height
     weld_solref: Tuple[float, float] = (0.01, 1.0)  # stiffness of the palm-tool weld in grip_mode "weld"
+    hold_solref: Tuple[float, float] = (0.05, 1.0)  # grip_mode "grasp": soft weld holding the floating tool in place
 
 
 @dataclass
@@ -116,7 +117,12 @@ class RewardCfg:
     w_contact: float = 2.0
     w_lift: float = 5.0
     lift_scale: float = 0.1
-    drop_penalty: float = 10.0
+    drop_penalty: float = 10.0  # physical: a drop; grasp: knocking the floating tool
+    # Grasp grip only: w_grasp_approach * (improvement of the best D_grasp) before the weld, D_grasp = grip-point
+    # distance to its grasp target / approach_scale + palm rotation error / approach_theta_scale (like approach);
+    # w_grasp once when the weld turns on. A knock claws back the grasp-approach reward and costs drop_penalty.
+    w_grasp_approach: float = 0.3
+    w_grasp: float = 2.0
 
 
 @dataclass
@@ -145,6 +151,8 @@ class EnvCfg:
     curriculum: CurriculumCfg = field(default_factory=CurriculumCfg)
     # "weld": the tool is welded to the palm at a sampled grasp, the fingers are frozen and only the arm is
     # controlled (Stage A: learn the strike). "physical": the tool must be grasped and held by the hand.
+    # "grasp": a new tool floats above the table (gravity compensated) until the hand closes on its handle, which
+    # turns on the weld at the actual relative pose; from then on it is weld mode. One extra action: the grip.
     grip_mode: str = "weld"
     # "head_twist": arm actions are the tool head's linear + angular velocity, mapped to joints by damped
     # least squares. "joint": arm actions are changes to the joint-position targets.
@@ -171,6 +179,30 @@ class EnvCfg:
     grasp_min_parts: int = 2  # hand parts (4 fingers + palm) that must touch the tool to count as grasped
     drop_no_contact_steps: int = 10  # 0.2 s without hand-tool contact = drop
     success_requires_grasp: bool = True
+    # Grasp grip only. The canonical grasp (env._canonical_grasp) puts the handle across the fingers, head on the
+    # pinky side: grip point at (grasp_palm_xy, grasp_palm_face - handle half thickness - grasp_gap) in the palm frame,
+    # grasp_slide_canon * half the handle length from the handle center towards its base.
+    float_height: Tuple[float, float] = (0.15, 0.35)  # tool spawn height above the table
+    float_tilt_deg: float = 30.0  # handle within this angle of horizontal
+    float_start_prob: float = 1.0  # else a new tool starts already welded (random grasp, as in weld mode)
+    float_tries: int = 60
+    float_clearance: float = 0.12  # min distance of the spawned tool (as a segment) from the palm and fingertips
+    float_behind: float = 0.04  # palm and fingertips start at least this far behind the grasp, along the approach
+    grasp_palm_xy: Tuple[float, float] = (-0.03, -0.035)
+    grasp_palm_face: float = -0.035  # palm surface, along palm z (the fingers curl towards -z)
+    grasp_gap: float = 0.004
+    grasp_slide_canon: float = 0.3
+    grip_close_frac: float = 0.85  # grip action +1: hand joints this far from open to the top of their range
+    grip_close_thresh: float = 0.5  # smoothed grip action above which the weld can turn on
+    grip_open_thresh: float = -0.9  # smoothed grip action at or below which the hand counts as open (for knocks)
+    grasp_handle_tol: float = 0.04  # weld needs the handle grip point this close to the palm grip point
+    pregrasp_dist: float = 0.08  # the palm approaches the grasp along its -z from this far back
+    # Knocked: the floating tool moved knock_pos (m) / knock_deg from its spawn pose while the grip was open, or
+    # lost_dist even while closing (closing fingers shove a light tool a few cm before the weld turns on).
+    knock_pos: float = 0.02
+    knock_deg: float = 10.0
+    lost_dist: float = 0.10  # moved this far even while closing: knocked
+    grasp_extra_steps: int = 200  # added to max_steps for episodes that start with a floating tool
     curriculum_level: float = 0.0
     seed: Optional[int] = None
     render_width: int = 640

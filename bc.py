@@ -8,13 +8,16 @@ so the learner's small errors take it to states it never saw labels for; DAgger 
 actually visits.
 
 The oracle is stateful (approach the lead-in point, then strike) and reads privileged env state, so each env worker
-runs its own oracle (PoseVelocityEnv.oracle_action). Weld grip and head_twist actions only.
+runs its own oracle (PoseVelocityEnv.oracle_action). head_twist actions, weld or grasp grip. With grasp grip
+(--grip-mode grasp) the oracle is GraspOracle: it grasps a floating tool, then strikes the goals that follow with it
+(regrip_every goals per tool), so one policy learns both the grasp and goal-to-goal manipulation.
 
 The envs are spread evenly over --levels: the curriculum tolerances are part of the observation, so the cloned
 policy has to have seen the levels PPO will run at.
 
 The checkpoint works with evaluate.py (--ckpt) and train.py (--init-from):
   python bc.py --name bc
+  python bc.py --grip-mode grasp --name bc_grasp
   python evaluate.py --ckpt runs/bc/bc_latest.pt --episodes 100
   python train.py --init-from runs/bc/bc_latest.pt --name strike_bc --lr 1e-4
 """
@@ -39,6 +42,10 @@ from vec_env import SerialVecEnv, SubprocVecEnv
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--grip-mode", default=None, choices=["weld", "grasp"],
+                   help="override EnvCfg.grip_mode: weld (tool starts in the hand) or grasp (floating tool)")
+    p.add_argument("--regrip-every", type=int, default=None,
+                   help="override EnvCfg.regrip_every: goals per tool, which sets the mix of grasp and strike episodes")
     p.add_argument("--num-envs", type=int, default=PPOCfg.num_envs)
     p.add_argument("--eval-envs", type=int, default=4,
                    help="envs driven by the deterministic learner alone (no oracle, no noise); their success is "
@@ -78,8 +85,12 @@ def main():
         torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
 
     env_cfg, ppo_cfg = EnvCfg(), PPOCfg(num_envs=args.num_envs)
-    if env_cfg.grip_mode != "weld" or env_cfg.action_mode != "head_twist":
-        raise SystemExit("the oracle needs grip_mode 'weld' and action_mode 'head_twist'")
+    if args.grip_mode is not None:
+        env_cfg.grip_mode = args.grip_mode
+    if args.regrip_every is not None:
+        env_cfg.regrip_every = args.regrip_every
+    if env_cfg.grip_mode not in ("weld", "grasp") or env_cfg.action_mode != "head_twist":
+        raise SystemExit("the oracle needs grip_mode 'weld' or 'grasp' and action_mode 'head_twist'")
     K, N, T = args.eval_envs, args.num_envs, args.rollout_steps
     if not 0 <= K < N:
         raise SystemExit(f"--eval-envs must be in [0, num_envs), got {K}")
@@ -103,8 +114,8 @@ def main():
            for i, lv in enumerate(levels)]
     venv = SerialVecEnv(fns) if (args.serial or N == 1) else SubprocVecEnv(fns)
     obs_dim, act_dim, priv_dim = venv.observation_space.shape[0], venv.action_space.shape[0], venv.priv_dim
-    print(f"device={device}  num_envs={N} ({K} eval)  levels {lo:.2f}-{hi:.2f}  noise std {noise_std:.3f}  "
-          f"run_dir={run_dir}")
+    print(f"device={device}  grip={env_cfg.grip_mode}  num_envs={N} ({K} eval)  levels {lo:.2f}-{hi:.2f}  "
+          f"noise std {noise_std:.3f}  run_dir={run_dir}")
 
     agent = ActorCritic(obs_dim, priv_dim, act_dim, ppo_cfg).to(device)
     opt = torch.optim.Adam(agent.actor.parameters(), lr=args.lr)
@@ -160,18 +171,25 @@ def main():
 
         mean = lambda stats, k: float(np.mean([e[k] for e in stats])) if stats else float("nan")  # noqa: E731
         side = [e["pass"]["v_side_frac"] for e in eval_stats if e.get("pass")]
+        floats = [e for e in eval_stats if e.get("start") == "float"]
         log = {"bc/loss": float(np.mean(losses)), "bc/beta": beta, "bc/dataset": size,
                "ep/success": mean(ep_stats, "success"), "ep/waypoint": mean(ep_stats, "waypoint"),
                "eval/success": mean(eval_stats, "success"), "eval/passed": mean(eval_stats, "passed"),
                "eval/waypoint": mean(eval_stats, "waypoint"),
                "eval/pass/v_side_frac": float(np.mean(side)) if side else float("nan")}
+        if env_cfg.grip_mode == "grasp":  # eval episodes that started with a floating tool
+            log.update({"eval/float/grasped": mean(floats, "ever_grasped"), "eval/float/knocked": mean(floats, "knocked"),
+                        "eval/float/success": mean(floats, "success")})
         if writer is not None:
             for k, v in log.items():
                 writer.add_scalar(k, v, rnd)
         print(f"round {rnd:3d} | beta {beta:.3f} | data {size:8d} | loss {log['bc/loss']:.5f} | "
               f"mix succ {log['ep/success']:.3f} | eval succ {log['eval/success']:.3f} "
               f"pass {log['eval/passed']:.3f} wpt {log['eval/waypoint']:.3f} "
-              f"side {log['eval/pass/v_side_frac']:.2f} (last {len(eval_stats)}) | {time.time() - t_round:.0f}s")
+              f"side {log['eval/pass/v_side_frac']:.2f} (last {len(eval_stats)})"
+              + (f" | float grasp {log['eval/float/grasped']:.2f} knock {log['eval/float/knocked']:.2f} "
+                 f"succ {log['eval/float/success']:.2f} ({len(floats)})" if env_cfg.grip_mode == "grasp" else "")
+              + f" | {time.time() - t_round:.0f}s")
 
         # Same keys train.py and evaluate.py read from a PPO checkpoint (no optimizer: --init-from starts fresh).
         torch.save({"format": CKPT_FORMAT, "agent": agent.state_dict(), "env_cfg": env_cfg, "ppo_cfg": ppo_cfg,

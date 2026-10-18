@@ -4,6 +4,7 @@ Examples:
   python evaluate.py --policy random --render human            # watch random actions live
   python evaluate.py --policy zero --episodes 3 --video zero.mp4
   python evaluate.py --policy oracle --episodes 50             # scripted strike: checks goals are feasible
+  python evaluate.py --policy oracle --grip-mode grasp --episodes 50   # scripted grasp of a floating tool + strike
   python evaluate.py --ckpt runs/<name>/ckpt_latest.pt --render human --level 1.0
 """
 from __future__ import annotations
@@ -15,7 +16,7 @@ import numpy as np
 
 from config import EnvCfg
 from env import PoseVelocityEnv
-from oracle import Oracle
+from oracle import make_oracle
 
 
 def main():
@@ -23,7 +24,7 @@ def main():
     p.add_argument("--ckpt", default=None)
     p.add_argument("--policy", default=None, choices=["ckpt", "random", "zero", "oracle"],
                    help="defaults to ckpt if --ckpt is given, else random")
-    p.add_argument("--grip-mode", default=None, choices=["weld", "physical"],
+    p.add_argument("--grip-mode", default=None, choices=["weld", "physical", "grasp"],
                    help="override the grip mode (default: from checkpoint, else config.py)")
     p.add_argument("--action-mode", default=None, choices=["head_twist", "joint"],
                    help="override the action mode (default: from checkpoint, else config.py)")
@@ -62,7 +63,7 @@ def main():
         if cfg.grip_mode != "physical":
             p.error("--table-start needs --grip-mode physical")
         cfg.curriculum.start_in_hand_prob = (0.0, 0.0)
-    oracle = Oracle() if policy == "oracle" else None
+    oracle = make_oracle(cfg) if policy == "oracle" else None
 
     render_mode = "rgb_array" if args.video else (None if args.render == "none" else args.render)
     env = PoseVelocityEnv(cfg, render_mode=render_mode)
@@ -108,6 +109,9 @@ def main():
         ps = e["pass"]
         pass_txt = (f"pass d {ps['d_perp'] * 100:4.1f}cm v {ps['dv_frac']:.2f}xv axis {ps['theta_deg']:3.0f}deg"
                     if ps else "no pass")
+        if e["start"] == "float":
+            pass_txt += (f"  grasped at step {int(e['grasp_step'])}" if e["grasp_step"] >= 0
+                         else "  knocked" if e["knocked"] else "  not grasped")
         print(f"episode {ep}: start {start_kind:7s}  return {ep_ret:8.2f}  len {e['length']:4d}  "
               f"success {bool(e['success'])}  dropped {bool(e['dropped'])}  {pass_txt}  "
               f"d_min {e['d_min'] * 100:.1f}cm")
@@ -117,6 +121,11 @@ def main():
           f"pass rate {np.mean([r['passed'] for r in results]):.2f}  "
           f"drop rate {np.mean([r['dropped'] for r in results]):.2f}  "
           f"mean return {np.mean([r['return'] for r in results]):.2f}")
+    floats = [r for r in results if r["start"] == "float"]
+    if floats:
+        print(f"floating starts {len(floats)}: grasp rate {np.mean([r['grasp_step'] >= 0 for r in floats]):.2f}  "
+              f"knock rate {np.mean([r['knocked'] for r in floats]):.2f}  "
+              f"success {np.mean([r['success'] for r in floats]):.2f}")
     if args.video and frames:
         import imageio
 
