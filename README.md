@@ -1,6 +1,6 @@
 # pose-velocity
 
-A UR5e arm with a LEAP hand holds a randomly generated tool. It moves the tool so that the **head center passes through a goal point, with the head axis aligned to a goal direction, while moving at a goal velocity**.
+A UR5e arm with a LEAP hand holds a randomly generated tool. It moves the tool so that the **head center passes through a goal point, with the tool in a goal orientation, while moving at a goal velocity**. The velocity need not point out of the head's face: a goal can be a straight strike, or a swipe where the tool faces one way and moves another.
 
 Training is staged:
 
@@ -61,7 +61,7 @@ Run every command from the project root.
    ```
    - Check that the hand is mounted sensibly on the flange.
    - With weld grip, the tool should sit in the closed hand. With physical grip it lies on the table in front of the arm.
-   - Goal markers: the **green** sphere is the goal point, the **red** arrow is the goal velocity (its length scales with speed), and the **blue** arrow is the goal head axis.
+   - Goal markers: the **green** sphere is the goal point, the **red** arrow is the goal velocity (its length scales with speed), the **blue** arrow is the goal head axis, and the **yellow** bar runs back along the goal handle direction. The blue and yellow markers together show the full goal orientation.
 
    If the hand is rotated or offset wrongly, tune `SceneCfg.hand_mount_euler` and `SceneCfg.hand_mount_pos` in `config.py`.
 
@@ -87,7 +87,7 @@ Run every command from the project root.
    python evaluate.py --policy oracle --episodes 100            # level 0
    python evaluate.py --policy oracle --episodes 100 --level 1  # tightest tolerances, fastest goals
    ```
-   The oracle flies the head to the lead-in point, aligns the axis, then moves at `v_g` through the goal. It should reach about 90% success at both levels. If it falls well below that after you change the env, the env is broken, not the learner.
+   The oracle flies the head to the lead-in point, turns the tool to the goal orientation, then moves at `v_g` through the goal while holding that orientation. It should reach about 90% success at both levels (at level 1 that holds across swipe angles from 0° to 180°). If it falls well below that after you change the env, the env is broken, not the learner.
 
 5. **Watch the env live with random actions**
    ```bash
@@ -119,9 +119,15 @@ Run every command from the project root.
    python train.py --init-from runs/bc/bc_latest.pt --name strike_bc --lr 1e-4
    ```
    - `bc.py` uses DAgger, not plain cloning. Each round, the training envs execute the oracle's action with probability `beta_decay^round` and the learner's otherwise, plus PPO's exploration noise. Every visited state is labelled with the oracle's action, and the actor is regressed on the aggregated dataset. Plain cloning only sees the oracle's states, so the learner's small errors lead it to states it never got labels for.
-   - The envs are spread over curriculum levels 0 to 1 (`--levels`), because the success tolerances are part of the observation.
-   - The oracle's phase (approach, then strike) is a function of the observation, not a hidden flag. With a latched flag, the same state at the lead-in point was labelled "hold" before the flag flipped and "go" after it. The clone averaged the two and stalled there (about 5% success). Instead, the strike continues while the head is in a cone around the strike line and its smoothed commanded velocity (`prev_action`) is committed forward. `Oracle(markov=False)` restores the latched version.
-   - `--init-from` loads the weights and observation normalizers. The optimizer, curriculum and step count start fresh. For the first `--critic-warmup` iterations (20 by default) only the critic trains: advantages from an untrained critic would otherwise push the actor off the cloned behavior before PPO has a useful signal. A lower `--lr` than from scratch also helps keep it close.
+   - The envs are spread over curriculum levels 0 to 1 (`--levels`), because the success tolerances are part of the observation and the velocity cone (strikes to swipes) widens with the level.
+   - Checkpoints from before the full-orientation goals (checkpoint format 2) have a different observation layout and are rejected; re-run `bc.py`.
+   - The oracle's action is a continuous function of the observation. Its velocity is a blend `(1 − α)·approach + α·strike`, where the strike weight `α` ramps smoothly with progress past the lead-in point, distance from the strike line (a cone that widens towards the goal), orientation error, and whether the smoothed commanded velocity (`prev_action`) along the line is backwards. Regression averages labels that disagree on nearby states, so every hard switch in the oracle became a place the clone got stuck:
+     - A latched phase flag labelled the same state at the lead-in point "hold" before the flag flipped and "go" after it. The clone stalled there (about 5% success). `Oracle(markov=False)` restores this version.
+     - A hard in/out switch at the edge of the strike region (`runs/bc_swipe12`) had labels about the goal velocity apart on either side of the edge. The clone hesitated at the lead-in point (about 4× the oracle's time there), struck at about 65% of the goal speed with extra sideways velocity, and plateaued at 20–40% success while the oracle got about 90%. More DAgger data didn't help, because more labels at the edge only pin the average down.
+     - Requiring the commanded velocity to reach half the goal speed within 3 cm past the lead-in point (`commit_frac = 0.5`) made it worse: a clone that accelerated slightly slower than the oracle was labelled "go back" and cycled there.
+   - Watch `bc/loss_new` (loss on each round's states before training on them), not `bc/loss`. The training loss is averaged over all the data, which is mostly easy early states, and was about 10× lower than the error on the states the clone visits. `--recent-frac` draws half of each batch from the newest `--recent-rounds` rounds for the same reason.
+   - The oracle-mixing schedule decays per round, so with fewer envs scale `--rounds` and `--beta-decay` to keep the total data and the oracle-guided share about the same. The training envs execute about `(training envs × rollout steps) / (1 − beta_decay)` oracle actions in total. For example, `--num-envs 24 --rounds 180 --beta-decay 0.86` gives about 1.1M samples and 37k oracle actions, close to the 32-env defaults over 150 rounds.
+   - `--init-from` loads the weights and observation normalizers. The optimizer, curriculum and step count start fresh, and the reward comes from `config.py` (the fine-tuning reward), not from the checkpoint. For the first `--critic-warmup` iterations (20 by default) only the critic trains: advantages from an untrained critic would otherwise push the actor off the cloned behavior before PPO has a useful signal. A lower `--lr` than from scratch also helps keep it close.
 
 ## Command-line flags
 
@@ -150,10 +156,10 @@ Defaults marked `PPOCfg` come from `config.py`.
 | `--resume CKPT` | none | Checkpoint to resume from; its env config is used instead of `config.py`. Checkpoints from before the weld / head-twist change can't be resumed |
 | `--init-from CKPT` | none | Start a new run from this checkpoint's weights and env config (for example a `bc.py` checkpoint). The optimizer, curriculum and step count start fresh. Can't be combined with `--resume` |
 | `--critic-warmup N` | `20` with `--init-from`, else `0` | Iterations at the start of this invocation that train only the critic, with the actor frozen |
-| `--reward-from-config` | off | On `--resume` or `--init-from`, use `RewardCfg` from `config.py` instead of the checkpoint's |
+| `--reward-from-config` | off | On `--resume`, use `RewardCfg` from `config.py` instead of the checkpoint's. `--init-from` always does |
 | `--save-every N` | `50` (`PPOCfg.save_every`) | Checkpoint interval in iterations |
 | `--eps-p LEVEL0 LEVEL1` | `0.08 0.03` | Success position tolerance in meters at curriculum level 0 and 1. Also overrides a resumed checkpoint's config |
-| `--sigma-p S` | `0.05` | Position scale in meters of the pass reward. Also overrides a resumed checkpoint's config |
+| `--sigma-p S` | `0.03` | Position scale in meters of the pass reward. Also overrides a resumed checkpoint's config |
 
 ### `evaluate.py`
 
@@ -189,7 +195,10 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 | `--grad-steps N` | `500` | Actor gradient steps per round |
 | `--batch-size N` | `4096` | Batch size for those steps |
 | `--lr LR` | `1e-3` | Adam learning rate |
+| `--lr-final LR` | `1e-4` | The learning rate is annealed linearly to this over the rounds |
 | `--buffer-size N` | `2000000` | Size of the aggregated dataset; the oldest samples are dropped beyond it |
+| `--recent-rounds N` | `10` | The newest N rounds of data form the "recent" pool |
+| `--recent-frac F` | `0.5` | Fraction of each batch drawn from the recent pool; the rest comes from the whole dataset |
 | `--levels LO HI` | `0 1` | Curriculum levels the envs are spread over |
 | `--seed N` | `0` | Seed |
 | `--serial` | off | Run envs in the main process |
@@ -211,7 +220,7 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 | `scene.py` | Attaches the LEAP hand to the UR5e flange (`MjSpec.attach`) and adds the table, floor and goal markers. Recompiles the model per tool, with an optional palm-tool weld. |
 | `tool_gen.py` | Random tool: handle (cylinder/capsule/box) + head (box/cylinder/sphere/ellipsoid/capsule) in a T, L or inline layout |
 | `goals.py` | Goal sampling, either from arm configurations with the current grasp (weld) or from a precomputed reach map (physical), plus the goal-plane crossing test |
-| `rewards.py` | Pass reward, approach potential, and the grasp potential for physical grip |
+| `rewards.py` | Pass quality, and the grasp potential for physical grip |
 | `env.py` | `PoseVelocityEnv` (Gymnasium) |
 | `vec_env.py` | Subprocess vector env with same-step autoreset that also returns privileged critic features |
 | `ppo.py` | Asymmetric actor-critic, observation normalizers, PPO update, GAE |
@@ -225,18 +234,19 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 An episode is one goal, which gets one attempt.
 
 - **Grip (weld, the default):** the fingers are frozen closed. The tool is welded to the palm with its handle across the fingers, slid up to ±30% along the handle, at a random roll, and with the head on a random side. Collisions between the hand and the tool are turned off; the arm, table and floor still collide with the tool.
-- **Goal:** a point `p_g`, a velocity `v_g` and a head axis `a_g`.
-  - **Weld:** goals are sampled from arm configurations near the current pose. The goal is the head pose at that configuration, so it is reachable with this grasp by construction. `v_g` runs along the head axis, or within a cone of it with `GoalCfg.axis_mode = "cone"`.
-  - The lead-in point (12 cm before `p_g` along the motion) and the follow-through point (8 cm after it) must each be reachable by IK with the same axis, without collisions.
+- **Goal:** a point `p_g`, a velocity `v_g` and a full tool orientation `R_g` (a quaternion, so roll about the head axis counts too).
+  - **Weld:** goals are sampled from arm configurations near the current pose. The goal is the tool pose (head position and orientation) at that configuration, so it is reachable with this grasp by construction.
+  - The direction of `v_g` is drawn uniformly within a cone around the head axis at the goal pose. The cone widens with the curriculum (`vel_cone_deg`), from 30° at level 0 to 180° at level 1, where any direction is possible: sideways or even backwards swipes. Velocities pointing steeply into the table are still rejected.
+  - The lead-in point (12 cm before `p_g` along the motion) and the follow-through point (8 cm after it) must each be reachable by IK in the goal orientation, without collisions.
   - If no goal can be found near the current pose (an awkward posture), the arm is re-homed and sampling is retried, then a new grasp is tried too. `ep/goal_recovery` logs how often that happens. The grasp-agnostic region sampler is only a last resort, logged as `ep/goal_fallback`; it has never triggered in testing. So weld goals are always reachable, and the policy can't dodge goals by parking the arm where none can be drawn.
   - **Physical:** goals come from the arm's palm reach map, as before.
 - **Pass:** the attempt is the moment the head crosses the plane through `p_g` with normal `v̂`, going forward, within `pass_radius` (15 cm) of `p_g`. The pass ends the episode. Crossings farther out are ignored.
 - **Success:** a pass where all three of these hold:
   - the crossing point is within `eps_p` of `p_g`;
   - `|v_head - v_g| < eps_v_frac · |v_g|`, a fraction of the goal speed, so a stationary head never qualifies;
-  - the angle between the head axis and `a_g` is below `eps_theta`.
+  - the full rotation angle between the tool's orientation and `R_g` is below `eps_theta`.
 
-  The curriculum tightens these from 8 cm / 60% of goal speed / 60° to 3 cm / 25% of goal speed / 20°. It also raises the maximum goal speed from 0.3 to 0.6 m/s (goals are at least 0.3 m/s). Because the velocity tolerance is relative to goal speed, slow goals are the hardest to hit under exploration noise, not the easiest. The curriculum moves up at 50% success.
+  The curriculum tightens these from 8 cm / 60% of goal speed / 60° to 3 cm / 25% of goal speed / 20°. It also raises the maximum goal speed from 0.3 to 0.6 m/s (goals are at least 0.3 m/s), and widens the velocity cone around the head axis from 30° to 180°. Because the velocity tolerance is relative to goal speed, slow goals are the hardest to hit under exploration noise, not the easiest. The curriculum moves up at 50% success.
 - **Drop (physical only):** the tool had been grasped and then either lost all hand contact for 0.2 s or touched the floor. It also counts as a drop if the tool is knocked off the table. A drop ends the episode early.
 - **Time limit:** 5 s (250 control steps at 50 Hz) without a pass.
 - **After an episode:**
@@ -257,7 +267,7 @@ An episode is one goal, which gets one attempt.
   - arm joint positions and velocities, and the previous action;
   - palm pose, and the tool pose in the palm frame (the grasp);
   - tool head pose and velocity, and shape features of the tool;
-  - the goal, the position, velocity and axis errors to it, and the offset to the lead-in point;
+  - the goal (`p_g`, `v_g`, and `R_g` as a 6D rotation), the position and velocity errors, the orientation error as a world-frame rotation vector, and the offset to the lead-in point;
   - the current success tolerances, and time remaining.
   - Physical grip adds hand joints, fingertip positions, contact flags and grasp flags.
 - **Critic-only inputs** (`info["priv"]`): tool mass, center of mass and friction; contact forces; closest distance so far; curriculum level.
@@ -265,48 +275,17 @@ An episode is one goal, which gets one attempt.
   - Actor: MLP 512-256-128 (ELU) with a Gaussian output.
   - Critic: MLP 512-512-256.
   - Both use running observation normalization. They have separate Adam optimizers and separate gradient clipping.
-- **Reward:** five terms, with weights in `RewardCfg`.
+- **Reward:** set up for fine-tuning a policy that already strikes (`bc.py`), so it is just the task, with no shaping. Weights are in `RewardCfg`.
   - **Pass**, paid once at the crossing: `20 · q`, plus 10 if it's a success, where
-    `q = exp(−d/σp) · exp(−|v_along − |v_g|| / |v_g|) · exp(−|v_side| / |v_g|) · max(0, cos θ)`.
-    `v_along` and `v_side` are the head velocity's components along and across the goal direction.
-    - It's a product, so a head parked on the goal earns nothing.
-    - Speed error along `v̂` is scored leniently: a pass at 3× speed still keeps about 10% of that factor, so slowing down always pays.
-    - **Waypoint gate** (`pass_requires_waypoint`): the pass reward and success bonus are paid only if the attempt hit the waypoint first. A pass without it counts as quality 0, so all of its approach reward is clawed back.
-      - Earlier runs learned to swoop in from the side and cut across the plane at an angle, which capped success at about 25%. The gate means that can't pay, however close it gets.
-      - This applies to the training reward only. `succ`, `eval succ` and the curriculum still count every pass that meets the tolerances.
-      - A steep sideways penalty (`sigma_v_perp_frac = 0.25`) was tried first. It didn't stop the swoop, and it shrank the reward for good passes under exploration noise.
-    - The log shows both components at passes as `(along … side …)`, as fractions of goal speed. They're `pass/v_along_frac` and `pass/v_side_frac` in TensorBoard.
-  - **Approach**, paid whenever the attempt reaches a new best `D = d_lead/0.1 + θ/0.5`. Here `d_lead` is the head's distance to the lead-in point and `θ` the axis error.
-    - It pays `1 · (previous best D − new D)`, so at most `D(start)` per attempt, and it's paid immediately. That makes it a real learning signal, unlike potential-based shaping.
-    - **Clawback:** at a pass, `(1 − pass quality)` of what the attempt earned from approach is taken back. A drop takes all of it back. A time-out keeps it.
-      - So rushing through the goal to get a fresh goal (and fresh approach reward) hands the reward back.
-      - Getting to the lead-in point and waiting is a safe stepping stone, never worse than a bad pass.
-  - **Waypoint:** a one-off bonus of 3 the first time in an attempt that the head is within 3 cm of the lead-in point with its axis within 15°. It counts as approach reward, so the same clawback applies. It gives a policy that swoops in from the side a concrete target for lining up behind the goal.
-  - **Track**, the dense signal for the strike itself. Each step pays `10 · q · Δs / lead_in` for forward motion `Δs` along the lead-in segment.
-    - Quality: `q = exp(−d_line/0.03) · exp(−|v−v_g| / (0.5·|v_g|)) · max(0, cos θ)`.
-    - Only motion within 6 cm of the line, coming from behind the goal plane, counts.
-    - Each attempt has a budget of `lead_in` metres of motion, so it earns at most 10. Backtracking and re-advancing just spends the budget.
-    - It's paid per distance, not per step, so crawling earns nothing extra; rushing lowers `q`.
-  - **Incentive check** (discounted return from attempt starts, the quantity PPO maximises), each step better than the last:
-
-    | policy | return |
-    |---|---|
-    | doing nothing | 0 |
-    | swooping in from the side (strike_f's / strike_g's learned policies) | +2.1 / +1.6 |
-    | going to the lead-in point and waiting | +5.5 |
-    | running back and forth along the line without crossing | +9.4 |
-    | crawling (0.3×) or rushing (3×) through the goal | +9.2 / +9.2 |
-    | the scripted oracle | +41.2 (+31.7 with training noise) |
-
-
-  - **Earlier reward designs that failed:**
-    - Re-paying the approach reward on every goal taught the policy to rush through goals.
-    - Charging `−Φ(start)` per attempt taught it to park the arm where only unreachable goals could be drawn.
-    - Without the waypoint gate, every run settled into swooping across the plane from the side.
-    - Exact potential-based shaping can't be exploited, but it gives no advantage signal until real reward exists, so the approach was never learned.
+    `q = exp(−(d/σp + |v_head − v_g| / (σv·|v_g|) + θ/σθ))`, with `σp = 3 cm`, `σv = 0.25` and `σθ = 20°`.
+    - The scales are the tightest success tolerances (level 1), so each factor is `1/e` at the edge of success. The reward keeps sharpening the strike inside the success region instead of saturating there.
+    - It uses the full velocity error, so a sideways crossing costs as much as a wrong speed. It's a product, so a head parked on the goal earns almost nothing.
+    - The scripted oracle scores `q ≈ 0.5` (about 18–20 per goal). Crawling (0.3×) or rushing (3×) through the goal earns under 1.
+    - The log shows the velocity at passes split into `(along … side …)`, as fractions of goal speed. They're `pass/v_along_frac` and `pass/v_side_frac` in TensorBoard. With swipe goals a large `side` is no longer by itself a sign of cutting across, because it's measured against the goal velocity, not the head axis. `pass/swipe_deg` is the mean angle between the goal velocity and the goal head axis.
   - **Contact:** −0.1 per step when the robot or tool touches the table, floor or pedestal. With physical grip, only arm links count.
-  - **Physical grip adds** a grasp potential (reach, touch, lift, as `Φ' − Φ`) and a −10 drop penalty.
-  - Only drops and physics divergence cut the PPO return. A pass, a time-out, a new goal or a regrip doesn't, because the world carries on.
+  - **Physical grip adds** a grasp potential (reach, touch, lift, as `Φ' − Φ`) and a −10 drop penalty. With no approach shaping, physical grip has no dense signal toward the goal, so it isn't meant to be trained from scratch with this reward.
+  - Every episode end (pass, time-out, drop, divergence) cuts the PPO return, so each goal is scored on its own pass. If the return carried over into the next goal, reaching that goal sooner would pay, which means rushing through this one. A time-out can be cut too, because the time remaining is part of the observation.
+  - **Earlier, from-scratch versions** of this reward added approach progress toward the lead-in point, a waypoint bonus, a waypoint gate on the pass reward, a clawback of shaping on poor passes, and a per-distance track reward along the lead-in line. These guarded against hacks a policy finds when learning from scratch, such as swooping across the plane from the side or rushing through goals. Starting from the cloned oracle, they're unnecessary (see git history).
 - **PPO:** 32 envs × 256 steps per update, 5 epochs (`--epochs`) of 4 minibatches.
   - The lr anneals linearly from `--lr` to `--lr-final` over each invocation of `train.py`, so a resumed run starts at the `--lr` it's given.
   - An update stops early if KL to the rollout policy exceeds 0.05.

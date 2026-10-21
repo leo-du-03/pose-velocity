@@ -54,13 +54,11 @@ class GoalCfg:
     lateral: Tuple[float, float] = (-0.35, 0.35)
     height: Tuple[float, float] = (0.15, 0.5)
     min_base_dist: float = 0.3
-    lead_in: float = 0.12  # p_g - lead_in * v_hat must be reachable
+    lead_in: float = 0.12  # p_g - lead_in * v_hat must be reachable (with the goal orientation)
     follow_through: float = 0.08  # p_g + follow_through * v_hat must be reachable
     min_clearance: float = 0.08  # all three points must be this far above the table
     min_dir_z: float = -0.5  # reject velocity directions pointing steeply into the table
     speed_min: float = 0.3  # m/s; tolerances are relative to speed, so slow goals are the hardest under noise
-    axis_mode: str = "velocity"  # "velocity": head axis = v_hat; "cone": random within axis_cone_deg of v_hat
-    axis_cone_deg: float = 30.0
     reach_samples: int = 50000
     reach_voxel: float = 0.05
     # Weld mode samples goals from arm configurations (see GoalSampler.sample_from_grasp): joints are drawn
@@ -74,42 +72,16 @@ class GoalCfg:
 
 @dataclass
 class RewardCfg:
-    # Pass reward, paid once when the head crosses the goal plane: pass_scale * quality (see rewards.pass_quality),
-    # quality = exp(-d_perp/sigma_p) * exp(-|v_along - |v_g|| / (sigma_v_frac*|v_g|))
-    #           * exp(-|v_sideways| / (sigma_v_perp_frac*|v_g|)) * max(0, cos theta),
-    # where v_along / v_sideways are the head velocity's components along / across the goal direction.
+    # Tuned for PPO fine-tuning of a policy that already strikes (bc.py): the reward is only the task, with no
+    # shaping. Pass reward, paid once when the head crosses the goal plane: pass_scale * quality, with
+    # quality = exp(-(d_perp/sigma_p + |v_head - v_g|/(sigma_v_frac*|v_g|) + theta/sigma_theta)) (rewards.pass_quality),
+    # theta = full rotation angle between the tool and goal orientations (roll about the head axis included).
+    # The scales are the tightest success tolerances (CurriculumCfg at level 1), so each factor is 1/e there.
     pass_scale: float = 20.0
-    sigma_p: float = 0.05
-    sigma_v_frac: float = 1.0  # along v_hat; a 3x-speed pass keeps ~10% of it, so the gradient to slow down exists
-    # Across v_hat. 0.25 (steep) was tried against "swooping" in from the side, but mostly shrank the reward for good
-    # passes under exploration noise; the waypoint gate (pass_requires_waypoint) handles swoops instead.
-    sigma_v_perp_frac: float = 1.0
+    sigma_p: float = 0.03
+    sigma_v_frac: float = 0.25
+    sigma_theta_deg: float = 20.0
     success_bonus: float = 10.0  # added when the pass is within all success tolerances
-    # Approach progress: w_approach * (improvement of the attempt's best D), D = d_lead/approach_scale +
-    # theta/approach_theta_scale, d_lead = head distance to the lead-in point p_g - lead_in*v_hat. At most
-    # w_approach * D(start) per attempt. At a pass, (1 - pass quality) of what the attempt earned is clawed back, so a
-    # rushed pass to get the next goal sooner hands it back; a time-out keeps it.
-    # Keep approach + waypoint (E per attempt) small next to pass_scale: finishing a strike beats timing out only when
-    # pass_scale*q > (1 - q)*E, i.e. q > E / (pass_scale + E). With w_approach 1 and w_waypoint 3 (E ~ 6) that was
-    # q > 0.23, so a learning policy's clumsy first strikes (q ~ 0.05-0.12) lost to waiting at the lead-in point.
-    w_approach: float = 0.3
-    approach_scale: float = 0.1
-    approach_theta_scale: float = 0.5
-    # Waypoint: a one-off bonus the first time in an attempt the head is within waypoint_radius of the lead-in point
-    # with its axis within waypoint_theta_deg. It counts as approach reward, so the same clawback applies.
-    w_waypoint: float = 1.0
-    waypoint_radius: float = 0.03
-    # Pay the pass reward and success bonus only if the attempt hit the waypoint first; a pass without it counts as
-    # quality 0 (full clawback). Training reward only: success is still measured on every pass.
-    pass_requires_waypoint: bool = True
-    waypoint_theta_deg: float = 15.0
-    # Track reward: paid per step for forward motion along the lead-in segment, out of a budget of lead_in metres
-    # per attempt (so at most w_track per attempt), times quality
-    # q = exp(-d_line/track_sigma_line) * exp(-dv_frac/track_sigma_v_frac) * max(0, cos theta).
-    w_track: float = 10.0
-    track_sigma_line: float = 0.03
-    track_radius: float = 0.06  # only motion this close to the line counts (and spends the budget)
-    track_sigma_v_frac: float = 0.5
     w_env_contact: float = 0.1  # per step; weld: robot or tool touching table/floor/pedestal; physical: arm links only
     # Physical grip only: grasp potential Phi = reach + contact + lift, paid as Phi' - Phi, and the drop penalty.
     w_reach: float = 1.0
@@ -126,7 +98,10 @@ class CurriculumCfg:
     # Velocity tolerance as a fraction of the goal speed: |v_head - v_g| < eps_v_frac * |v_g|.
     # Always < 1, so a stationary head can never count as matching the goal velocity.
     eps_v_frac: Tuple[float, float] = (0.6, 0.25)
-    eps_theta_deg: Tuple[float, float] = (60.0, 20.0)
+    eps_theta_deg: Tuple[float, float] = (60.0, 20.0)  # full rotation angle between tool and goal orientation
+    # Max angle between the goal velocity and the head axis at the goal pose: small = strike out of the head's face,
+    # 180 = any direction (swipes). Sampled uniformly within it.
+    vel_cone_deg: Tuple[float, float] = (30.0, 180.0)
     speed_max: Tuple[float, float] = (0.3, 0.6)
     start_in_hand_prob: Tuple[float, float] = (0.5, 0.0)  # physical grip only
     up_threshold: float = 0.5

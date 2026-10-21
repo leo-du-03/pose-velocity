@@ -131,16 +131,33 @@ def test_head_twist_tracks(cfg):
     env.close()
 
 
-def test_goal_from_grasp_is_reachable(env):
-    """Weld goals come from arm configurations: q_ref puts the head on the goal with the goal axis."""
+@pytest.mark.parametrize("level", [0.0, 1.0])
+def test_goal_from_grasp_is_reachable(env, level):
+    """Weld goals come from arm configurations: q_ref puts the head on the goal in the goal orientation, and the
+    velocity is within the curriculum's cone of the head axis."""
+    env.set_curriculum(level)
+    cone = env.cfg.curriculum.vel_cone_deg[0] + (env.cfg.curriculum.vel_cone_deg[1]
+                                                  - env.cfg.curriculum.vel_cone_deg[0]) * level
     for _ in range(20):
         env._sample_goal()
         g = env.goal
         assert not env.goal_fallback and g.q_ref is not None
-        head, axis, _ = env._scratch_pose(g.q_ref)
+        head, axis, quat, _ = env._scratch_pose(g.q_ref)
         assert np.linalg.norm(head - g.p) < 1e-3
+        assert np.linalg.norm(mu.quat_error(g.quat, quat)) < np.deg2rad(1.0)
         assert mu.angle_between(axis, g.axis) < np.deg2rad(1.0)
+        assert np.degrees(mu.angle_between(g.v, g.axis)) <= cone + 1e-6
         assert env.goal_sampler.in_region(g.p)
+
+
+def test_full_curriculum_samples_swipes(env):
+    """At level 1 the velocity is independent of the head axis, so many goals move sideways or backwards."""
+    env.set_curriculum(1.0)
+    angles = []
+    for _ in range(40):
+        env._sample_goal()
+        angles.append(np.degrees(mu.angle_between(env.goal.v, env.goal.axis)))
+    assert np.mean(np.array(angles) > 60.0) > 0.3, angles
 
 
 @pytest.mark.parametrize("lateral, expect_pass", [(0.0, True), (2.0, False)])
@@ -153,7 +170,7 @@ def test_crossing_counts_only_near_goal(env, lateral, expect_pass):
     perp = mu.any_perpendicular(d)
     # Plane 1 cm behind the head; pretend the head came from 3 cm behind it.
     p = head - 0.01 * d + lateral * env.cfg.goal.pass_radius * perp
-    env.goal = Goal(p=p, v=0.1 * d, axis=d)
+    env.goal = Goal(p=p, v=0.1 * d, quat=env._tool_quat(), axis=d)
     env._prev_head = head - 0.03 * d
     _, _, term, _, info = env.step(np.zeros(env.action_space.shape))
     assert info["passed"] == expect_pass and term == expect_pass
@@ -164,85 +181,6 @@ def _run_attempt(env, policy):
         _, _, term, trunc, info = env.step(policy(env))
         if term or trunc:
             return info["episode"]
-
-
-@pytest.mark.parametrize("policy", ["oracle", "rush", "random"])
-def test_approach_reward_is_bounded_and_clawed_back(env, policy):
-    """Approach reward per attempt is at most w_approach * D(start); a pass hands back (1 - quality) of it."""
-    rng = np.random.default_rng(0)
-    pol = {"oracle": _speed_scaled_oracle(1.0), "rush": _speed_scaled_oracle(3.0),
-           "random": lambda env: rng.uniform(-1, 1, env.action_space.shape)}[policy]
-    for _ in range(5):
-        bound = env.cfg.reward.w_approach * env.approach_best
-        e = _run_attempt(env, pol)
-        t = e["terms"]
-        assert 0.0 <= t["approach"] <= bound + 1e-9, (t["approach"], bound)
-        assert t["waypoint"] in (0.0, env.cfg.reward.w_waypoint)  # paid at most once per attempt
-        earned = t["approach"] + t["waypoint"]
-        if e["passed"]:
-            paid = e["pass"]["paid_quality"]
-            assert paid == (e["pass"]["quality"] if e["waypoint"] else 0.0)  # no waypoint, no pass reward
-            assert np.isclose(t["clawback"], -(1.0 - paid) * earned)
-        else:
-            assert t["clawback"] == 0.0  # a time-out keeps the approach reward
-        env.reset()
-
-
-def test_pass_without_waypoint_pays_nothing(env):
-    """A perfect crossing that didn't come through the lead-in point earns no pass reward and hands back its
-    approach reward; success is still recorded (the gate is on the training reward only)."""
-    from goals import Goal
-
-    head = env.data.site_xpos[env.head_site].copy()
-    _, lin, _, axis = env._head_state()
-    d = np.array([0.0, 0.0, 1.0])
-    env.goal = Goal(p=head - 0.01 * d, v=0.3 * d, axis=axis)  # plane 1 cm behind the head
-    env._prev_head = head - 0.03 * d
-    env.approach_earned, env.waypoint_hit = 2.0, False
-    _, _, term, _, info = env.step(np.zeros(env.action_space.shape))
-    assert info["passed"] and term
-    t = info["episode"]["terms"]
-    assert t["pass"] == 0.0
-    assert np.isclose(t["clawback"], -2.0 - t["approach"])
-
-
-def test_oracle_strike_is_paid(env):
-    """The lined-up strike goes through the waypoint, so its passes are paid."""
-    pol = _speed_scaled_oracle(1.0)
-    env.reset(seed=11)
-    for _ in range(4):
-        e = _run_attempt(env, pol)
-        if e["success"]:
-            assert e["waypoint"] == 1.0 and e["terms"]["pass"] > env.cfg.reward.success_bonus
-        env.reset()
-
-
-def test_oracle_collects_the_waypoint(env):
-    """The scripted strike goes through the lead-in point aligned, so it earns the waypoint bonus every time."""
-    pol = _speed_scaled_oracle(1.0)
-    env.reset(seed=11)
-    hits = []
-    for _ in range(6):
-        e = _run_attempt(env, pol)
-        if e["success"]:
-            hits.append(e["terms"]["waypoint"])
-        env.reset()
-    assert hits and all(h == env.cfg.reward.w_waypoint for h in hits), hits
-
-
-def test_rushing_hands_back_the_approach_reward(env):
-    """Net approach reward (after clawback) is much higher for a good strike than for rushing through the goal."""
-    net = {}
-    for mult in (1.0, 3.0):
-        env.reset(seed=11)
-        pol = _speed_scaled_oracle(mult)
-        vals = []
-        for _ in range(6):
-            t = _run_attempt(env, pol)["terms"]
-            vals.append(t["approach"] + t["clawback"])
-            env.reset()
-        net[mult] = float(np.mean(vals))
-    assert net[3.0] < 0.4 * net[1.0], net
 
 
 def _speed_scaled_oracle(mult):
@@ -262,26 +200,19 @@ def _speed_scaled_oracle(mult):
     return Scaled()
 
 
-def test_track_reward_pays_for_the_right_traversal(env):
-    """Traversing the lead-in line at the goal velocity earns most of w_track; crawling or rushing earns less, and
-    no attempt ever earns more than w_track."""
-    w = env.cfg.reward.w_track
+def test_pass_reward_prefers_the_right_strike(env):
+    """Striking at the goal velocity earns more pass reward than crawling or rushing through the goal."""
     per_policy = {}
     for mult in (1.0, 0.3, 3.0):
-        oracle = _speed_scaled_oracle(mult)
         env.reset(seed=11)
+        pol = _speed_scaled_oracle(mult)
         got = []
         for _ in range(6):
-            while True:
-                _, _, term, trunc, info = env.step(oracle(env))
-                if term or trunc:
-                    break
-            got.append(info["episode"]["terms"]["track"])
+            got.append(_run_attempt(env, pol)["terms"]["pass"])
             env.reset()
-        assert max(got) <= w + 1e-6, got
         per_policy[mult] = float(np.mean(got))
-    assert per_policy[1.0] > 0.4 * w, per_policy  # the oracle starts from rest at the lead-in point
-    assert per_policy[0.3] < per_policy[1.0] and per_policy[3.0] < per_policy[1.0], per_policy
+    assert per_policy[1.0] > env.cfg.reward.success_bonus, per_policy
+    assert per_policy[0.3] < 0.5 * per_policy[1.0] and per_policy[3.0] < 0.5 * per_policy[1.0], per_policy
 
 
 def test_awkward_posture_recovers_with_reachable_goal(env):
@@ -301,7 +232,7 @@ def test_awkward_posture_recovers_with_reachable_goal(env):
     env._sample_goal()
     assert env.goal_recovery == 1 and not env.goal_fallback
     assert np.linalg.norm(env.data.qpos[env.arm_qadr] - home) < 0.2
-    head, axis, _ = env._scratch_pose(env.goal.q_ref)
+    head, axis, _, _ = env._scratch_pose(env.goal.q_ref)
     assert np.linalg.norm(head - env.goal.p) < 1e-3
     # The re-home must not register as head motion (no spurious goal-plane crossing on the next step).
     np.testing.assert_allclose(env._prev_head, env.data.site_xpos[env.head_site])
@@ -328,7 +259,6 @@ def test_scripted_pass_through_succeeds(physical_cfg):
 
     cfg = physical_cfg
     cfg.success_requires_grasp = False
-    cfg.reward.pass_requires_waypoint = False  # the head is teleported onto the line, not flown through the lead-in
     env = PoseVelocityEnv(cfg)
     env.set_curriculum(0.0)
     env.reset(seed=3)
@@ -336,7 +266,7 @@ def test_scripted_pass_through_succeeds(physical_cfg):
     env.model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
     g = env.goal
     dt = env.model.opt.timestep * cfg.frame_skip
-    env.debug_set_head_state(g.p - g.v * 5 * dt, g.axis, g.v)
+    env.debug_set_head_state(g.p - g.v * 5 * dt, g.quat, g.v)
     success = False
     for _ in range(10):
         _, r, term, trunc, info = env.step(np.zeros(env.action_space.shape))
@@ -345,7 +275,7 @@ def test_scripted_pass_through_succeeds(physical_cfg):
             break
     assert success, f"d_perp={info['d_perp']}"
     assert term
-    # Only the pass term: teleporting the tool out of a scripted grasp also (correctly) costs grasp/approach.
+    # Only the pass term: teleporting the tool out of a scripted grasp also (correctly) costs grasp potential.
     assert env.ep_terms["pass"] > 0.95 * (env.cfg.reward.pass_scale + env.cfg.reward.success_bonus)
     env.close()
 
@@ -367,4 +297,29 @@ def test_oracle_succeeds(cfg):
         successes += info["episode"]["success"]
         env.reset()
     assert successes >= 8, successes
+    env.close()
+
+
+def test_oracle_labels_have_no_jumps(cfg):
+    """The oracle's linear-velocity action changes smoothly along its own rollouts. A hard approach/strike switch
+    jumps by about the goal speed (up to ~0.65 here), and a clone regressed onto it averages the two sides."""
+    from env import PoseVelocityEnv
+    from oracle import Oracle
+
+    env = PoseVelocityEnv(cfg)
+    env.set_curriculum(1.0)
+    env.reset(seed=3)
+    oracle, worst = Oracle(), 0.0
+    for _ in range(6):
+        prev = None
+        while True:
+            a = oracle(env)
+            if prev is not None:
+                worst = max(worst, float(np.abs(a[:3] - prev).max()))
+            prev = a[:3]
+            _, _, term, trunc, _ = env.step(a)
+            if term or trunc:
+                break
+        env.reset()
+    assert worst < 0.3, worst
     env.close()

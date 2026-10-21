@@ -10,7 +10,7 @@ Episode rules (one episode = one goal = one attempt)
 -----------------------------------------------------
 * terminated: the head crosses the goal plane (through p_g, normal v_hat, going forward) within
   pass_radius of p_g: a "pass". It is a success if the crossing distance, the velocity error and the
-  axis error are all within the curriculum tolerances. Physical grip also terminates on a drop.
+  orientation error (full rotation angle to the goal orientation) are all within the curriculum tolerances. Physical grip also terminates on a drop.
 * truncated: time limit (`max_steps`) or physics divergence.
 * The arm is never re-homed between episodes (except on the very first reset, an explicit
   `reset(seed=...)` / `options={"full": True}`, or after physics divergence).
@@ -38,7 +38,7 @@ from gymnasium.utils import seeding
 import mathutils as mu
 from config import EnvCfg
 from goals import Goal, GoalSampler, ReachMap, plane_crossing
-from rewards import approach_distance, grasp_potential, pass_quality, track_quality
+from rewards import grasp_potential, pass_quality
 from scene import SceneBuilder
 from tool_gen import ToolParams, sample_tool
 
@@ -47,10 +47,6 @@ OBJ = mujoco.mjtObj
 
 def _lerp(pair, level: float) -> float:
     return float(pair[0] + (pair[1] - pair[0]) * level)
-
-
-def _conj(q) -> np.ndarray:
-    return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
 class PoseVelocityEnv(gym.Env):
@@ -186,6 +182,7 @@ class PoseVelocityEnv(gym.Env):
         self.goal_mocap = int(m.body_mocapid[name2id(OBJ.mjOBJ_BODY, "goal")])
         self.goal_vel_mocap = int(m.body_mocapid[name2id(OBJ.mjOBJ_BODY, "goal_vel")])
         self.goal_axis_mocap = int(m.body_mocapid[name2id(OBJ.mjOBJ_BODY, "goal_axis")])
+        self.goal_handle_mocap = int(m.body_mocapid[name2id(OBJ.mjOBJ_BODY, "goal_handle")])
         self.goal_vel_gid = name2id(OBJ.mjOBJ_GEOM, "goal_vel_geom")
 
     def _save_robot_state(self) -> dict:
@@ -426,6 +423,13 @@ class PoseVelocityEnv(gym.Env):
         axis = d.xmat[self.tool_id].reshape(3, 3) @ self.tool.head_axis
         return head, vel6[3:].copy(), vel6[:3].copy(), axis
 
+    def _tool_quat(self) -> np.ndarray:
+        return self.data.xquat[self.tool_id].copy()
+
+    def _rot_error(self) -> np.ndarray:
+        """World-frame rotation vector from the tool's orientation to the goal orientation (angle = its norm)."""
+        return mu.quat_error(self.goal.quat, self._tool_quat())
+
     def _physics_ok(self, bad_before: int) -> bool:
         d = self.data
         bad = int(d.warning[int(mujoco.mjtWarning.mjWARN_BADQACC)].number)
@@ -457,7 +461,7 @@ class PoseVelocityEnv(gym.Env):
 
     # Goal sampling works on a scratch MjData: the arm at a candidate q, the tool placed by the weld grasp.
     def _scratch_pose(self, q: np.ndarray):
-        """Kinematics at arm joints q with the welded tool; returns (head_pos, head_axis, palm_pos)."""
+        """Kinematics at arm joints q with the welded tool; returns (head_pos, head_axis, tool_quat, palm_pos)."""
         m, sd = self.model, self._scratch
         sd.qpos[:] = self.data.qpos
         sd.qpos[self.arm_qadr] = q
@@ -467,7 +471,7 @@ class PoseVelocityEnv(gym.Env):
         sd.qpos[self.tool_qadr + 3:self.tool_qadr + 7] = mu.quat_mul(palm_q, self.grasp_quat)
         mujoco.mj_kinematics(m, sd)
         axis = sd.xmat[self.tool_id].reshape(3, 3) @ self.tool.head_axis
-        return sd.site_xpos[self.head_site].copy(), axis, palm_p
+        return sd.site_xpos[self.head_site].copy(), axis, sd.xquat[self.tool_id].copy(), palm_p
 
     def _scratch_collides(self) -> bool:
         """Robot or tool touches the table/floor/pedestal, or the tool touches the arm (after _scratch_pose)."""
@@ -487,7 +491,7 @@ class PoseVelocityEnv(gym.Env):
     def _propose_goal_q(self, rng: np.random.Generator):
         """Random collision-free arm configuration near the current pose (or home), with the welded tool.
 
-        Returns (q, head_pos, head_axis, palm_pos), or None if it collides.
+        Returns (q, head_pos, head_axis, tool_quat, palm_pos), or None if it collides.
         """
         if rng.random() < self.cfg.goal.goal_q_home_prob:
             center = np.asarray(self.cfg.scene.arm_home[: self.n_arm_act], dtype=np.float64)
@@ -495,21 +499,21 @@ class PoseVelocityEnv(gym.Env):
             center = self.data.qpos[self.arm_qadr]
         q = np.clip(center + rng.normal(0.0, self._goal_q_std, self.n_arm_act),
                     self.arm_range[:, 0], self.arm_range[:, 1])
-        head, axis, palm = self._scratch_pose(q)
+        head, axis, quat, palm = self._scratch_pose(q)
         if self._scratch_collides():
             return None
-        return q, head, axis, palm
+        return q, head, axis, quat, palm
 
-    def _ik_reachable(self, q0: np.ndarray, target: np.ndarray, target_axis: np.ndarray, iters: int = 30) -> bool:
-        """Damped-least-squares IK from q0 for the head at `target` with its axis on `target_axis`; True if it
-        converges (3 mm, ~1 deg) to a collision-free configuration within the joint limits."""
+    def _ik_reachable(self, q0: np.ndarray, target: np.ndarray, target_quat: np.ndarray, iters: int = 30) -> bool:
+        """Damped-least-squares IK from q0 for the head at `target` with the tool at orientation `target_quat`; True
+        if it converges (3 mm, ~1 deg) to a collision-free configuration within the joint limits."""
         m, sd = self.model, self._scratch
         q = np.asarray(q0, dtype=np.float64).copy()
         jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
         lam2 = self.cfg.ik_damping ** 2
         for _ in range(iters):
-            head, axis, _ = self._scratch_pose(q)
-            e = np.concatenate([target - head, np.cross(axis, target_axis)])
+            head, _, quat, _ = self._scratch_pose(q)
+            e = np.concatenate([target - head, mu.quat_error(target_quat, quat)])
             if np.linalg.norm(e[:3]) < 3e-3 and np.linalg.norm(e[3:]) < 0.02:
                 return not self._scratch_collides()
             mujoco.mj_comPos(m, sd)  # mj_jac needs cdof / subtree_com, which mj_kinematics doesn't compute
@@ -536,10 +540,10 @@ class PoseVelocityEnv(gym.Env):
         self._a_filt[:] = 0.0
         self._prev_head = d.site_xpos[self.head_site].copy()  # the head jumped; don't count it as motion
 
-    def _sample_weld_goal(self, speed_max: float) -> Optional[Goal]:
+    def _sample_weld_goal(self, speed_max: float, vel_cone: float) -> Optional[Goal]:
         for std_scale in (1.0, 0.5):  # a tighter joint spread finds goals in cramped postures
             self._goal_q_std = self.cfg.goal.goal_q_std * std_scale
-            goal = self.goal_sampler.sample_from_grasp(self.np_random, speed_max, self._propose_goal_q,
+            goal = self.goal_sampler.sample_from_grasp(self.np_random, speed_max, vel_cone, self._propose_goal_q,
                                                        self._ik_reachable)
             if goal is not None:
                 return goal
@@ -547,87 +551,32 @@ class PoseVelocityEnv(gym.Env):
 
     def _sample_goal(self) -> None:
         speed_max = _lerp(self.cfg.curriculum.speed_max, self.level)
+        vel_cone = _lerp(self.cfg.curriculum.vel_cone_deg, self.level)
         goal = None
         self.goal_recovery = 0  # weld: 0 found near the current pose, 1 after re-homing, 2 after a new grasp too
         if self.weld:
             # Goals near the current pose; if none are reachable (an awkward posture), re-home the arm, then also
             # try a new grasp. A weld goal is therefore always reachable with the current grasp: there is no way
             # to dodge goals by parking the arm somewhere they can't be sampled.
-            goal = self._sample_weld_goal(speed_max)
+            goal = self._sample_weld_goal(speed_max, vel_cone)
             if goal is None:
                 self.goal_recovery = 1
                 self._rehome_weld()
-                goal = self._sample_weld_goal(speed_max)
+                goal = self._sample_weld_goal(speed_max, vel_cone)
             if goal is None:
                 self.goal_recovery = 2
                 self._weld_tool()
                 self._prev_head = self.data.site_xpos[self.head_site].copy()
-                goal = self._sample_weld_goal(speed_max)
+                goal = self._sample_weld_goal(speed_max, vel_cone)
         # Last resort (never seen in testing for weld): the grasp-agnostic region sampler; may be unreachable.
         self.goal_fallback = goal is None and self.weld
-        self.goal: Goal = goal if goal is not None else self.goal_sampler.sample(self.np_random, speed_max)
+        if goal is None:
+            goal = self.goal_sampler.sample(self.np_random, speed_max, vel_cone, self.tool.head_axis)
+        self.goal: Goal = goal
         self._update_goal_markers()
-        # Approach progress is paid against the attempt's best D so far, starting from D where the goal appears.
-        h, _, _, a = self._head_state()
-        self.approach_best = self._approach_distance(h, a)
-        self.approach_earned = 0.0  # this attempt's approach + waypoint reward, for the clawback at a pass or drop
-        self.waypoint_hit = False
-        self.track_budget = self.cfg.goal.lead_in  # metres of forward motion the track reward can pay for
-
-    def _track_s(self, head) -> float:
-        """Signed position of the head along the goal direction: -lead_in at the lead-in point, 0 at the plane."""
-        return float((head - self.goal.p) @ self.goal.direction)
-
-    def _track_reward(self, head, prev_head, lin, theta) -> float:
-        """w_track * quality * (this step's forward motion along the lead-in segment) / lead_in.
-
-        Each attempt has a budget of lead_in metres of forward motion, so it earns at most w_track; backtracking and
-        re-advancing only spends the budget again. Only motion near the line (within track_radius) and starting
-        behind the goal plane counts or spends: getting into position off the line uses none of it.
-        """
-        g, L = self.goal, self.cfg.goal.lead_in
-        s_prev = self._track_s(prev_head)
-        if s_prev > 0.0 or self.track_budget <= 0.0:
-            return 0.0
-        s = self._track_s(head)
-        rel = head - g.p
-        d_line = float(np.linalg.norm(rel - s * g.direction))
-        if d_line > self.cfg.reward.track_radius:
-            return 0.0
-        clip = lambda x: min(max(x, -L), 0.0)  # noqa: E731
-        gained = min(self.track_budget, max(0.0, clip(s) - clip(s_prev)))
-        self.track_budget -= gained
-        if gained == 0.0:
-            return 0.0
-        q = track_quality(self.cfg.reward, d_line=d_line,
-                          dv_frac=float(np.linalg.norm(lin - g.v) / max(g.speed, 1e-6)), theta=theta)
-        return self.cfg.reward.w_track * q * gained / L
-
-    def _waypoint_reward(self, head, theta) -> float:
-        """w_waypoint, once per attempt, for reaching the lead-in point with the axis aligned."""
-        rc = self.cfg.reward
-        near = np.linalg.norm(head - self.lead_point()) <= rc.waypoint_radius
-        if self.waypoint_hit or not near or theta > np.deg2rad(rc.waypoint_theta_deg):
-            return 0.0
-        self.waypoint_hit = True
-        self.approach_earned += rc.w_waypoint
-        return rc.w_waypoint
 
     def lead_point(self) -> np.ndarray:
         return self.goal.p - self.cfg.goal.lead_in * self.goal.direction
-
-    def _approach_distance(self, head, axis) -> float:
-        return approach_distance(self.cfg.reward, d_lead=float(np.linalg.norm(head - self.lead_point())),
-                                 theta=mu.angle_between(axis, self.goal.axis))
-
-    def _approach_reward(self, head, axis) -> float:
-        """w_approach * (improvement of the attempt's best D); at most w_approach * D(start) per attempt."""
-        D = self._approach_distance(head, axis)
-        gained = max(0.0, self.approach_best - D)
-        self.approach_best = min(self.approach_best, D)
-        r = self.cfg.reward.w_approach * gained
-        self.approach_earned += r
-        return r
 
     def _update_goal_markers(self) -> None:
         m, d, g = self.model, self.data, self.goal
@@ -636,6 +585,8 @@ class PoseVelocityEnv(gym.Env):
         d.mocap_quat[self.goal_vel_mocap] = mu.quat_from_two_vectors([0, 0, 1], g.direction)
         d.mocap_pos[self.goal_axis_mocap] = g.p
         d.mocap_quat[self.goal_axis_mocap] = mu.quat_from_two_vectors([0, 0, 1], g.axis)
+        d.mocap_pos[self.goal_handle_mocap] = g.p
+        d.mocap_quat[self.goal_handle_mocap] = g.quat  # the tool frame: its z is the handle direction
         half = 0.05 + 0.15 * g.speed  # arrow length scales with target speed
         m.geom_size[self.goal_vel_gid][1] = half
         m.geom_pos[self.goal_vel_gid][2] = half
@@ -742,7 +693,7 @@ class PoseVelocityEnv(gym.Env):
         head, lin, ang, axis = self._head_state()
         g = self.goal
         dp, dv = head - g.p, lin - g.v
-        theta = mu.angle_between(axis, g.axis)
+        theta = float(np.linalg.norm(self._rot_error()))
 
         if self._grasp_condition():
             self.ever_grasped = True
@@ -771,28 +722,17 @@ class PoseVelocityEnv(gym.Env):
 
         terminated = passed or dropped
         truncated = (not terminated) and self.t >= cfg.max_steps
-        terms = {"approach": self._approach_reward(head, axis) if holding else 0.0,
-                 "waypoint": self._waypoint_reward(head, theta) if holding else 0.0,
-                 "track": self._track_reward(head, prev_head, lin, theta) if holding else 0.0,
-                 "contact": -rc.w_env_contact if self._env_contact() else 0.0,
-                 "pass": 0.0, "clawback": 0.0}
+        terms = {"contact": -rc.w_env_contact if self._env_contact() else 0.0, "pass": 0.0}
         if passed:
+            q = pass_quality(rc, d_perp=d_perp, dv=float(np.linalg.norm(dv)), speed=g.speed, theta=theta)
+            terms["pass"] = rc.pass_scale * q + (rc.success_bonus if success else 0.0)
             v_along = float(lin @ g.direction)
-            q = pass_quality(rc, d_perp=d_perp, v_along=v_along,
-                             v_side=float(np.linalg.norm(lin - v_along * g.direction)), speed=g.speed, theta=theta)
-            # Without the waypoint (lined up behind the goal), a pass earns nothing and hands back all the approach
-            # reward: cutting in from the side can't pay, however close it gets.
-            paid_q = q if (self.waypoint_hit or not rc.pass_requires_waypoint) else 0.0
-            terms["pass"] = rc.pass_scale * paid_q + (rc.success_bonus if success and paid_q > 0 else 0.0)
-            # A poor pass hands back the attempt's approach and waypoint reward, so rushing through goals doesn't
-            # farm them.
-            terms["clawback"] = -(1.0 - paid_q) * self.approach_earned
             v_side = float(np.linalg.norm(lin - v_along * g.direction))
             self.pass_info = {"d_perp": d_perp, "dv_frac": float(np.linalg.norm(dv) / max(g.speed, 1e-6)),
                               "v_along_frac": v_along / max(g.speed, 1e-6), "v_side_frac": v_side / max(g.speed, 1e-6),
-                              "theta_deg": float(np.degrees(theta)), "quality": q, "paid_quality": paid_q}
-        elif dropped:
-            terms["clawback"] = -self.approach_earned
+                              "theta_deg": float(np.degrees(theta)), "quality": q,
+                              # Angle between the goal velocity and the goal head axis: 0 = strike, 90 = swipe.
+                              "swipe_deg": float(np.degrees(mu.angle_between(g.v, g.axis)))}
         if not self.weld:
             phi = self._grasp_potential(holding)
             terms["grasp"] = phi - self.phi_prev
@@ -827,7 +767,6 @@ class PoseVelocityEnv(gym.Env):
                 "passed": float(passed), "d_min": float(self.d_best) if np.isfinite(self.d_best) else float("nan"),
                 "ever_grasped": float(self.ever_grasped), "diverged": float(self.diverged),
                 "goal_fallback": float(self.goal_fallback), "goal_recovery": float(self.goal_recovery),
-                "waypoint": float(self.waypoint_hit),
                 "next_reset": kind, "level": self.level,
                 "terms": dict(self.ep_terms), "start": self.start_type, "closest": dict(self.closest),
                 "pass": dict(self.pass_info)}
@@ -851,8 +790,8 @@ class PoseVelocityEnv(gym.Env):
             # Tool pose in the palm frame (for weld this is the grasp).
             R_palm.T @ (d.xpos[self.tool_id] - palm), mu.rot6d(R_palm.T @ R_tool),
             self.tool.features(),
-            g.p, g.v, g.axis,
-            head - g.p, lin - g.v, np.cross(axis, g.axis), [float(np.dot(axis, g.axis))],
+            g.p, g.v, mu.rot6d(mu.quat_to_mat(g.quat)),
+            head - g.p, lin - g.v, self._rot_error(),
             self.lead_point() - head,
             [eps_p, eps_v, eps_th],
         ]
@@ -883,12 +822,12 @@ class PoseVelocityEnv(gym.Env):
         return self._oracle(self).astype(np.float32)
 
     # ------------------------------------------------------------------ test / debug helpers
-    def debug_set_head_state(self, head_pos, axis, lin_vel) -> None:
-        """Teleports the tool so its head center is at head_pos, head axis along `axis`, moving at lin_vel.
+    def debug_set_head_state(self, head_pos, quat, lin_vel) -> None:
+        """Teleports the tool so its head center is at head_pos, the tool at orientation quat, moving at lin_vel.
 
         Physical grip only: with weld the grip constraint would pull the tool back to the palm.
         """
-        q = mu.quat_from_two_vectors(self.tool.head_axis, axis)
+        q = mu.normalize(quat)
         body_pos = np.asarray(head_pos) - mu.rotate(q, self.tool.head_pos)
         self._set_tool_pose(body_pos, q, linvel=lin_vel)
         mujoco.mj_forward(self.model, self.data)

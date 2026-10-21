@@ -1,15 +1,10 @@
-"""Reward terms. Pure functions returning floats or dicts of named terms (summed by the env, logged per term).
+"""Reward terms. Pure functions returning floats (summed by the env, logged per term).
 
-Five parts:
-  pass      paid once, when the head crosses the goal plane near p_g (the attempt ends there)
-  approach  paid for each new best distance to the lead-in point (plus axis error) during an attempt, so it points
-            the way immediately; at a pass, (1 - pass quality) of it is clawed back, so rushing through the goal to
-            get a fresh goal (and fresh approach reward) hands it back, while a time-out keeps it
-  waypoint  a one-off bonus for reaching the lead-in point with the axis aligned; clawed back like approach
-  track     paid for forward motion along the lead-in segment, times a quality factor for staying on the line at
-            the goal velocity and axis (see track_quality); at most w_track per attempt
+Set up for PPO fine-tuning of a policy that already strikes (e.g. a bc.py clone), so the reward is just the task:
+  pass      paid once, when the head crosses the goal plane near p_g (the attempt ends there):
+            pass_scale * pass_quality, plus success_bonus if the pass is within the success tolerances
   contact   small per-step penalty for hitting the table / floor / pedestal
-Physical grip adds a grasp potential (Phi' - Phi) and a drop penalty (a drop also claws back all approach reward).
+Physical grip adds a grasp potential (Phi' - Phi) and a drop penalty.
 """
 from __future__ import annotations
 
@@ -18,35 +13,15 @@ import numpy as np
 from config import RewardCfg
 
 
-def pass_quality(cfg: RewardCfg, *, d_perp: float, v_along: float, v_side: float, speed: float,
-                 theta: float) -> float:
-    """Quality of one pass in [0, 1]. Multiplicative, so it is high only when position, velocity and axis are all
-    good at once (a head parked on the goal scores nothing).
+def pass_quality(cfg: RewardCfg, *, d_perp: float, dv: float, speed: float, theta: float) -> float:
+    """Quality of one pass in [0, 1]: exp(-(d_perp/sigma_p + dv/(sigma_v_frac*speed) + theta/sigma_theta)).
 
-    v_along / v_side: the head velocity's components along / across the goal direction. The speed error along it is
-    scored leniently (a pass at 3x speed still scores something, so slowing down visibly pays); sideways velocity
-    is scored steeply, so cutting across the plane at an angle scores low, and every degree of approach angle given
-    up pays.
+    dv is the full velocity error |v_head - v_g|, so sideways motion costs as much as a wrong speed. Each factor is
+    1/e at its scale; the scales default to the tightest success tolerances, so the reward keeps sharpening the strike
+    inside the success region. Multiplicative, so it is high only when position, velocity and axis are all good.
     """
     s = max(speed, 1e-6)
-    return float(np.exp(-d_perp / cfg.sigma_p) * np.exp(-abs(v_along - speed) / (cfg.sigma_v_frac * s))
-                 * np.exp(-abs(v_side) / (cfg.sigma_v_perp_frac * s)) * max(0.0, np.cos(theta)))
-
-
-def track_quality(cfg: RewardCfg, *, d_line: float, dv_frac: float, theta: float) -> float:
-    """How well the head is moving along the lead-in line: on the line, at the goal velocity, axis aligned.
-
-    The track reward is this times the new distance covered, so it is paid per distance, not per step:
-    crawling earns nothing extra (and lowers the velocity factor), rushing lowers the velocity factor, and
-    backtracking only spends the attempt's budget again.
-    """
-    return float(np.exp(-d_line / cfg.track_sigma_line) * np.exp(-dv_frac / cfg.track_sigma_v_frac)
-                 * max(0.0, np.cos(theta)))
-
-
-def approach_distance(cfg: RewardCfg, *, d_lead: float, theta: float) -> float:
-    """D: how far the head is from being at the lead-in point with its axis aligned (dimensionless)."""
-    return float(d_lead / cfg.approach_scale + theta / cfg.approach_theta_scale)
+    return float(np.exp(-d_perp / cfg.sigma_p - dv / (cfg.sigma_v_frac * s) - theta / np.deg2rad(cfg.sigma_theta_deg)))
 
 
 def grasp_potential(cfg: RewardCfg, *, reach_dist: float, n_tip_contacts: int, n_tips: int, hand_contact: bool,

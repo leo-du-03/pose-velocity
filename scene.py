@@ -271,6 +271,11 @@ def build_base_spec(cfg: SceneCfg):
     ga = wb.add_body(name="goal_axis", mocap=True)
     ga.add_geom(name="goal_axis_geom", type=_GEOM.mjGEOM_CAPSULE, size=[0.003, 0.06, 0], pos=[0, 0, 0.06],
                 rgba=[0.1, 0.4, 1.0, 0.8], **nocol)
+    # Oriented as the goal tool frame; the bar runs along the tool's handle (-z, from the head back toward the hand),
+    # which together with the head axis pins down the full goal orientation.
+    gh = wb.add_body(name="goal_handle", mocap=True)
+    gh.add_geom(name="goal_handle_geom", type=_GEOM.mjGEOM_CAPSULE, size=[0.003, 0.05, 0], pos=[0, 0, -0.05],
+                rgba=[0.95, 0.8, 0.1, 0.8], **nocol)
 
     info = RobotInfo(
         arm_joints=arm_joints,
@@ -355,12 +360,12 @@ def _main():
     print(f"tool: handle={t.handle_type} L={t.handle_len:.3f} r={t.handle_rad:.3f} head={t.head_type} "
           f"layout={t.layout} mass={t.mass:.3f}kg")
     g = env.goal
-    print(f"goal: p={np.round(g.p, 3)} v={np.round(g.v, 3)} axis={np.round(g.axis, 3)}")
+    print(f"goal: p={np.round(g.p, 3)} v={np.round(g.v, 3)} axis={np.round(g.axis, 3)} quat={np.round(g.quat, 3)}")
     print(f"reset kind: {info['reset_kind']}  reach voxels: {len(env.reach.keys)}")
     if args.view:
         from mujoco import viewer  # `import mujoco.viewer` here would shadow the module-level mujoco
 
-        print("Opening viewer: green sphere = goal point, red arrow = goal velocity, blue = goal head axis.")
+        print("Opening viewer: green sphere = goal point, red arrow = goal velocity, blue = goal head axis, yellow = goal handle direction.")
         viewer.launch(env.model, env.data)
 
 

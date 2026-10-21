@@ -13,7 +13,7 @@ import time
 
 import numpy as np
 
-from config import EnvCfg
+from config import EnvCfg, RewardCfg
 from env import PoseVelocityEnv
 from oracle import Oracle
 
@@ -49,6 +49,7 @@ def main():
 
         ck = torch.load(args.ckpt, map_location=args.device, weights_only=False)
         cfg, level = ck["env_cfg"], ck["level"]
+        cfg.reward = RewardCfg()  # rewards don't affect evaluation; older checkpoints' RewardCfg lacks current fields
         agent = ActorCritic(ck["obs_dim"], ck["priv_dim"], ck["act_dim"], ck["ppo_cfg"]).to(args.device)
         agent.load_state_dict(ck["agent"])
         agent.eval()
@@ -106,7 +107,7 @@ def main():
         e = info["episode"]
         results.append(e)
         ps = e["pass"]
-        pass_txt = (f"pass d {ps['d_perp'] * 100:4.1f}cm v {ps['dv_frac']:.2f}xv axis {ps['theta_deg']:3.0f}deg"
+        pass_txt = (f"pass d {ps['d_perp'] * 100:4.1f}cm v {ps['dv_frac']:.2f}xv rot {ps['theta_deg']:3.0f}deg"
                     if ps else "no pass")
         print(f"episode {ep}: start {start_kind:7s}  return {ep_ret:8.2f}  len {e['length']:4d}  "
               f"success {bool(e['success'])}  dropped {bool(e['dropped'])}  {pass_txt}  "

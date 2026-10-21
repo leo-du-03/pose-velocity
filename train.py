@@ -23,8 +23,9 @@ from vec_env import SerialVecEnv, SubprocVecEnv
 # torch / ppo are imported inside the functions that use them: env workers are started with "spawn",
 # which re-imports this module in every worker, and a top-level torch import costs ~350 MB per worker.
 
-# Checkpoint layout version. 2: separate actor/critic optimizers, weld / head-twist env.
-CKPT_FORMAT = 2
+# Checkpoint layout version. 2: separate actor/critic optimizers, weld / head-twist env. 3: full goal orientation
+# in the observation (obs layout changed).
+CKPT_FORMAT = 3
 
 
 class Curriculum:
@@ -78,7 +79,7 @@ def episode_diagnostics(ep_stats, cc, level: float) -> dict:
         out["pass/theta_deg"] = float(np.mean(th))
         # Velocity at the crossing split along / across the goal direction, as fractions of goal speed. A large
         # sideways part means the policy is cutting across the plane instead of lining up behind the goal.
-        for k in ("v_along_frac", "v_side_frac", "quality"):
+        for k in ("v_along_frac", "v_side_frac", "quality", "swipe_deg"):
             vals = [c[k] for c in passes if k in c]
             if vals:
                 out[f"pass/{k}"] = float(np.mean(vals))
@@ -130,13 +131,14 @@ def parse_args():
                    help="iterations at the start that train only the critic, with the actor frozen "
                         "(default: 20 with --init-from, else 0)")
     p.add_argument("--reward-from-config", action="store_true",
-                   help="on --resume / --init-from, use RewardCfg from config.py instead of the checkpoint's")
+                   help="on --resume, use RewardCfg from config.py instead of the checkpoint's "
+                        "(--init-from always does)")
     p.add_argument("--save-every", type=int, default=PPOCfg.save_every)
     # Overrides applied on top of the config (also on --resume, where the checkpoint's config is used otherwise).
     p.add_argument("--eps-p", type=float, nargs=2, metavar=("LEVEL0", "LEVEL1"), default=None,
                    help="success position tolerance in meters at curriculum level 0 and 1, e.g. --eps-p 0.08 0.01")
     p.add_argument("--sigma-p", type=float, default=None,
-                   help="position scale (m) of the phase distance D used by the goal reward, e.g. 0.02")
+                   help="position scale (m) of the pass reward, e.g. 0.02")
     return p.parse_args()
 
 
@@ -187,7 +189,9 @@ def main():
         else:
             init = loaded
         env_cfg = loaded["env_cfg"]
-        if args.reward_from_config:
+        # A fine-tuning run (--init-from) always uses the current reward: a bc.py checkpoint's RewardCfg is just
+        # whatever config.py held when it was cloned, and older ones lack fields the env now reads.
+        if args.reward_from_config or path == args.init_from:
             env_cfg.reward = RewardCfg()
     if args.grip_mode is not None:
         env_cfg.grip_mode = args.grip_mode
@@ -290,10 +294,10 @@ def main():
             buf["actions"][t] = action
 
             obs_np, priv_np, rew, term, trunc, eps = venv.step(action.clamp(-1, 1).cpu().numpy())
-            # Episode boundaries (a pass, a time limit, a new goal, a regrip or respawn) don't end the world:
-            # the post-reset obs is the true next state, so keep bootstrapping through them. Only a drop
-            # (a real failure) or physics divergence (a teleport home) cuts the return.
-            cut = np.array([e is not None and bool(e["dropped"] or e["diverged"]) for e in eps])
+            # Every episode end cuts the return, so each goal is scored on its own pass. Bootstrapping into the next
+            # goal would pay for reaching it sooner, i.e. for rushing through this one. A time limit is cut too: the
+            # time remaining is in the observation, so the value of the last step doesn't depend on what follows.
+            cut = term | trunc
             r = scaler(rew.astype(np.float64), cut) if ppo_cfg.scale_rewards else rew
             buf["rewards"][t] = torch.as_tensor(r, **f32)
             buf["dones"][t] = torch.as_tensor(cut, **f32)
@@ -340,7 +344,7 @@ def main():
         log["level"] = curriculum.level
         if ep_stats:
             for k in ("return", "length", "success", "passed", "dropped", "ever_grasped", "diverged",
-                      "goal_fallback", "goal_recovery", "waypoint"):
+                      "goal_fallback", "goal_recovery"):
                 log[f"ep/{k}"] = float(np.mean([e.get(k, 0.0) for e in ep_stats]))
             d_min = [e["d_min"] for e in ep_stats if np.isfinite(e["d_min"])]
             if d_min:
@@ -364,7 +368,6 @@ def main():
         g = lambda k: log.get(k, float("nan"))  # noqa: E731
         print(f"it {it:5d} step {global_step:10d} | sps {sps:7.0f} | lvl {curriculum.level:.2f} | "
               f"ret {g('ep/return'):8.2f} | succ {g('ep/success'):.3f} | pass {g('ep/passed'):.3f} | "
-              f"wpt {g('ep/waypoint'):.3f} | "
               f"eval succ {g('eval/success'):.3f} | "
               f"drop {g('ep/dropped'):.3f} | kl {train_stats['final_kl']:.4f} ({train_stats['steps']} steps) "
               f"clip {train_stats['clipfrac']:.3f} lr {train_stats['lr']:.1e} std {train_stats['std']:.3f}")
