@@ -129,6 +129,87 @@ Run every command from the project root.
    - The oracle-mixing schedule decays per round, so with fewer envs scale `--rounds` and `--beta-decay` to keep the total data and the oracle-guided share about the same. The training envs execute about `(training envs × rollout steps) / (1 − beta_decay)` oracle actions in total. For example, `--num-envs 24 --rounds 180 --beta-decay 0.86` gives about 1.1M samples and 37k oracle actions, close to the 32-env defaults over 150 rounds.
    - `--init-from` loads the weights and observation normalizers. The optimizer, curriculum and step count start fresh, and the reward comes from `config.py` (the fine-tuning reward), not from the checkpoint. For the first `--critic-warmup` iterations (20 by default) only the critic trains: advantages from an untrained critic would otherwise push the actor off the cloned behavior before PPO has a useful signal. A lower `--lr` than from scratch also helps keep it close.
 
+9. **Task evaluation**: hammer a plate, hammer a nail, sweep a dirty board.
+   ```bash
+   python evaluate_tasks.py --task plate --policy trace --episodes 20                   # the trace's own accuracy, ~100%
+   python evaluate_tasks.py --task nail --ckpt runs/strike_bc/ckpt_best.pt --episodes 50
+   python evaluate_tasks.py --task sweep --ckpt runs/strike_bc/ckpt_best.pt --episodes 20 --video sweep.mp4
+   ```
+   See [Task evaluation](#task-evaluation) below.
+
+## Task evaluation
+
+`tasks.py` builds three task envs on top of `PoseVelocityEnv`, each with a fixed tool and fixtures:
+
+| task | tool | goal | success |
+|---|---|---|---|
+| `plate` | hammer (round handle, box head) | hit a plate with a target peak force | peak force within `force_tol` (15%) of the target |
+| `nail` | hammer | hit a vertical nail head, straight down, with a target peak force | the face hits the nail head first, within `nail_tol` (1.2 cm) of its axis, and the force is within 15% |
+| `sweep` | brush with a spring-loaded bristle pad | sweep a dirty patch; heavier dirt needs more force | at least 95% of the dirt (weighted by level) removed |
+
+Each episode samples an instance and builds a **trace**: head position, tool orientation, velocity and angular velocity at every control step (`traces.Trace`). If the trace is followed exactly, the task is achieved exactly:
+
+- **Hammer tasks:**
+  - The force is the **impact** only: the peak normal contact force between the hammer and the plate or nail in the first 6 ms of contact (`impact_window`), measured every physics substep. Impulse is reported too.
+    - In that time the force comes from the hammer's own momentum. The hammer is coupled to the hand through the weld's ~10 ms softness, so the arm's push hasn't arrived yet. With these settings the peak is on the first contact substep.
+    - A longer window (30 ms before) mostly measures how hard the arm keeps pushing after the hit. Policies are never trained on that, because training episodes end at the goal. One checkpoint drove the nail straight down and scored +24% that way, though its impact speed was within 3% of the trace's.
+    - The nail is held by friction (`nail_hold`, 80 N, no damping), like a real nail. Viscous resistance would make the force keep rising for as long as the arm pushes.
+    - The plate's impact force is sensitive to the face being square: a face tilted a few degrees strikes a rigid plate on an edge and gives a higher spike.
+  - The peak force depends on the arm, the weld and the contact softness, so each episode calibrates it by simulation:
+    1. From a snapshot, the reference follower runs the strike at five impact speeds (0.3–0.6 m/s).
+    2. The target force is drawn from the range that measures, and its speed is interpolated, then refined with up to two more rollouts.
+    3. `trace.meta["follower_force_err"]` records how close the follower got; instances where it misses by more than half the tolerance are resampled.
+  - The hammer is always **held the way a person holds one** (`HammerTask.grasp`), not at the random grasps of training:
+    - the handle runs across the fingers, with the hand `grasp_from_end` (6 cm) from the end of the handle;
+    - the head is beyond the index finger and thumb;
+    - the striking face points the way the knuckles do (the hand's finger direction, along the flange axis), so a swing of the wrist and elbow drives the face into the target.
+
+    Small jitter (±1 cm along the handle, ±8° about it) keeps it natural. The grasp is still part of the observation, as in training.
+  - Every strike starts with a **windup** (`TaskCfg.windup`, on by default), as a person swings a hammer:
+    1. **Raise.** A smooth joint-space move from wherever the arm is to the top of the windup. Moving the whole arm avoids the awkward postures and singularities a straight Cartesian move can run into.
+    2. **Pause** at the top.
+    3. **Swing.** The head travels down an arc into the target, as if pivoting at the wrist or elbow `windup_radius` (35 cm) back along the handle. The tool rotates with the arc, so the head axis is tangent to it and points along the strike at contact. The swing accelerates over the first 60% of the arc and holds the impact speed for the rest.
+    4. **Follow-through** along the arc.
+  - The backswing is the largest of `windup_angles` (80°, 65°, 50°, 35°, 20°) for which the whole motion checks out. The check walks the motion as executed (the joint-space raise, then the arc) and requires every point to be reachable, collision-free, above the table, in front of the target, and away from singularities (`min_arm_margin`).
+  - Policies get two extra goals before the hit: halfway up the raise and halfway down the swing. Each is used only if it is at least `GoalCfg.speed_min` fast, so it looks like a training goal.
+  - Each goal's time limit is `EnvCfg.max_steps` or 1.5× the trace's own time to it, whichever is longer.
+  - With `windup = False`, the trace is a straight run-up instead: approach, hold at the pre-strike point, accelerate, constant speed over `lead_in` to the contact, then follow-through.
+- **Sweep:**
+  - The brush's bristle pad is a spring along the tool's axis, so its force is set by how far the head is pressed down. A static calibration of the pad on the board maps depth to force.
+  - Each dirt cell needs a minimum force by level: 3, 8 and 14 N. A cell is removed whenever it is under the pad while the pad pushes at least that hard.
+  - Along each stroke, the trace presses for the strongest dirt under the brush plus a 15% margin, smoothed so the requirement is never undercut.
+  - Strokes run back and forth across the patch. Each starts with a `lead_in`-long run-up and ends with lift, transfer and lower moves to the next.
+- **"Followed exactly"** is defined by `traces.TraceFollower` (`--policy trace`). It tracks the trace with feedforward plus feedback, and inverts the action EMA so the smoothed command equals what it asks for. On the in-distribution layout it hits the target force to within about 1% and clears all of the dirt, with about 2 mm of path error.
+
+**How a trained policy sees a trace:**
+- Policies only know single goals, so the env gives them the trace's **keypoints** one at a time, as ordinary goals in the training observation format:
+  - for hammering, the head at the moment of contact, at the impact velocity;
+  - for sweeping, waypoints every 4 cm through the dirt, at the sweep speed, plus one goal in the middle of each transfer.
+- The env advances to the next keypoint when the head crosses the current one's goal plane. It resets the per-goal clock each time, so the time-remaining input looks like training.
+- An episode ends when the task is done, after 20 s, or when a keypoint isn't reached within `EnvCfg.max_steps`.
+
+**Layouts (`--layout`):**
+- `in_dist` (the default) keeps the fixtures where training goals are:
+  - Plate instances are built from the tool pose at a random arm configuration near the current one, like weld goal sampling, so the strike is reachable and within `GoalCfg.min_dir_z`. The plate is placed so the hammer face meets it there.
+  - The nail always stands vertical, like a standard nailing task. Its block sits on a platform that puts the hammer head at a training goal height at contact (`TaskCfg.nail_height`, 15–28 cm above the table, so the top of the windup is still reachable and inside the goal heights). The strike is straight down. Training covers that since `GoalCfg.min_dir_z` became −1 with `down_frac` (checkpoints trained with the old −0.5 never saw it).
+  - The sweep board is raised 12 cm.
+- `realistic` lays the plate flat on the table and puts the nail block directly on the table, both struck straight down, and sweeps a mat on the tabletop. This is out of distribution for the current policies.
+
+Every task episode starts from home with a new grasp (`TaskCfg.rehome_each_episode`). Settings are in `TaskCfg` in `config.py`.
+
+**Output:** each episode prints its metrics; the run ends with a summary.
+- **Hammer tasks:**
+  - target and peak force, and the relative error;
+  - contact speed along the normal;
+  - contact-point error (and, for the nail, the distance off the nail axis);
+  - orientation error at contact;
+  - for the nail, how far it was driven;
+  - how many of the windup goals the policy passed.
+- **Sweep:**
+  - the fraction cleaned, overall and per dirt level;
+  - the mean force shortfall on cells that were touched but not cleaned.
+- **Path:** the mean distance from the head to the trace's path, ignoring timing. It includes the approach, where a policy takes its own route.
+
 ## Command-line flags
 
 Defaults marked `PPOCfg` come from `config.py`.
@@ -160,6 +241,10 @@ Defaults marked `PPOCfg` come from `config.py`.
 | `--save-every N` | `50` (`PPOCfg.save_every`) | Checkpoint interval in iterations |
 | `--eps-p LEVEL0 LEVEL1` | `0.08 0.03` | Success position tolerance in meters at curriculum level 0 and 1. Also overrides a resumed checkpoint's config |
 | `--sigma-p S` | `0.03` | Position scale in meters of the pass reward. Also overrides a resumed checkpoint's config |
+| `--eps-v-frac LEVEL0 LEVEL1` | `0.6 0.25` | Success velocity tolerance as a fraction of the goal speed at curriculum level 0 and 1. Also overrides a resumed checkpoint's config. The scripted oracle meets 0.15 about 64% of the time and 0.1 only about 18%, so don't go below about 0.15 |
+| `--sigma-v-frac S` | `0.25` | Velocity scale (fraction of the goal speed) of the pass reward. Also overrides a resumed checkpoint's config |
+| `--min-dir-z Z` | `-0.5` | Steepest downward goal velocity (the z of its direction); `-1` allows straight-down strikes such as the vertical nail task. Also overrides a resumed checkpoint's config |
+| `--grasp-slide F` | `0.3` | Weld grasps slide up to this fraction of the handle's half length from its center; `0.7` reaches grips near the end of the handle, like the task hammer grip. Also overrides a resumed checkpoint's config |
 
 ### `evaluate.py`
 
@@ -204,6 +289,24 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 | `--serial` | off | Run envs in the main process |
 | `--logdir DIR`, `--name NAME` | `runs`, `bc_<timestamp>` | Output directory |
 
+### `evaluate_tasks.py`
+
+| flag | default | description |
+|---|---|---|
+| `--task {plate,nail,sweep}` | required | Which task |
+| `--ckpt CKPT` | none | Checkpoint to load (weld grip and `head_twist` only); the env config and curriculum level are taken from it |
+| `--policy {ckpt,trace,zero}` | `ckpt` if `--ckpt` is given, else `trace` | `trace` is the reference trace follower |
+| `--episodes N` | `10` | Number of episodes |
+| `--layout {in_dist,realistic}` | `in_dist` | Fixture placement (see [Task evaluation](#task-evaluation)) |
+| `--level L` | from checkpoint, else `1` | Curriculum level; only sets the success tolerances in the observation |
+| `--stochastic` | off | Sample actions instead of using the mean |
+| `--render {none,human,rgb_array}` | `none` | Render mode; `human` opens the viewer |
+| `--video PATH` | none | Write an mp4 (implies `--render rgb_array`) |
+| `--realtime` | off | Slow down to real time in the viewer |
+| `--save-traces DIR` | none | Save each episode's trace to `DIR/ep<k>.npz` (`t`, `p`, `quat`, `v`, `w`, `phase`, `force_target`, `keypoint_idx`, `meta`) |
+| `--seed N` | `0` | Seed |
+| `--device DEVICE` | `cpu` | Torch device for the policy |
+
 ### `scene.py`
 
 | flag | default | description |
@@ -216,9 +319,9 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 
 | file | contents |
 |---|---|
-| `config.py` | Every tunable setting: scene, tool ranges, goal region, reward weights, curriculum, PPO |
+| `config.py` | Every tunable setting: scene, tool ranges, goal region, reward weights, curriculum, PPO, tasks |
 | `scene.py` | Attaches the LEAP hand to the UR5e flange (`MjSpec.attach`) and adds the table, floor and goal markers. Recompiles the model per tool, with an optional palm-tool weld. |
-| `tool_gen.py` | Random tool: handle (cylinder/capsule/box) + head (box/cylinder/sphere/ellipsoid/capsule) in a T, L or inline layout |
+| `tool_gen.py` | Random tool: handle (cylinder/capsule/box) + head (box/cylinder/sphere/ellipsoid/capsule) in a T, L or inline layout; `build_tool` for fixed shapes, with an optional bristle pad |
 | `goals.py` | Goal sampling, either from arm configurations with the current grasp (weld) or from a precomputed reach map (physical), plus the goal-plane crossing test |
 | `rewards.py` | Pass quality, and the grasp potential for physical grip |
 | `env.py` | `PoseVelocityEnv` (Gymnasium) |
@@ -228,15 +331,18 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 | `evaluate.py` | Evaluation: viewer, video, success stats |
 | `oracle.py` | The scripted `Oracle` strike (privileged), used by `evaluate.py --policy oracle` and as the `bc.py` expert |
 | `bc.py` | DAgger behavior cloning of the oracle into the actor, as an initialization for `train.py --init-from` |
+| `traces.py` | Reference traces (head pose and velocity over time), their segment builders, and the `TraceFollower` |
+| `tasks.py` | `TaskEnv` and the plate, nail and sweep tasks: fixtures, instance sampling, trace calibration, metrics |
+| `evaluate_tasks.py` | Task evaluation: per-episode metrics and a summary, viewer, video, trace export |
 
 ## How an episode works
 
 An episode is one goal, which gets one attempt.
 
-- **Grip (weld, the default):** the fingers are frozen closed. The tool is welded to the palm with its handle across the fingers, slid up to ±30% along the handle, at a random roll, and with the head on a random side. Collisions between the hand and the tool are turned off; the arm, table and floor still collide with the tool.
+- **Grip (weld, the default):** the fingers are frozen closed. The tool is welded to the palm with its handle across the fingers, slid up to ±70% of the handle's half length from its center (`grasp_slide`, so grips near either end of the handle are included), at a random roll, and with the head on a random side. Collisions between the hand and the tool are turned off; the arm, table and floor still collide with the tool.
 - **Goal:** a point `p_g`, a velocity `v_g` and a full tool orientation `R_g` (a quaternion, so roll about the head axis counts too).
   - **Weld:** goals are sampled from arm configurations near the current pose. The goal is the tool pose (head position and orientation) at that configuration, so it is reachable with this grasp by construction.
-  - The direction of `v_g` is drawn uniformly within a cone around the head axis at the goal pose. The cone widens with the curriculum (`vel_cone_deg`), from 30° at level 0 to 180° at level 1, where any direction is possible: sideways or even backwards swipes. Velocities pointing steeply into the table are still rejected.
+  - The direction of `v_g` is drawn uniformly within a cone around the head axis at the goal pose. The cone widens with the curriculum (`vel_cone_deg`), from 30° at level 0 to 180° at level 1, where any direction is possible: sideways or even backwards swipes. Velocities may point straight down (`min_dir_z = −1`), and a quarter of goals (`down_frac`) are drawn as steep downward strikes (fewer in practice, since some grasps can't reach one and fall back to an ordinary goal) (velocity z ≤ `down_max_z` = −0.85), like hammering a vertical nail; without that they would be rare (about 3%), because most arm configurations don't point the head axis down.
   - The lead-in point (12 cm before `p_g` along the motion) and the follow-through point (8 cm after it) must each be reachable by IK in the goal orientation, without collisions.
   - If no goal can be found near the current pose (an awkward posture), the arm is re-homed and sampling is retried, then a new grasp is tried too. `ep/goal_recovery` logs how often that happens. The grasp-agnostic region sampler is only a last resort, logged as `ep/goal_fallback`; it has never triggered in testing. So weld goals are always reachable, and the policy can't dodge goals by parking the arm where none can be drawn.
   - **Physical:** goals come from the arm's palm reach map, as before.

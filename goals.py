@@ -112,8 +112,18 @@ class GoalSampler:
         within vel_cone_deg of the head axis: near it the goal is a strike out of the head's face, at 180 it can be
         any direction (a swipe). The lead-in and follow-through points along the velocity must clear the table and
         be reachable with the same orientation.
+        A fraction down_frac of goals is a steep downward strike (v_dir z <= down_max_z, e.g. a vertical nail); they
+        are rare otherwise. If none is found, the goal is drawn without that constraint.
         Returns None if no proposal is accepted within goal_q_tries.
         """
+        c = self.cfg
+        if c.down_frac > 0.0 and rng.random() < c.down_frac:
+            goal = self._sample_from_grasp(rng, speed_max, vel_cone_deg, propose, reachable, c.down_max_z)
+            if goal is not None:
+                return goal
+        return self._sample_from_grasp(rng, speed_max, vel_cone_deg, propose, reachable, None)
+
+    def _sample_from_grasp(self, rng, speed_max, vel_cone_deg, propose, reachable, max_dir_z) -> Optional[Goal]:
         c = self.cfg
         min_z = self.ri.table_top + c.min_clearance
         for _ in range(c.goal_q_tries):
@@ -125,7 +135,7 @@ class GoalSampler:
             if not self.in_region(p):
                 continue
             v_dir = cone_sample(rng, d, vel_cone_deg)
-            if v_dir[2] < c.min_dir_z:
+            if v_dir[2] < c.min_dir_z or (max_dir_z is not None and v_dir[2] > max_dir_z):
                 continue
             points = (p - c.lead_in * v_dir, p + c.follow_through * v_dir)
             if not all(x[2] > min_z and reachable(q, x, quat) for x in points):

@@ -52,3 +52,14 @@ def test_quat_error_roundtrip():
         target = mu.quat_mul(mu.axis_angle_quat(axis, angle), q)  # world-frame rotation applied to q
         for qq in (q, -q):  # sign of the quaternion doesn't matter
             np.testing.assert_allclose(mu.quat_error(target, qq), axis * angle, atol=1e-6)
+
+
+def test_down_frac_samples_steep_strikes(env):
+    """With down_frac = 1 most weld goals are steep downward strikes (vertical-nail-like). Not all: with some grasps
+    no reachable configuration near the current pose points the head down, and the sampler falls back."""
+    env.cfg.goal.down_frac = 1.0
+    steep = 0
+    for _ in range(20):
+        env.reset(options={"kind": "regrip"})  # a new grasp each time
+        steep += env.goal.direction[2] <= env.cfg.goal.down_max_z
+    assert steep >= 8, steep

@@ -11,6 +11,7 @@ the direction that must match the goal axis.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import mujoco
 import numpy as np
@@ -55,6 +56,7 @@ class ToolParams:
     head_axis: np.ndarray  # unit vector in tool frame
     mass: float
     rest_half_height: float  # height of tool origin above the table when lying flat
+    pad: Optional["PadParams"] = None  # brushes only: compliant bristle pad (tasks.py)
 
     def features(self) -> np.ndarray:
         f = np.concatenate([
@@ -105,6 +107,17 @@ def _head_geom(kind: str, a: float, b: float, c: float):
     return np.array([r, 0.0, 0.0]), np.array([1.0, 0, 0, 0]), 4 / 3 * np.pi * r**3, r, r, r
 
 
+@dataclass
+class PadParams:
+    """Compliant bristle pad under a brush head: a box on a spring-loaded slide joint along the tool's +z."""
+    half_size: np.ndarray  # box half extents in the pad frame (x along the head's long axis, z along the tool's +z)
+    pos: np.ndarray  # pad body origin in the tool frame (the head face farthest from the handle)
+    stiffness: float  # N/m
+    damping: float  # N s/m
+    travel: float  # m of compression before the joint limit
+    friction: float
+
+
 def sample_tool(rng: np.random.Generator, cfg: ToolCfg) -> ToolParams:
     u = lambda lo_hi: float(rng.uniform(*lo_hi))  # noqa: E731
     handle_type = HANDLE_TYPES[rng.integers(len(HANDLE_TYPES))]
@@ -114,7 +127,19 @@ def sample_tool(rng: np.random.Generator, cfg: ToolCfg) -> ToolParams:
     a, b, c = u(cfg.head_long), u(cfg.head_short), u(cfg.head_width)
     roll = float(rng.uniform(-np.pi, np.pi))
     jx, jy = rng.uniform(-cfg.head_jitter, cfg.head_jitter, size=2)
+    return build_tool(handle_type, length, rad, aspect, head_type, layout, a, b, c, roll, (jx, jy),
+                      density=u(cfg.density), friction=u(cfg.friction), mass_range=cfg.mass,
+                      head_jitter=cfg.head_jitter)
 
+
+def build_tool(handle_type: str, length: float, rad: float, aspect: float, head_type: str, layout: str,
+               a: float, b: float, c: float, roll: float = 0.0, jitter=(0.0, 0.0), density: float = 800.0,
+               friction: float = 1.0, mass_range=(0.1, 0.6), head_jitter: float = 0.01) -> ToolParams:
+    """A tool with the given shape (sample_tool draws these at random; tasks use fixed presets).
+
+    a, b, c: the head's long, short and width half-extents. The mass is density * volume, clipped to mass_range.
+    """
+    jx, jy = jitter
     handle_size, handle_vol, handle_vert = _handle_geom(handle_type, length, rad, aspect)
     head_size, q_type, head_vol, long_h, short_h, width_h = _head_geom(head_type, a, b, c)
 
@@ -136,16 +161,16 @@ def sample_tool(rng: np.random.Generator, cfg: ToolCfg) -> ToolParams:
     head_quat = mu.quat_mul(layout_q, q_type)
 
     volume = handle_vol + head_vol
-    mass = float(np.clip(u(cfg.density) * volume, *cfg.mass))
+    mass = float(np.clip(density * volume, *mass_range))
     density = mass / volume
     # When spawned flat (see env._spawn_on_table) the head's width axis is vertical.
     head_vert = width_h if head_type in ("box", "ellipsoid") else short_h
-    rest = max(handle_vert, head_vert) + cfg.head_jitter + 0.002
+    rest = max(handle_vert, head_vert) + head_jitter + 0.002
 
     return ToolParams(
         handle_type=handle_type, handle_len=length, handle_rad=rad, handle_aspect=aspect,
         head_type=head_type, layout=layout, head_long=a, head_short=b, head_width=c, head_roll=roll,
-        density=density, friction=u(cfg.friction),
+        density=density, friction=friction,
         handle_size=handle_size, head_size=head_size, head_pos=head_pos, head_quat=head_quat,
         head_axis=mu.normalize(axis), mass=mass, rest_half_height=rest,
     )
@@ -166,3 +191,11 @@ def add_tool(spec: mujoco.MjSpec, p: ToolParams, park_pos=(0.0, 0.0, 3.0)) -> No
                   pos=list(p.head_pos), quat=list(p.head_quat), rgba=[0.6, 0.62, 0.68, 1.0], **common)
     body.add_site(name="tool_head_center", pos=list(p.head_pos), size=[0.008, 0, 0], rgba=[1, 0.2, 0.2, 1])
     body.add_site(name="tool_handle_center", pos=[0, 0, 0], size=[0.006, 0, 0], rgba=[0.2, 0.2, 1, 1])
+    if p.pad is not None:
+        pd = p.pad
+        pad = body.add_body(name="tool_pad", pos=list(pd.pos), gravcomp=1.0)
+        pad.add_joint(name="tool_pad_slide", type=mujoco.mjtJoint.mjJNT_SLIDE, axis=[0, 0, 1],
+                      stiffness=[pd.stiffness, 0.0, 0.0], damping=pd.damping, range=[-pd.travel, 0.0],
+                      limited=mujoco.mjtLimited.mjLIMITED_TRUE)
+        pad.add_geom(name="tool_pad", type=_GEOM["box"], size=list(pd.half_size), pos=[0, 0, pd.half_size[2]],
+                     mass=0.02, friction=[pd.friction, 0.01, 0.001], condim=3, rgba=[0.85, 0.75, 0.4, 1.0])

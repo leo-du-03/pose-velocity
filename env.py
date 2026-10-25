@@ -75,7 +75,7 @@ class PoseVelocityEnv(gym.Env):
         self.goals_with_grip = 0
         self._oracle = None
 
-        self.tool: ToolParams = sample_tool(self.np_random, self.cfg.tool)
+        self.tool: ToolParams = self._new_tool()
         self._load_model(self.tool, preserve=False)
         self._set_home(noise=False)
 
@@ -101,7 +101,7 @@ class PoseVelocityEnv(gym.Env):
     # ------------------------------------------------------------------ model management
     def _load_model(self, tool: ToolParams, preserve: bool) -> None:
         saved = self._save_robot_state() if (preserve and self.model is not None) else None
-        self.model = self.builder.compile(tool, weld=self.weld)
+        self.model = self.builder.compile(tool, weld=self.weld, fixtures=self._add_fixtures)
         self.data = mujoco.MjData(self.model)
         self._scratch = mujoco.MjData(self.model)  # for goal sampling FK / collision checks
         self._index_model()
@@ -111,6 +111,13 @@ class PoseVelocityEnv(gym.Env):
             self.targets = self.data.qpos[self.act_qadr].copy()
             self.data.ctrl[self.act_ids] = self.targets
         mujoco.mj_forward(self.model, self.data)
+
+    def _new_tool(self) -> ToolParams:
+        """The tool for a new model (a random one here; task envs use a fixed tool)."""
+        return sample_tool(self.np_random, self.cfg.tool)
+
+    def _add_fixtures(self, spec) -> None:
+        """Hook for extra scene objects, added to each compiled model (none here; see tasks.TaskEnv)."""
 
     def _index_model(self) -> None:
         m, ri = self.model, self.rinfo
@@ -507,6 +514,11 @@ class PoseVelocityEnv(gym.Env):
     def _ik_reachable(self, q0: np.ndarray, target: np.ndarray, target_quat: np.ndarray, iters: int = 30) -> bool:
         """Damped-least-squares IK from q0 for the head at `target` with the tool at orientation `target_quat`; True
         if it converges (3 mm, ~1 deg) to a collision-free configuration within the joint limits."""
+        return self._ik_solve(q0, target, target_quat, iters) is not None
+
+    def _ik_solve(self, q0: np.ndarray, target: np.ndarray, target_quat: np.ndarray,
+                  iters: int = 30) -> Optional[np.ndarray]:
+        """Like _ik_reachable, but returns the arm configuration it converged to (or None)."""
         m, sd = self.model, self._scratch
         q = np.asarray(q0, dtype=np.float64).copy()
         jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
@@ -515,13 +527,13 @@ class PoseVelocityEnv(gym.Env):
             head, _, quat, _ = self._scratch_pose(q)
             e = np.concatenate([target - head, mu.quat_error(target_quat, quat)])
             if np.linalg.norm(e[:3]) < 3e-3 and np.linalg.norm(e[3:]) < 0.02:
-                return not self._scratch_collides()
+                return None if self._scratch_collides() else q
             mujoco.mj_comPos(m, sd)  # mj_jac needs cdof / subtree_com, which mj_kinematics doesn't compute
             mujoco.mj_jac(m, sd, jacp, jacr, head, self.palm_id)
             J = np.vstack([jacp[:, self.arm_dadr], jacr[:, self.arm_dadr]])
             dq = J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), e)
             q = np.clip(q + np.clip(dq, -0.3, 0.3), self.arm_range[:, 0], self.arm_range[:, 1])
-        return False
+        return None
 
     def _rehome_weld(self) -> None:
         """Teleports the arm to home (with noise), keeping the grasp: the welded tool moves with the palm."""
@@ -636,7 +648,7 @@ class PoseVelocityEnv(gym.Env):
             keep_grasp = self._holding()
             start = "soft"
         else:
-            self.tool = sample_tool(self.np_random, self.cfg.tool)
+            self.tool = self._new_tool()
             rehome = kind == "full" or (kind == "regrip" and self.cfg.regrip_rehome)
             self._load_model(self.tool, preserve=not rehome)
             if rehome:
@@ -660,8 +672,9 @@ class PoseVelocityEnv(gym.Env):
         self._last_obs = self._get_obs()
         return self._last_obs, info
 
-    def step(self, action):
-        cfg, rc = self.cfg, self.cfg.reward
+    def _apply_action(self, action) -> np.ndarray:
+        """Smooths the action (EMA) and sets the actuator targets from it; returns the smoothed action."""
+        cfg = self.cfg
         a = np.clip(np.asarray(action, dtype=np.float64).reshape(-1), -1.0, 1.0)
         if cfg.action_ema > 0:
             a = cfg.action_ema * self._a_filt + (1.0 - cfg.action_ema) * a
@@ -675,10 +688,19 @@ class PoseVelocityEnv(gym.Env):
             self.targets[na:] = self.targets[na:] + a[na:] * self.act_scale[na:]
         self.targets = np.clip(self.targets, self.ctrl_lo, self.ctrl_hi)
         self.data.ctrl[self.act_ids] = self.targets
+        return a
+
+    def _physics_step(self) -> None:
+        """One control step of physics (task envs step substep by substep to measure contact forces)."""
+        mujoco.mj_step(self.model, self.data, nstep=self.cfg.frame_skip)
+
+    def step(self, action):
+        cfg, rc = self.cfg, self.cfg.reward
+        a = self._apply_action(action)
         prev_head = self._prev_head
         bad_before = int(self.data.warning[int(mujoco.mjtWarning.mjWARN_BADQACC)].number)
 
-        mujoco.mj_step(self.model, self.data, nstep=cfg.frame_skip)
+        self._physics_step()
         self.t += 1
 
         if not self._physics_ok(bad_before):

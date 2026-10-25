@@ -139,6 +139,16 @@ def parse_args():
                    help="success position tolerance in meters at curriculum level 0 and 1, e.g. --eps-p 0.08 0.01")
     p.add_argument("--sigma-p", type=float, default=None,
                    help="position scale (m) of the pass reward, e.g. 0.02")
+    p.add_argument("--eps-v-frac", type=float, nargs=2, metavar=("LEVEL0", "LEVEL1"), default=None,
+                   help="success velocity tolerance as a fraction of the goal speed at curriculum level 0 and 1, "
+                        "e.g. --eps-v-frac 0.6 0.1")
+    p.add_argument("--sigma-v-frac", type=float, default=None,
+                   help="velocity scale (fraction of the goal speed) of the pass reward, e.g. 0.1")
+    p.add_argument("--min-dir-z", type=float, default=None,
+                   help="steepest allowed downward goal velocity (z of its direction); -1 allows straight-down strikes")
+    p.add_argument("--grasp-slide", type=float, default=None,
+                   help="weld grasps slide up to this fraction of the handle's half length from its center; "
+                        "0.7 reaches grips near the end of the handle")
     return p.parse_args()
 
 
@@ -201,8 +211,18 @@ def main():
         env_cfg.curriculum.eps_p = tuple(args.eps_p)
     if args.sigma_p is not None:
         env_cfg.reward.sigma_p = args.sigma_p
+    if args.eps_v_frac is not None:
+        env_cfg.curriculum.eps_v_frac = tuple(args.eps_v_frac)
+    if args.sigma_v_frac is not None:
+        env_cfg.reward.sigma_v_frac = args.sigma_v_frac
+    if args.min_dir_z is not None:
+        env_cfg.goal.min_dir_z = args.min_dir_z
+    if args.grasp_slide is not None:
+        env_cfg.grasp_slide = args.grasp_slide
     print(f"grip={env_cfg.grip_mode} actions={env_cfg.action_mode}  "
-          f"eps_p (level 0 -> 1) = {env_cfg.curriculum.eps_p}  sigma_p = {env_cfg.reward.sigma_p}")
+          f"eps_p (level 0 -> 1) = {env_cfg.curriculum.eps_p}  sigma_p = {env_cfg.reward.sigma_p}  "
+          f"eps_v_frac = {env_cfg.curriculum.eps_v_frac}  sigma_v_frac = {env_cfg.reward.sigma_v_frac}  "
+          f"min_dir_z = {env_cfg.goal.min_dir_z}  grasp_slide = {env_cfg.grasp_slide}")
 
     run_name = args.name or time.strftime("posevel_%Y%m%d_%H%M%S")
     run_dir = os.path.join(args.logdir, run_name)

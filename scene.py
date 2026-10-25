@@ -302,21 +302,26 @@ class SceneBuilder:
         self.cfg = cfg
         self.base_spec, self.info = build_base_spec(cfg)
 
-    def compile(self, tool: ToolParams, weld: bool = False) -> mujoco.MjModel:
+    def compile(self, tool: ToolParams, weld: bool = False, fixtures=None) -> mujoco.MjModel:
         """weld=True adds an equality "grip" (palm -> tool) and turns off hand-tool collisions.
 
         The weld's relative pose is set at runtime (eq_data[3:10], tool pose in the palm frame, see
         PoseVelocityEnv._weld_tool); its anchor eq_data[0:3] must stay zero.
+        fixtures: optional callable(spec) that adds extra scene objects (task fixtures) before compiling.
         """
         spec = self._copy_base()
         add_tool(spec, tool, park_pos=(float(self.info.table_center[0]), float(self.info.table_center[1]), 3.0))
+        if fixtures is not None:
+            fixtures(spec)
         if weld:
             eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_WELD, name="grip", name1=self.info.palm_body,
                                    name2="tool", objtype=mujoco.mjtObj.mjOBJ_BODY)
             eq.solref = list(self.cfg.weld_solref)
+            tool_bodies = ["tool"] + [b.name for b in _find_body(spec, "tool").find_all(mujoco.mjtObj.mjOBJ_BODY)]
             for name in self.info.robot_bodies:
                 if name.startswith(HAND_PREFIX):
-                    spec.add_exclude(bodyname1=name, bodyname2="tool")
+                    for tb in tool_bodies:
+                        spec.add_exclude(bodyname1=name, bodyname2=tb)
         m = spec.compile()
         if weld:
             m.eq_data[0, :] = 0.0
