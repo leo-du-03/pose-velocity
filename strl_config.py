@@ -45,9 +45,11 @@ class StrlCfg:
     tolerance_increment: float = 0.9  # multiplicative, per curriculum step
     # Tighten when the mean number of goals reached per finished episode is at least this.
     tolerance_success_threshold: float = 3.0
-    # DEVIATION: the official code checks every 3000 vectorized steps of 24576 envs; with ~12 CPU envs we check every
-    # PPO iteration once this many episodes have finished since the last change.
-    tolerance_min_episodes: int = 50
+    # The official code checks the mean over the last episode of every one of 24576 envs, a very stable average. We
+    # use the mean over the last tolerance_min_episodes finished episodes, checked once that many have finished since
+    # the previous check. (A first run used 50, which let the tolerance tighten on lucky batches while the true mean
+    # stayed near 2 goals per episode.)
+    tolerance_min_episodes: int = 200
     # ---- reward (Table I)
     keypoint_rew_scale: float = 200.0
     reach_goal_bonus: float = 1000.0

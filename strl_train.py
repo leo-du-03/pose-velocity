@@ -39,6 +39,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tol", type=float, default=None, help="initial success tolerance (default StrlCfg)")
     p.add_argument("--fixed-tol", action="store_true", help="disable the tolerance curriculum")
+    p.add_argument("--tol-window", type=int, default=None,
+                   help="episodes averaged by the tolerance curriculum (overrides StrlCfg / a resumed checkpoint)")
     p.add_argument("--dr", action="store_true", help="enable domain randomization (off by default)")
     p.add_argument("--serial", action="store_true", help="run envs in the main process (debugging)")
     p.add_argument("--logdir", default="runs")
@@ -92,6 +94,10 @@ def main():
         scfg = StrlCfg()
         scfg.dr = bool(args.dr)
         env_cfg = make_env_cfg(scfg)
+    if args.tol_window is not None:
+        scfg.tolerance_min_episodes = args.tol_window
+    print(f"tolerance curriculum: mean of the last {scfg.tolerance_min_episodes} episodes "
+          f">= {scfg.tolerance_success_threshold} goals")
     ppo_cfg = make_ppo_cfg(num_envs=args.num_envs, rollout_steps=args.rollout_steps, total_steps=args.total_steps,
                            lr=args.lr, epochs=args.epochs, save_every=args.save_every)
 
@@ -204,6 +210,11 @@ def main():
                 if vals:
                     log[f"ep/{k}"] = float(np.mean(vals))
             reasons = Counter(e["reason"] for e in ep_window)
+            # Each episode reaches its goals in a row and ends on the first failure (unless it hits the cap), so the
+            # per-goal success rate is reached / (reached + failed attempts).
+            reached = sum(e["successes"] for e in ep_window)
+            failed = len(ep_window) - reasons.get("max_successes", 0)
+            log["ep/goal_success"] = reached / max(1.0, reached + failed)
             for k in ("timeout", "max_successes", "table_force", "diverged"):
                 log[f"end/{k}"] = reasons.get(k, 0) / len(ep_window)
             terms = defaultdict(list)
@@ -216,7 +227,7 @@ def main():
             for k, v in log.items():
                 writer.add_scalar(k, v, global_step)
         print(f"it {it:5d} step {global_step:10d} | sps {sps:6.0f} | tol {tol * 100:5.2f}cm | "
-              f"goals/ep {log.get('ep/successes', float('nan')):5.2f} | len {log.get('ep/length', float('nan')):5.0f} | "
+              f"goals/ep {log.get('ep/successes', float('nan')):5.2f} goal succ {log.get('ep/goal_success', float('nan')):4.0%} | len {log.get('ep/length', float('nan')):5.0f} | "
               f"d_min {log.get('ep/d_min', float('nan')) * 100:5.1f}cm last {log.get('ep/d_last', float('nan')) * 100:5.1f}cm | "
               f"kl {stats['final_kl']:.4f} ({stats['steps']}) lr {stats['lr']:.1e} std {stats['std']:.3f}")
         if it % 10 == 0 and ep_window:

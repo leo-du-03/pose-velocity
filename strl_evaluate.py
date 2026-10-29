@@ -106,7 +106,12 @@ def main():
 
     goals = np.array([e["successes"] for e in results])
     print(f"\ngoals per episode: mean {goals.mean():.2f}  median {np.median(goals):.1f}  max {goals.max():.0f}")
-    print("episode ends:", dict(Counter(e["reason"] for e in results)))
+    ends = Counter(e["reason"] for e in results)
+    print("episode ends:", dict(ends))
+    reached, failed = goals.sum(), len(results) - ends.get("max_successes", 0)
+    attempts = max(1.0, reached + failed)
+    print(f"per-goal success {reached / attempts:.0%} | failed by timeout {ends.get('timeout', 0) / attempts:.0%}, "
+          f"table {ends.get('table_force', 0) / attempts:.0%}")
     if args.video and frames:
         import imageio
 
