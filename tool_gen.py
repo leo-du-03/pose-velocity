@@ -57,6 +57,9 @@ class ToolParams:
     mass: float
     rest_half_height: float  # height of tool origin above the table when lying flat
     pad: Optional["PadParams"] = None  # brushes only: compliant bristle pad (tasks.py)
+    # Box heads only: a crowned striking face. A massless ellipsoid cap over the head's +x face, as wide as the face,
+    # bulging face_crown (m) beyond it at the center; 0: the flat box face.
+    face_crown: float = 0.0
 
     def features(self) -> np.ndarray:
         f = np.concatenate([
@@ -189,6 +192,14 @@ def add_tool(spec: mujoco.MjSpec, p: ToolParams, park_pos=(0.0, 0.0, 3.0)) -> No
                   rgba=[0.55, 0.35, 0.2, 1.0], **common)
     body.add_geom(name="tool_head", type=_GEOM[p.head_type], size=list(p.head_size),
                   pos=list(p.head_pos), quat=list(p.head_quat), rgba=[0.6, 0.62, 0.68, 1.0], **common)
+    if p.face_crown > 0:
+        if p.head_type != "box":
+            raise ValueError("face_crown needs a box head")
+        # Cap centered on the face plane: its front half bulges face_crown out, the back half is inside the head.
+        body.add_geom(name="tool_face", type=_GEOM["ellipsoid"],
+                      size=[p.face_crown, p.head_size[1], p.head_size[2]],
+                      pos=list(p.head_pos + p.head_long * p.head_axis), quat=list(p.head_quat), density=0.0,
+                      friction=common["friction"], condim=common["condim"], rgba=[0.7, 0.72, 0.78, 1.0])
     body.add_site(name="tool_head_center", pos=list(p.head_pos), size=[0.008, 0, 0], rgba=[1, 0.2, 0.2, 1])
     body.add_site(name="tool_handle_center", pos=[0, 0, 0], size=[0.006, 0, 0], rgba=[0.2, 0.2, 1, 1])
     if p.pad is not None:

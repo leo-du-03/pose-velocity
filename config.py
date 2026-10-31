@@ -192,6 +192,14 @@ class TaskCfg:
     windup_raise_speed: float = 0.4  # m/s peak head speed while raising the hammer to the top of the windup
     windup_joint_speed: float = 1.0  # rad/s peak joint speed of the raise (a joint-space move)
     windup_pause: float = 0.15  # s at the top
+    # m of straight run-in at the end of the swing: the arc ends this far back from the hit (tangent to the strike
+    # line) and the head goes straight in, orientation held, through the contact and follow-through. The policy hits
+    # without the arc's rotation (~speed / windup_radius at impact); with this, the reference follower does too, so
+    # the speed -> force calibration matches a policy's strike. 0: the hit is on the arc.
+    swing_straight: float = 0.08
+    # m the hammer's striking face bulges at its center (a crowned face, like a real hammer's); 0: flat. A flat face
+    # on the rigid plate lands on its rim at the policy's ~1-2 deg of tilt, which cuts the peak force by up to ~20%.
+    face_crown: float = 0.002
     swing_accel_frac: float = 0.6  # fraction of the swing arc spent accelerating; the rest is at the impact speed
     accel_time: float = 0.3  # windup off: s to ramp from rest at the pre-lead point up to the impact speed
     # s after first contact over which the peak force is taken: only the impact. The hammer is coupled to the hand

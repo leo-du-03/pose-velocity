@@ -132,6 +132,56 @@ def test_hammer_trace_winds_up(cfg, task):
 
 
 @pytest.mark.parametrize("task", ["plate", "nail"])
+def test_hammer_swing_straight_run_in(cfg, task):
+    """With swing_straight, the head goes straight in along the strike line, orientation held and not rotating, for
+    that distance before the hit and through the follow-through; the follower still hits the target force."""
+    from tasks import TaskEnv
+
+    tc = TaskCfg(swing_straight=0.05)
+    env = TaskEnv(task, cfg, tc)
+    env.reset(seed=0)
+    for _ in range(2):
+        tr, n = env.trace, env.task.normal
+        k_hit = tr.meta["contact_index"]
+        seg = np.flatnonzero(np.linalg.norm(tr.p - tr.p[k_hit], axis=1) < tc.swing_straight - 1e-3)
+        seg = seg[seg >= k_hit - int(tc.swing_straight / (tr.meta["impact_speed"] * tr.dt)) - 1]
+        k0, k1 = seg[0], k_hit + 2  # run-in start .. into the follow-through
+        rel = tr.p[k0:k1] - tr.p[k_hit]
+        np.testing.assert_allclose(rel - np.outer(rel @ n, n), 0.0, atol=1e-9)  # on the strike line
+        np.testing.assert_allclose(tr.w[k0:k1], 0.0, atol=1e-12)
+        for q in tr.quat[k0:k1]:
+            assert np.linalg.norm(mu.quat_error(q, tr.quat[k_hit])) < 1e-9
+        assert np.linalg.norm(tr.w[k0 - 3]) > 0.5  # still on the arc before the run-in
+        m = _run(env)
+        assert m["hit"] and m["success"], m
+        env.reset()
+    env.close()
+
+
+def test_crowned_face_makes_plate_force_tilt_tolerant(cfg):
+    """With a crowned face, the follower struck 2 deg off flat still hits the target force (a flat face lands on its
+    rim at that tilt and loses up to ~20%); the crown is the struck point (contact point = face apex)."""
+    import copy
+
+    from tasks import TaskEnv
+
+    env = TaskEnv("plate", cfg, TaskCfg(face_crown=0.002))
+    assert env.task._face_offset() == pytest.approx(env.tool.head_long + 0.002)
+    env.reset(seed=0)
+    for _ in range(2):
+        tr = env.trace
+        for ax in (env.task.arc_axis, -env.task.arc_axis):
+            r = mu.axis_angle_quat(ax, np.deg2rad(2.0))
+            t2 = copy.deepcopy(tr)
+            t2.quat = np.array([mu.quat_mul(r, q) for q in tr.quat])
+            t2.w = tr.w @ mu.quat_to_mat(r).T
+            m = env.rollout(t2)
+            assert m["hit"] and abs(m["force_err"]) < 0.08, m
+        env.reset()
+    env.close()
+
+
+@pytest.mark.parametrize("task", ["plate", "nail"])
 def test_hammer_is_held_like_a_hammer(cfg, task):
     """Every episode: the hand near the handle's end, the head beyond the index finger, the face along the fingers."""
     from tasks import TaskEnv

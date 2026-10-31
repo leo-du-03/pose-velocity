@@ -57,6 +57,11 @@ def main():
     p.add_argument("--video", default=None, help="write an mp4 (implies --render rgb_array)")
     p.add_argument("--realtime", action="store_true", help="slow down to real time in the viewer")
     p.add_argument("--save-traces", default=None, metavar="DIR", help="write each episode's trace to DIR/ep<k>.npz")
+    p.add_argument("--swing-straight", type=float, default=None, metavar="M",
+                   help="plate/nail: straight run-in (m) at the end of the swing, no rotation at impact "
+                        "(TaskCfg.swing_straight; default from config)")
+    p.add_argument("--face-crown", type=float, default=None, metavar="M",
+                   help="plate/nail: crowned hammer face, bulging this much at its center (TaskCfg.face_crown)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
@@ -80,7 +85,12 @@ def main():
         level = args.level
 
     render_mode = "rgb_array" if args.video else (None if args.render == "none" else args.render)
-    env = TaskEnv(args.task, cfg, TaskCfg(layout=args.layout), render_mode=render_mode)
+    task_cfg = TaskCfg(layout=args.layout)
+    if args.swing_straight is not None:
+        task_cfg.swing_straight = args.swing_straight
+    if args.face_crown is not None:
+        task_cfg.face_crown = args.face_crown
+    env = TaskEnv(args.task, cfg, task_cfg, render_mode=render_mode)
     env.set_curriculum(level)
     if agent is not None and env.observation_space.shape[0] != ck["obs_dim"]:
         raise SystemExit(f"checkpoint obs dim {ck['obs_dim']} != env obs dim {env.observation_space.shape[0]}")

@@ -43,9 +43,12 @@ _BLOCK_HALF = 0.025  # half thickness of the nail's wooden block
 _PLATFORM_HALF = 0.3  # half height of the box the nail block stands on (in_dist); tall enough for any goal height
 
 
-def hammer_tool() -> ToolParams:
-    """Claw-less hammer: round handle, box head across it. The striking face is the head's +x end."""
-    return build_tool("cylinder", 0.30, 0.015, 1.0, "box", "T", 0.06, 0.02, 0.02, density=1200.0)
+def hammer_tool(face_crown: float = 0.0) -> ToolParams:
+    """Claw-less hammer: round handle, box head across it. The striking face is the head's +x end, flat or crowned
+    (face_crown m at its center, see ToolParams.face_crown)."""
+    t = build_tool("cylinder", 0.30, 0.015, 1.0, "box", "T", 0.06, 0.02, 0.02, density=1200.0)
+    t.face_crown = face_crown
+    return t
 
 
 def brush_tool(tc: TaskCfg) -> ToolParams:
@@ -344,7 +347,7 @@ class HammerTask(Task):
 
     def tool(self) -> ToolParams:
         if self._tool is None:
-            self._tool = hammer_tool()
+            self._tool = hammer_tool(self.tc.face_crown)
         return self._tool
 
     def grasp(self, env, center, axis):
@@ -399,7 +402,9 @@ class HammerTask(Task):
 
     # ---------------------------------------------------------------- instance sampling
     def _face_offset(self) -> float:
-        return self.tool().head_long
+        """Head center to the struck point of the face (the crown's apex if crowned)."""
+        t = self.tool()
+        return t.head_long + t.face_crown
 
     def _pre_back(self, env, v: float) -> float:
         """Distance from the contact point back to where the strike starts from rest at impact speed v."""
@@ -501,11 +506,24 @@ class HammerTask(Task):
 
     # ---------------------------------------------------------------- windup
     def arc_pose(self, phi: float):
-        """Head position and tool orientation phi (rad) back along the swing arc from the contact pose: the tool
-        rotated rigidly about the pivot by phi, raising the head back against the strike direction."""
+        """Head position and tool orientation phi (rad) back along the swing arc from where it meets the strike line:
+        the tool rotated rigidly about the pivot by phi, raising the head back against the strike direction. With
+        swing_straight > 0 the arc meets the line that far back from the contact pose."""
         d, R = -self.normal, self.tc.windup_radius
-        p = self.pivot + R * (np.cos(phi) * self.arc_u - np.sin(phi) * d)
+        p = self.pivot + R * (np.cos(phi) * self.arc_u - np.sin(phi) * d) - self.tc.swing_straight * d
         return p, mu.quat_mul(mu.axis_angle_quat(self.arc_axis, phi), self.quat_goal)
+
+    def swing_pose(self, x: float):
+        """Pose x (m, path length) back from the contact pose along the swing: the straight run-in for
+        x <= swing_straight (negative: the follow-through), the arc beyond. Without a run-in the follow-through stays
+        on the arc. Returns (head, quat, unit direction of motion towards the target, angular speed per unit head speed
+        about arc_axis, towards the target)."""
+        d, R, l = -self.normal, self.tc.windup_radius, self.tc.swing_straight
+        if l > 0 and x <= l:
+            return self.head_goal - x * d, self.quat_goal, d, 0.0
+        phi = (x - l) / R
+        p, q = self.arc_pose(phi)
+        return p, q, np.sin(phi) * self.arc_u + np.cos(phi) * d, 1.0 / R
 
     def _plan_windup(self, env, q) -> bool:
         """Sets the swing arc for the current instance, with the largest reachable windup angle. The pivot is
@@ -535,6 +553,12 @@ class HammerTask(Task):
         min_z = env.rinfo.table_top + gc.min_clearance
         ok_at = lambda p: p[2] >= min_z and (p - self.contact) @ self.normal >= 0.02  # noqa: E731
         q = q_hit
+        l = tc.swing_straight
+        for x in np.linspace(0.0, l, int(np.ceil(l / 0.03)) + 1)[1:]:  # the straight run-in, orientation held
+            p = self.head_goal + x * self.normal
+            q = env._ik_solve(q, p, self.quat_goal) if ok_at(p) else None
+            if q is None or arm_margin(env, q) < tc.min_arm_margin:
+                return False
         n_arc = int(np.ceil(phi_top * tc.windup_radius / 0.03)) + 1
         for phi in np.linspace(np.deg2rad(5.0), phi_top, n_arc):
             p, quat = self.arc_pose(phi)
@@ -580,11 +604,11 @@ class HammerTask(Task):
         b.samples(ps, full_q[1:], vs, ws, "windup")
 
     def _swing_profile(self, env, v: float):
-        """Arc length from the top of the windup and head speed at each step of the swing, through the contact and
+        """Path length from the top of the windup and head speed at each step of the swing, through the contact and
         the follow-through. Durations are whole steps; the windup angle is adjusted (slightly) so the contact lands on
-        a sample. Returns (total arc to contact, arc lengths, speeds, steps to contact)."""
+        a sample. Returns (total path to contact, path lengths, speeds, steps to contact)."""
         tc, dt = self.tc, env.dt
-        L_want = tc.windup_radius * np.deg2rad(self.windup_deg)
+        L_want = tc.windup_radius * np.deg2rad(self.windup_deg) + tc.swing_straight
         n_a = max(1, int(round(2 * tc.swing_accel_frac * L_want / v / dt)))
         L_a = 0.5 * v * n_a * dt
         n_c = max(1, int(round((L_want - L_a) / (v * dt))))
@@ -605,7 +629,7 @@ class HammerTask(Task):
         tc, gc, R = self.tc, env.cfg.goal, self.tc.windup_radius
         d = -self.normal
         L, s, speed, n_hit = self._swing_profile(env, v)
-        phi_top = L / R
+        phi_top = (L - tc.swing_straight) / R
         p0, _, _, _ = env._head_state()
         b = TraceBuilder(env.dt, p0, env._tool_quat(), env.tool.head_axis)
         top, top_q = self.arc_pose(phi_top)
@@ -614,11 +638,11 @@ class HammerTask(Task):
         k_raise = (k0 + b.index) // 2
         b.hold(tc.windup_pause)
         k_top = b.index
-        phi = (L - s) / R  # negative past the contact (follow-through along the arc)
-        poses = [self.arc_pose(x) for x in phi]
-        vel = speed[:, None] * (np.sin(phi)[:, None] * self.arc_u + np.cos(phi)[:, None] * d)
-        w = -(speed / R)[:, None] * self.arc_axis
-        ps, qs = [p for p, _ in poses], [q for _, q in poses]
+        x = L - s  # path length back from the contact; negative past it (the follow-through)
+        poses = [self.swing_pose(xi) for xi in x]
+        ps, qs = [p[0] for p in poses], [p[1] for p in poses]
+        vel = speed[:, None] * np.array([p[2] for p in poses])
+        w = -(speed * np.array([p[3] for p in poses]))[:, None] * self.arc_axis
         b.samples(ps[:n_hit], qs[:n_hit], vel[:n_hit], w[:n_hit], "swing")
         k_contact = b.index
         b.samples(ps[n_hit:], qs[n_hit:], vel[n_hit:], w[n_hit:], "contact", force)
@@ -632,7 +656,7 @@ class HammerTask(Task):
         # they are fast enough to be training-like goals (GoalCfg.speed_min).
         if np.linalg.norm(tr.v[k_raise]) >= gc.speed_min and k_raise > k0:
             tr.add_keypoint(k_raise)
-        k_mid = k_top + 1 + int(np.argmin(np.abs(phi[:n_hit] - 0.5 * phi_top)))
+        k_mid = k_top + 1 + int(np.argmin(np.abs(x[:n_hit] - 0.5 * L)))
         fast = [k for k in range(k_mid, k_contact - 5) if np.linalg.norm(tr.v[k]) >= gc.speed_min]
         if fast:
             tr.add_keypoint(fast[0])
