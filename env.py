@@ -38,7 +38,7 @@ from gymnasium.utils import seeding
 import mathutils as mu
 from config import EnvCfg
 from goals import Goal, GoalSampler, ReachMap, plane_crossing
-from rewards import grasp_potential, pass_quality
+from rewards import grasp_potential, keypoint_distance, keypoint_offsets, step_terms
 from scene import SceneBuilder
 from tool_gen import ToolParams, sample_tool
 
@@ -406,6 +406,21 @@ class PoseVelocityEnv(gym.Env):
             return self.c_arm_env or self.c_hand_env or self.c_tool_table or self.c_tool_floor
         return self.c_arm_env
 
+    def _env_contact_force(self) -> float:
+        """Net normal force of the contacts _env_contact counts: robot or tool on the table, pedestal or floor
+        (physical grip: arm links only)."""
+        m, d = self.model, self.data
+        pushers = (self.robot_body_set | {self.tool_id}) if self.weld else self.arm_body_set
+        f6, total = np.zeros(6), 0.0
+        for i in range(d.ncon):
+            g1, g2 = int(d.contact.geom1[i]), int(d.contact.geom2[i])
+            if g1 in self.env_geoms or g2 in self.env_geoms:
+                other = int(m.geom_bodyid[g2 if g1 in self.env_geoms else g1])
+                if other in pushers:
+                    mujoco.mj_contactForce(m, d, i, f6)
+                    total += abs(float(f6[0]))
+        return total
+
     def _tool_lift(self) -> float:
         return float(self.data.xpos[self.tool_id][2] - self._tool_rest_z())
 
@@ -465,6 +480,16 @@ class PoseVelocityEnv(gym.Env):
         cc = self.cfg.curriculum
         return (_lerp(cc.eps_p, self.level), _lerp(cc.eps_v_frac, self.level) * self.goal.speed,
                 np.deg2rad(_lerp(cc.eps_theta_deg, self.level)))
+
+    def eps_kp(self) -> float:
+        """Keypoint pose distance (m) within which the head makes its attempt at the goal."""
+        return _lerp(self.cfg.curriculum.eps_kp, self.level)
+
+    def kp_distance(self, head=None) -> float:
+        """Keypoint pose distance between the tool (keypoints around the head) and the goal pose."""
+        head = self.data.site_xpos[self.head_site] if head is None else head
+        return keypoint_distance(head, self._tool_quat(), self.goal.p, self.goal.quat,
+                                 keypoint_offsets(self.cfg.reward))
 
     # Goal sampling works on a scratch MjData: the arm at a candidate q, the tool placed by the weld grasp.
     def _scratch_pose(self, q: np.ndarray):
@@ -612,6 +637,8 @@ class PoseVelocityEnv(gym.Env):
         self.d_best = np.inf  # closest head-to-goal distance while holding (m)
         self.closest: dict = {}
         self.pass_info: dict = {}
+        self.kp_best: Optional[float] = None  # closest keypoint pose distance while holding (the reward's d*)
+        self.table_force = 0.0
         self.ep_return = 0.0
         self.ep_terms: dict = {}
         self.diverged = False
@@ -730,9 +757,14 @@ class PoseVelocityEnv(gym.Env):
 
         eps_p, eps_v, eps_th = self.tolerances()
         held_ok = holding or not cfg.success_requires_grasp
-        d_perp = plane_crossing(prev_head, head, g.p, g.direction)
-        passed = bool(held_ok and d_perp is not None and d_perp < cfg.goal.pass_radius)
-        success = bool(passed and d_perp < eps_p and np.linalg.norm(dv) < eps_v and theta < eps_th)
+        dv_norm = float(np.linalg.norm(dv))
+        d_kp = self.kp_distance(head)
+        # The attempt: the first step within the keypoint tolerance (position and orientation). The episode ends
+        # there; it is a success if the head also moves at the goal velocity.
+        attempt = bool(held_ok and d_kp <= self.eps_kp())
+        success = bool(attempt and dv_norm < eps_v)
+        passed = attempt
+        d_perp = plane_crossing(prev_head, head, g.p, g.direction)  # goal-plane crossing (diagnostics only)
 
         dropped = False
         if not self.weld:
@@ -742,17 +774,26 @@ class PoseVelocityEnv(gym.Env):
             dropped = bool(not passed and (lost or (self.ever_grasped
                                                     and self.no_contact >= cfg.drop_no_contact_steps)))
 
-        terminated = passed or dropped
+        self.table_force = self._env_contact_force()
+        pushed = bool(self.table_force > rc.table_force_limit)
+        terminated = passed or dropped or pushed
         truncated = (not terminated) and self.t >= cfg.max_steps
-        terms = {"contact": -rc.w_env_contact if self._env_contact() else 0.0, "pass": 0.0}
-        if passed:
-            q = pass_quality(rc, d_perp=d_perp, dv=float(np.linalg.norm(dv)), speed=g.speed, theta=theta)
-            terms["pass"] = rc.pass_scale * q + (rc.success_bonus if success else 0.0)
+
+        # Keypoint progress counts only while holding (an empty hand moving the tool is no progress).
+        if holding:
+            d_star = d_kp if self.kp_best is None else self.kp_best
+            self.kp_best = min(d_star, d_kp)
+        else:
+            d_star = d_kp
+        terms, q_v = step_terms(rc, d=d_kp, d_star=d_star, attempt=attempt, dv=dv_norm, speed=g.speed,
+                                qvel_l1=float(np.abs(self.data.qvel[self.arm_dadr]).sum()))
+        if attempt:
             v_along = float(lin @ g.direction)
             v_side = float(np.linalg.norm(lin - v_along * g.direction))
-            self.pass_info = {"d_perp": d_perp, "dv_frac": float(np.linalg.norm(dv) / max(g.speed, 1e-6)),
-                              "v_along_frac": v_along / max(g.speed, 1e-6), "v_side_frac": v_side / max(g.speed, 1e-6),
-                              "theta_deg": float(np.degrees(theta)), "quality": q,
+            s = max(g.speed, 1e-6)
+            self.pass_info = {"d_kp": d_kp, "q_v": q_v, "dp": float(np.linalg.norm(dp)), "dv_frac": dv_norm / s,
+                              "v_along_frac": v_along / s, "v_side_frac": v_side / s,
+                              "theta_deg": float(np.degrees(theta)),
                               # Angle between the goal velocity and the goal head axis: 0 = strike, 90 = swipe.
                               "swipe_deg": float(np.degrees(mu.angle_between(g.v, g.axis)))}
         if not self.weld:
@@ -771,7 +812,7 @@ class PoseVelocityEnv(gym.Env):
         obs = self._get_obs()
         self._last_obs = obs
         info = {"priv": self._get_priv(), "success": success, "dropped": dropped, "passed": passed,
-                "holding": holding, "d_perp": d_perp}
+                "holding": holding, "d_perp": d_perp, "d_kp": d_kp, "pushed": pushed}
         if terminated or truncated:
             self.goals_with_grip += 1
             if self.weld:
@@ -779,14 +820,16 @@ class PoseVelocityEnv(gym.Env):
             else:
                 kind = "respawn" if dropped else ("soft" if holding else "respawn")
             self._forced_reset_kind = kind
-            info["episode"] = self._episode_info(success=success, dropped=dropped, passed=passed, kind=kind)
+            info["episode"] = self._episode_info(success=success, dropped=dropped, passed=passed, kind=kind,
+                                                 pushed=pushed)
         if self.render_mode == "human":
             self.render()
         return obs, reward, terminated, truncated, info
 
-    def _episode_info(self, success: bool, dropped: bool, passed: bool, kind: str) -> dict:
+    def _episode_info(self, success: bool, dropped: bool, passed: bool, kind: str, pushed: bool = False) -> dict:
         return {"return": self.ep_return, "length": self.t, "success": float(success), "dropped": float(dropped),
-                "passed": float(passed), "d_min": float(self.d_best) if np.isfinite(self.d_best) else float("nan"),
+                "passed": float(passed), "pushed": float(pushed),
+                "d_kp_min": float(self.kp_best) if self.kp_best is not None else float("nan"), "d_min": float(self.d_best) if np.isfinite(self.d_best) else float("nan"),
                 "ever_grasped": float(self.ever_grasped), "diverged": float(self.diverged),
                 "goal_fallback": float(self.goal_fallback), "goal_recovery": float(self.goal_recovery),
                 "next_reset": kind, "level": self.level,

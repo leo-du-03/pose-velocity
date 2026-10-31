@@ -76,17 +76,21 @@ class GoalCfg:
 
 @dataclass
 class RewardCfg:
-    # Tuned for PPO fine-tuning of a policy that already strikes (bc.py): the reward is only the task, with no
-    # shaping. Pass reward, paid once when the head crosses the goal plane: pass_scale * quality, with
-    # quality = exp(-(d_perp/sigma_p + |v_head - v_g|/(sigma_v_frac*|v_g|) + theta/sigma_theta)) (rewards.pass_quality),
-    # theta = full rotation angle between the tool and goal orientations (roll about the head axis included).
-    # The scales are the tightest success tolerances (CurriculumCfg at level 1), so each factor is 1/e there.
-    pass_scale: float = 20.0
-    sigma_p: float = 0.03
-    sigma_v_frac: float = 0.25
-    sigma_theta_deg: float = 20.0
-    success_bonus: float = 10.0  # added when the pass is within all success tolerances
-    w_env_contact: float = 0.1  # per step; weld: robot or tool touching table/floor/pedestal; physical: arm links only
+    # The SimToolReal reward (strl_config.StrlCfg, paper Table I) extended with the goal velocity; see rewards.py.
+    # Per step: keypoint_rew_scale * max(d* - d, 0) - arm_vel_penalty * |qdot_arm|_1, where d is the keypoint pose
+    # distance and d* the closest so far. On the attempt (first step with d <= eps_kp, the episode ends there):
+    # reach_goal_bonus * exp(-|v_head - v_g| / (sigma_v_frac * |v_g|)).
+    keypoint_rew_scale: float = 200.0
+    reach_goal_bonus: float = 1000.0
+    arm_vel_penalty: float = 0.03  # L1 norm of arm joint velocities (rad/s)
+    sigma_v_frac: float = 0.25  # velocity match is 1/e at this fraction of the goal speed (eps_v_frac at level 1)
+    # Keypoints: corners of one fixed box, centered on the head, in the tool frame (x, y, z; z along the handle).
+    # Same box as SimToolReal's reward keypoints (0.141 along the handle), scaled by keypoint_scale.
+    keypoint_scale: float = 1.5
+    keypoint_size: Tuple[float, float, float] = (0.03025, 0.0271, 0.141)
+    # Terminate when the robot or tool pushes on the table, pedestal or floor harder than this (N; physical grip:
+    # arm links only, since the hand has to touch the table to pick the tool up).
+    table_force_limit: float = 100.0
     # Physical grip only: grasp potential Phi = reach + contact + lift, paid as Phi' - Phi, and the drop penalty.
     w_reach: float = 1.0
     w_contact: float = 2.0
@@ -99,6 +103,12 @@ class RewardCfg:
 class CurriculumCfg:
     # (start, end) values, linearly interpolated by the difficulty level in [0, 1].
     eps_p: Tuple[float, float] = (0.08, 0.03)
+    # Keypoint pose distance (rewards.keypoint_distance, m) that makes the attempt: the reward's success region.
+    # SimToolReal starts at 0.11 (0.075 * keypoint_scale 1.5), but that is about the lead-in (12 cm): the attempt
+    # would fire while the head is still lining up behind the goal (the oracle then succeeds 42% at level 0, vs 94%
+    # at 0.06 and 100% at 0.03). Ends at the tightest eps_p.
+    # eps_p and eps_theta_deg stay in the observation (the policy was trained with them) and in diagnostics.
+    eps_kp: Tuple[float, float] = (0.06, 0.03)
     # Velocity tolerance as a fraction of the goal speed: |v_head - v_g| < eps_v_frac * |v_g|.
     # Always < 1, so a stationary head can never count as matching the goal velocity.
     eps_v_frac: Tuple[float, float] = (0.6, 0.25)

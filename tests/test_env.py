@@ -160,20 +160,29 @@ def test_full_curriculum_samples_swipes(env):
     assert np.mean(np.array(angles) > 60.0) > 0.3, angles
 
 
-@pytest.mark.parametrize("lateral, expect_pass", [(0.0, True), (2.0, False)])
-def test_crossing_counts_only_near_goal(env, lateral, expect_pass):
-    """A goal-plane crossing ends the attempt only within pass_radius of p_g (lateral in units of it)."""
+@pytest.mark.parametrize("offset, expect_attempt", [(0.01, True), (0.3, False)])
+def test_attempt_only_within_keypoint_tolerance(env, offset, expect_attempt):
+    """The attempt (and the episode end) happens only within eps_kp of the goal pose."""
+    from goals import Goal
+
+    env.set_curriculum(0.0)
+    head = env.data.site_xpos[env.head_site].copy()
+    d = np.array([0.0, 0.0, 1.0])
+    env.goal = Goal(p=head + offset * d, v=0.3 * d, quat=env._tool_quat(), axis=d)
+    _, _, term, _, info = env.step(np.zeros(env.action_space.shape))
+    assert info["passed"] == expect_attempt and term == expect_attempt
+
+
+def test_stationary_arrival_is_an_attempt_without_success(env):
+    """Reaching the goal pose without moving ends the episode with a near-zero bonus and no success."""
     from goals import Goal
 
     head = env.data.site_xpos[env.head_site].copy()
-    d = np.array([0.0, 0.0, 1.0])
-    perp = mu.any_perpendicular(d)
-    # Plane 1 cm behind the head; pretend the head came from 3 cm behind it.
-    p = head - 0.01 * d + lateral * env.cfg.goal.pass_radius * perp
-    env.goal = Goal(p=p, v=0.1 * d, quat=env._tool_quat(), axis=d)
-    env._prev_head = head - 0.03 * d
-    _, _, term, _, info = env.step(np.zeros(env.action_space.shape))
-    assert info["passed"] == expect_pass and term == expect_pass
+    d = np.array([0.0, 0.0, -1.0])
+    env.goal = Goal(p=head, v=0.4 * d, quat=env._tool_quat(), axis=d)
+    _, r, term, _, info = env.step(np.zeros(env.action_space.shape))
+    assert term and info["passed"] and not info["success"]
+    assert info["episode"]["terms"]["bonus"] < 0.05 * env.cfg.reward.reach_goal_bonus
 
 
 def _run_attempt(env, policy):
@@ -200,18 +209,18 @@ def _speed_scaled_oracle(mult):
     return Scaled()
 
 
-def test_pass_reward_prefers_the_right_strike(env):
-    """Striking at the goal velocity earns more pass reward than crawling or rushing through the goal."""
+def test_attempt_bonus_prefers_the_right_strike(env):
+    """Striking at the goal velocity earns more attempt bonus than crawling or rushing at the goal."""
     per_policy = {}
     for mult in (1.0, 0.3, 3.0):
         env.reset(seed=11)
         pol = _speed_scaled_oracle(mult)
         got = []
         for _ in range(6):
-            got.append(_run_attempt(env, pol)["terms"]["pass"])
+            got.append(_run_attempt(env, pol)["terms"]["bonus"])
             env.reset()
         per_policy[mult] = float(np.mean(got))
-    assert per_policy[1.0] > env.cfg.reward.success_bonus, per_policy
+    assert per_policy[1.0] > 0.2 * env.cfg.reward.reach_goal_bonus, per_policy
     assert per_policy[0.3] < 0.5 * per_policy[1.0] and per_policy[3.0] < 0.5 * per_policy[1.0], per_policy
 
 
@@ -275,8 +284,9 @@ def test_scripted_pass_through_succeeds(physical_cfg):
             break
     assert success, f"d_perp={info['d_perp']}"
     assert term
-    # Only the pass term: teleporting the tool out of a scripted grasp also (correctly) costs grasp potential.
-    assert env.ep_terms["pass"] > 0.95 * (env.cfg.reward.pass_scale + env.cfg.reward.success_bonus)
+    # Only the bonus term: teleporting the tool out of a scripted grasp also (correctly) costs grasp potential.
+    assert env.ep_terms["bonus"] > 0.95 * env.cfg.reward.reach_goal_bonus
+    assert info["episode"]["pass"]["dv_frac"] < 0.05
     env.close()
 
 

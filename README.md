@@ -240,9 +240,9 @@ Defaults marked `PPOCfg` come from `config.py`.
 | `--reward-from-config` | off | On `--resume`, use `RewardCfg` from `config.py` instead of the checkpoint's. `--init-from` always does |
 | `--save-every N` | `50` (`PPOCfg.save_every`) | Checkpoint interval in iterations |
 | `--eps-p LEVEL0 LEVEL1` | `0.08 0.03` | Success position tolerance in meters at curriculum level 0 and 1. Also overrides a resumed checkpoint's config |
-| `--sigma-p S` | `0.03` | Position scale in meters of the pass reward. Also overrides a resumed checkpoint's config |
+| `--eps-kp L0 L1` | `0.06 0.03` | Keypoint distance in meters that makes the attempt, at curriculum level 0 and 1. Also overrides a resumed checkpoint's config |
 | `--eps-v-frac LEVEL0 LEVEL1` | `0.6 0.25` | Success velocity tolerance as a fraction of the goal speed at curriculum level 0 and 1. Also overrides a resumed checkpoint's config. The scripted oracle meets 0.15 about 64% of the time and 0.1 only about 18%, so don't go below about 0.15 |
-| `--sigma-v-frac S` | `0.25` | Velocity scale (fraction of the goal speed) of the pass reward. Also overrides a resumed checkpoint's config |
+| `--sigma-v-frac S` | `0.25` | Velocity scale (fraction of the goal speed) of the attempt bonus. Also overrides a resumed checkpoint's config |
 | `--min-dir-z Z` | `-0.5` | Steepest downward goal velocity (the z of its direction); `-1` allows straight-down strikes such as the vertical nail task. Also overrides a resumed checkpoint's config |
 | `--grasp-slide F` | `0.3` | Weld grasps slide up to this fraction of the handle's half length from its center; `0.7` reaches grips near the end of the handle, like the task hammer grip. Also overrides a resumed checkpoint's config |
 
@@ -381,16 +381,16 @@ An episode is one goal, which gets one attempt.
   - Actor: MLP 512-256-128 (ELU) with a Gaussian output.
   - Critic: MLP 512-512-256.
   - Both use running observation normalization. They have separate Adam optimizers and separate gradient clipping.
-- **Reward:** set up for fine-tuning a policy that already strikes (`bc.py`), so it is just the task, with no shaping. Weights are in `RewardCfg`.
-  - **Pass**, paid once at the crossing: `20 · q`, plus 10 if it's a success, where
-    `q = exp(−(d/σp + |v_head − v_g| / (σv·|v_g|) + θ/σθ))`, with `σp = 3 cm`, `σv = 0.25` and `σθ = 20°`.
-    - The scales are the tightest success tolerances (level 1), so each factor is `1/e` at the edge of success. The reward keeps sharpening the strike inside the success region instead of saturating there.
-    - It uses the full velocity error, so a sideways crossing costs as much as a wrong speed. It's a product, so a head parked on the goal earns almost nothing.
-    - The scripted oracle scores `q ≈ 0.5` (about 18–20 per goal). Crawling (0.3×) or rushing (3×) through the goal earns under 1.
-    - The log shows the velocity at passes split into `(along … side …)`, as fractions of goal speed. They're `pass/v_along_frac` and `pass/v_side_frac` in TensorBoard. With swipe goals a large `side` is no longer by itself a sign of cutting across, because it's measured against the goal velocity, not the head axis. `pass/swipe_deg` is the mean angle between the goal velocity and the goal head axis.
-  - **Contact:** −0.1 per step when the robot or tool touches the table, floor or pedestal. With physical grip, only arm links count.
-  - **Physical grip adds** a grasp potential (reach, touch, lift, as `Φ' − Φ`) and a −10 drop penalty. With no approach shaping, physical grip has no dense signal toward the goal, so it isn't meant to be trained from scratch with this reward.
-  - Every episode end (pass, time-out, drop, divergence) cuts the PPO return, so each goal is scored on its own pass. If the return carried over into the next goal, reaching that goal sooner would pay, which means rushing through this one. A time-out can be cut too, because the time remaining is part of the observation.
+- **Reward:** the SimToolReal reward (the `strl_*` baseline, see [STRL_BASELINE.md](STRL_BASELINE.md)) extended with the goal velocity. Weights are in `RewardCfg`, the math in `rewards.py`.
+  - **Keypoint distance** `d`: the largest distance between 4 keypoints on the tool and the same keypoints at the goal pose. The keypoints are the corners of one fixed box (the baseline's, 0.141 m along the handle, scaled by 1.5) centered on the head, in the tool frame, so `d` covers position and orientation.
+  - **Keypoint progress**, per step: `200 · max(d* − d, 0)`, where `d*` is the closest so far this episode (while holding). Only beating the best pays, so a wind-up away from the goal costs nothing.
+  - **Smoothness**, per step: `−0.03 · Σ|q̇_arm|`.
+  - **Attempt bonus**, once: the first step with `d ≤ eps_kp` (6 cm at level 0 → 3 cm at level 1) is the attempt, and the episode ends there. It pays `1000 · exp(−|v_head − v_g| / (0.25·|v_g|))`, so arriving slowly or sideways earns little. It's a success if also `|v_head − v_g| < eps_v`.
+    - `eps_kp` starts tighter than the baseline's 11 cm because a wider zone covers the 12 cm lead-in: the attempt would fire while the head is still lining up (the oracle succeeds 42% at 11 cm, 94% at 6 cm).
+    - The log shows the errors at the attempt: keypoint and head distance, velocity error and its match `q_v`, and the velocity split into `(along … side …)` as fractions of goal speed (`pass/*` in TensorBoard).
+  - **Table force:** the episode ends (no penalty) when the robot or tool pushes on the table, floor or pedestal harder than 100 N (`push` in the log). With physical grip, only arm links count.
+  - **Physical grip adds** a grasp potential (reach, touch, lift, as `Φ' − Φ`) and a −10 drop penalty. Keypoint progress is paid only while holding.
+  - Every episode end (attempt, time-out, drop, table force, divergence) cuts the PPO return, so each goal is scored on its own attempt. If the return carried over into the next goal, reaching that goal sooner would pay, which means rushing through this one. A time-out can be cut too, because the time remaining is part of the observation.
   - **Earlier, from-scratch versions** of this reward added approach progress toward the lead-in point, a waypoint bonus, a waypoint gate on the pass reward, a clawback of shaping on poor passes, and a per-distance track reward along the lead-in line. These guarded against hacks a policy finds when learning from scratch, such as swooping across the plane from the side or rushing through goals. Starting from the cloned oracle, they're unnecessary (see git history).
 - **PPO:** 32 envs × 256 steps per update, 5 epochs (`--epochs`) of 4 minibatches.
   - The lr anneals linearly from `--lr` to `--lr-final` over each invocation of `train.py`, so a resumed run starts at the `--lr` it's given.

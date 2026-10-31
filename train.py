@@ -56,8 +56,9 @@ def episode_diagnostics(ep_stats, cc, level: float) -> dict:
 
     by_start/<type>/*  episodes split by how they started: weld "soft" (next goal, same grip), "regrip" or
                        "full"; physical "soft", "in_hand" (scripted grasp at respawn) or "table"
-    pass/*             error components at each pass (goal-plane crossing): crossing distance, velocity error
-                       as a fraction of goal speed, axis error, and the fraction of passes meeting each tolerance
+    pass/*             error components at each attempt (first step within the keypoint tolerance): keypoint
+                       distance, head distance, velocity error as a fraction of goal speed and its match q_v,
+                       rotation error, and the fraction of attempts meeting each tolerance
     """
     out = {}
     n = len(ep_stats)
@@ -71,15 +72,16 @@ def episode_diagnostics(ep_stats, cc, level: float) -> dict:
     if passes:
         lerp = lambda pair: pair[0] + (pair[1] - pair[0]) * level  # noqa: E731
         eps_p, eps_v_frac, eps_th = lerp(cc.eps_p), lerp(cc.eps_v_frac), lerp(cc.eps_theta_deg)
-        dp = np.array([c["d_perp"] for c in passes])
+        dp = np.array([c["dp"] for c in passes])
         dv_frac = np.array([c["dv_frac"] for c in passes])
         th = np.array([c["theta_deg"] for c in passes])
         out["pass/dp_cm"] = float(np.mean(dp) * 100)
+        out["pass/d_kp_cm"] = float(np.mean([c["d_kp"] for c in passes]) * 100)
         out["pass/dv_frac"] = float(np.mean(dv_frac))
         out["pass/theta_deg"] = float(np.mean(th))
         # Velocity at the crossing split along / across the goal direction, as fractions of goal speed. A large
         # sideways part means the policy is cutting across the plane instead of lining up behind the goal.
-        for k in ("v_along_frac", "v_side_frac", "quality", "swipe_deg"):
+        for k in ("v_along_frac", "v_side_frac", "q_v", "swipe_deg"):
             vals = [c[k] for c in passes if k in c]
             if vals:
                 out[f"pass/{k}"] = float(np.mean(vals))
@@ -137,13 +139,14 @@ def parse_args():
     # Overrides applied on top of the config (also on --resume, where the checkpoint's config is used otherwise).
     p.add_argument("--eps-p", type=float, nargs=2, metavar=("LEVEL0", "LEVEL1"), default=None,
                    help="success position tolerance in meters at curriculum level 0 and 1, e.g. --eps-p 0.08 0.01")
-    p.add_argument("--sigma-p", type=float, default=None,
-                   help="position scale (m) of the pass reward, e.g. 0.02")
+    p.add_argument("--eps-kp", type=float, nargs=2, metavar=("LEVEL0", "LEVEL1"), default=None,
+                   help="keypoint pose distance (m) that makes the attempt at curriculum level 0 and 1, "
+                        "e.g. --eps-kp 0.11 0.02")
     p.add_argument("--eps-v-frac", type=float, nargs=2, metavar=("LEVEL0", "LEVEL1"), default=None,
                    help="success velocity tolerance as a fraction of the goal speed at curriculum level 0 and 1, "
                         "e.g. --eps-v-frac 0.6 0.1")
     p.add_argument("--sigma-v-frac", type=float, default=None,
-                   help="velocity scale (fraction of the goal speed) of the pass reward, e.g. 0.1")
+                   help="velocity scale (fraction of the goal speed) of the attempt bonus, e.g. 0.1")
     p.add_argument("--min-dir-z", type=float, default=None,
                    help="steepest allowed downward goal velocity (z of its direction); -1 allows straight-down strikes")
     p.add_argument("--grasp-slide", type=float, default=None,
@@ -209,8 +212,8 @@ def main():
         env_cfg.action_mode = args.action_mode
     if args.eps_p is not None:
         env_cfg.curriculum.eps_p = tuple(args.eps_p)
-    if args.sigma_p is not None:
-        env_cfg.reward.sigma_p = args.sigma_p
+    if args.eps_kp is not None:
+        env_cfg.curriculum.eps_kp = tuple(args.eps_kp)
     if args.eps_v_frac is not None:
         env_cfg.curriculum.eps_v_frac = tuple(args.eps_v_frac)
     if args.sigma_v_frac is not None:
@@ -220,7 +223,7 @@ def main():
     if args.grasp_slide is not None:
         env_cfg.grasp_slide = args.grasp_slide
     print(f"grip={env_cfg.grip_mode} actions={env_cfg.action_mode}  "
-          f"eps_p (level 0 -> 1) = {env_cfg.curriculum.eps_p}  sigma_p = {env_cfg.reward.sigma_p}  "
+          f"eps_kp (level 0 -> 1) = {env_cfg.curriculum.eps_kp}  "
           f"eps_v_frac = {env_cfg.curriculum.eps_v_frac}  sigma_v_frac = {env_cfg.reward.sigma_v_frac}  "
           f"min_dir_z = {env_cfg.goal.min_dir_z}  grasp_slide = {env_cfg.grasp_slide}")
 
@@ -363,12 +366,15 @@ def main():
         log["sps"] = sps
         log["level"] = curriculum.level
         if ep_stats:
-            for k in ("return", "length", "success", "passed", "dropped", "ever_grasped", "diverged",
+            for k in ("return", "length", "success", "passed", "dropped", "pushed", "ever_grasped", "diverged",
                       "goal_fallback", "goal_recovery"):
                 log[f"ep/{k}"] = float(np.mean([e.get(k, 0.0) for e in ep_stats]))
             d_min = [e["d_min"] for e in ep_stats if np.isfinite(e["d_min"])]
             if d_min:
                 log["ep/d_min_cm"] = float(np.mean(d_min) * 100)
+            d_kp_min = [e["d_kp_min"] for e in ep_stats if np.isfinite(e.get("d_kp_min", np.nan))]
+            if d_kp_min:
+                log["ep/d_kp_min_cm"] = float(np.mean(d_kp_min) * 100)
             terms = defaultdict(list)
             for e in ep_stats:
                 for k, v in e["terms"].items():
@@ -389,14 +395,15 @@ def main():
         print(f"it {it:5d} step {global_step:10d} | sps {sps:7.0f} | lvl {curriculum.level:.2f} | "
               f"ret {g('ep/return'):8.2f} | succ {g('ep/success'):.3f} | pass {g('ep/passed'):.3f} | "
               f"eval succ {g('eval/success'):.3f} | "
-              f"drop {g('ep/dropped'):.3f} | kl {train_stats['final_kl']:.4f} ({train_stats['steps']} steps) "
+              f"drop {g('ep/dropped'):.3f} push {g('ep/pushed'):.3f} | kl {train_stats['final_kl']:.4f} ({train_stats['steps']} steps) "
               f"clip {train_stats['clipfrac']:.3f} lr {train_stats['lr']:.1e} std {train_stats['std']:.3f}")
         if it % 10 == 0 and ep_stats:
             starts = " ".join(f"{s} {g(f'by_start/{s}/success'):.2f}"
                               for s in sorted({e.get('start') for e in ep_stats}))
-            line = f"  succ by start: {starts} | d_min {g('ep/d_min_cm'):.1f}cm"
+            line = f"  succ by start: {starts} | d_min {g('ep/d_min_cm'):.1f}cm kp {g('ep/d_kp_min_cm'):.1f}cm"
             if "pass/dp_cm" in log:
-                line += (f" | at pass: {g('pass/dp_cm'):.1f}cm {g('pass/dv_frac'):.2f}xv {g('pass/theta_deg'):.0f}deg"
+                line += (f" | at attempt: kp {g('pass/d_kp_cm'):.1f}cm head {g('pass/dp_cm'):.1f}cm "
+                         f"{g('pass/dv_frac'):.2f}xv (q_v {g('pass/q_v'):.2f}) {g('pass/theta_deg'):.0f}deg"
                          f" (along {g('pass/v_along_frac'):.2f} side {g('pass/v_side_frac'):.2f})"
                          f" | ok pos {g('pass/ok_pos'):.2f} vel {g('pass/ok_vel'):.2f} axis {g('pass/ok_axis'):.2f}")
             print(line)

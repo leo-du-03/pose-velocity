@@ -30,12 +30,12 @@ import mathutils as mu
 from config import EnvCfg
 from env import PoseVelocityEnv
 from goals import Goal
+from rewards import KEYPOINT_CORNERS, keypoints
 from strl_config import StrlCfg, make_env_cfg
 
 warnings.filterwarnings("ignore", message=".*Attach conflict.*")
 
 OBJ = mujoco.mjtObj
-KEYPOINT_CORNERS = np.array([[1, 1, 1], [1, 1, -1], [-1, -1, 1], [-1, -1, -1]], dtype=np.float64)
 # The tool body frame has z along the handle towards the head. SimToolReal's object frame has x along the handle
 # towards the head: object x = tool z, object y = tool x, object z = tool y (a proper rotation).
 R_TOOL_OBJ = np.column_stack([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
@@ -54,11 +54,6 @@ def canon_quat(q) -> np.ndarray:
     """q and -q are the same rotation; pick w >= 0 so the observation is continuous for small rotations."""
     q = np.asarray(q, dtype=np.float64)
     return -q if q[0] < 0 else q
-
-
-def keypoints(pos, quat_obj, offsets) -> np.ndarray:
-    """World positions (K, 3) of object-frame offsets (K, 3) at an object pose."""
-    return np.asarray(pos) + np.asarray(offsets) @ mu.quat_to_mat(quat_obj).T
 
 
 class StrlEnv(PoseVelocityEnv):
@@ -194,19 +189,6 @@ class StrlEnv(PoseVelocityEnv):
         mujoco.mj_forward(m, d)
 
     # ------------------------------------------------------------------ measurements
-    def _env_contact_force(self) -> float:
-        """Net normal force of contacts between the robot or tool and the table, pedestal or floor."""
-        m, d = self.model, self.data
-        f6, total = np.zeros(6), 0.0
-        for i in range(d.ncon):
-            g1, g2 = int(d.contact.geom1[i]), int(d.contact.geom2[i])
-            if g1 in self.env_geoms or g2 in self.env_geoms:
-                other = int(m.geom_bodyid[g2 if g1 in self.env_geoms else g1])
-                if other in self.robot_body_set or other == self.tool_id:
-                    mujoco.mj_contactForce(m, d, i, f6)
-                    total += abs(float(f6[0]))
-        return total
-
     def _body_vel(self, body_id: int) -> np.ndarray:
         v = np.zeros(6)
         mujoco.mj_objectVelocity(self.model, self.data, OBJ.mjOBJ_BODY, body_id, v, 0)

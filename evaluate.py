@@ -107,8 +107,8 @@ def main():
         e = info["episode"]
         results.append(e)
         ps = e["pass"]
-        pass_txt = (f"pass d {ps['d_perp'] * 100:4.1f}cm v {ps['dv_frac']:.2f}xv rot {ps['theta_deg']:3.0f}deg"
-                    if ps else "no pass")
+        pass_txt = (f"attempt kp {ps['d_kp'] * 100:4.1f}cm head {ps['dp'] * 100:4.1f}cm v {ps['dv_frac']:.2f}xv "
+                    f"(q_v {ps['q_v']:.2f}) rot {ps['theta_deg']:3.0f}deg" if ps else "no attempt")
         print(f"episode {ep}: start {start_kind:7s}  return {ep_ret:8.2f}  len {e['length']:4d}  "
               f"success {bool(e['success'])}  dropped {bool(e['dropped'])}  {pass_txt}  "
               f"d_min {e['d_min'] * 100:.1f}cm")

@@ -768,6 +768,13 @@ class HammerTask(Task):
                "success": bool(hit and abs(err) < self.tc.force_tol),
                "follower_force_err": float(env.trace.meta.get("follower_force_err", float("nan")))}
         out.update(self.at_contact)
+        # Impact speed the trace commands, and the speed the reference follower actually hit at (which gave
+        # the target force); speed_err compares the policy's contact speed with the follower's.
+        out["trace_speed"] = float(env.trace.meta.get("impact_speed", float("nan")))
+        v_ref = float(env.trace.meta.get("follower_contact_speed", float("nan")))
+        out["follower_contact_speed"] = v_ref
+        v = out.get("contact_speed", float("nan"))
+        out["speed_err"] = float(v / v_ref - 1.0) if v_ref > 0 and np.isfinite(v) else float("nan")
         n_windup = len(env.trace.keypoints) - 1  # goals before the hit (raise, swing)
         out["windup_keypoints"], out["windup_passed"] = n_windup, min(len(env.kp_log), n_windup)
         return out

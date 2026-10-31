@@ -23,13 +23,15 @@ COLUMNS = {
               ("force_err", "err", "{:+6.1%}", 1), ("contact_speed", "v", "{:4.2f}m/s", 1),
               ("contact_err", "pos", "{:4.1f}cm", 100), ("contact_theta_deg", "rot", "{:3.0f}deg", 1)],
     "nail": [("force_target", "F*", "{:6.1f}N", 1), ("peak_force", "F", "{:6.1f}N", 1),
-             ("force_err", "err", "{:+6.1%}", 1), ("contact_err", "off-axis", "{:4.1f}cm", 100),
+             ("force_err", "err", "{:+6.1%}", 1), ("contact_speed", "v", "{:4.2f}m/s", 1),
+             ("follower_contact_speed", "v*", "{:4.2f}m/s", 1), ("speed_err", "v err", "{:+6.1%}", 1),
+             ("contact_err", "off-axis", "{:4.1f}cm", 100),
              ("nail_driven", "driven", "{:4.1f}mm", 1000), ("hit", "hit", "{}", None)],
     "sweep": [("cleaned", "cleaned", "{:5.1%}", 1), ("cleaned_l1", "light", "{:5.1%}", 1),
               ("cleaned_l2", "medium", "{:5.1%}", 1), ("cleaned_l3", "heavy", "{:5.1%}", 1),
               ("force_deficit", "deficit", "{:5.1%}", 1), ("untouched_cells", "untouched", "{}", None)],
 }
-SUMMARY = {"plate": ["force_err", "contact_err", "contact_speed"], "nail": ["force_err", "contact_err", "nail_driven"],
+SUMMARY = {"plate": ["force_err", "contact_err", "contact_speed"], "nail": ["force_err", "speed_err", "contact_err", "nail_driven"],
            "sweep": ["cleaned", "cleaned_l1", "cleaned_l2", "cleaned_l3", "force_deficit"]}
 
 
