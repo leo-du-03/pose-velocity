@@ -102,7 +102,7 @@ class TaskEnv(PoseVelocityEnv):
     """
 
     _SNAP_ATTRS = ("targets", "_a_filt", "prev_action", "_prev_head", "t", "task_t", "goal", "kp_index", "kp_log",
-                   "head_log", "d_best", "closest", "ep_return", "ep_terms", "_forced_reset_kind")
+                   "head_log", "d_best", "closest", "ep_return", "ep_terms", "_forced_reset_kind", "near_steps")
 
     def __init__(self, task="plate", cfg: Optional[EnvCfg] = None, task_cfg: Optional[TaskCfg] = None,
                  render_mode: Optional[str] = None):
@@ -174,6 +174,7 @@ class TaskEnv(PoseVelocityEnv):
         self.trace = trace
         self.task_t, self.kp_index, self.kp_log, self.head_log = 0, 0, [], []
         self.t = 0
+        self.near_steps = 0
         self.goal = trace.keypoints[0]
         self._update_goal_markers()
         self.task.begin(self)
@@ -238,12 +239,26 @@ class TaskEnv(PoseVelocityEnv):
         kps = self.trace.keypoints
         if self.kp_index < len(kps):
             g = self.goal
-            d_perp = plane_crossing(prev_head, head, g.p, g.direction)
-            if d_perp is not None and d_perp < self.cfg.goal.pass_radius:
+            if self.cfg.goal_velocity:
+                # A keypoint is passed when the head crosses its plane (normal v_hat) near it.
+                d_perp = plane_crossing(prev_head, head, g.p, g.direction)
+                passed = d_perp is not None and d_perp < self.cfg.goal.pass_radius
+            else:
+                # Pose-only checkpoints: the training success rule, since a policy that stops at the pose never
+                # crosses the plane. "touch": the first step within eps_kp; "hold": success_steps such steps (not
+                # necessarily consecutive) on this keypoint. d_perp logs the head's distance to the point instead.
+                near = self.kp_distance(head) <= self.eps_kp()
+                if self.task.last_keypoint_is_contact and self.kp_index == len(kps) - 1:
+                    near = False
+                self.near_steps += int(near)
+                passed = near if not self.pose_hold else self.near_steps >= self.cfg.success_steps
+                d_perp = float(np.linalg.norm(head - g.p))
+            if passed:
                 self.kp_log.append({"d_perp": d_perp, "dv_frac": float(np.linalg.norm(lin - g.v) / max(g.speed, 1e-6)),
                                     "theta_deg": float(np.degrees(np.linalg.norm(self._rot_error()))),
                                     "step": self.task_t})
                 self.kp_index += 1
+                self.near_steps = 0
                 if self.kp_index < len(kps):
                     self.goal = kps[self.kp_index]
                     self.t = 0
@@ -292,6 +307,9 @@ class TaskEnv(PoseVelocityEnv):
 # ====================================================================================================== tasks
 class Task:
     name = "task"
+    # The last keypoint is the contact itself (hammer hits). Pose-only checkpoints can't pass it by getting within
+    # eps_kp: the episode ends on the contact instead, or at the keypoint's step budget.
+    last_keypoint_is_contact = False
 
     def __init__(self, tc: TaskCfg):
         self.tc = tc
@@ -342,6 +360,7 @@ class HammerTask(Task):
     """Shared by plate and nail: hit the target with the hammer face at a calibrated speed for a target peak force."""
 
     vertical = False  # always strike straight down (a vertical target), in either layout
+    last_keypoint_is_contact = True
     target_names: tuple = ()  # geoms whose contact with the tool is the hit
     miss_names: tuple = ()  # geoms whose contact with the tool first is a miss
 
@@ -912,8 +931,9 @@ class NailTask(HammerTask):
 
 
 class SweepTask(Task):
-    """Sweep a dirty patch with the brush. A dirt cell is removed when it is under the bristle pad while the pad
-    pushes with at least that cell's required force (TaskCfg.dirt_forces, by dirt level)."""
+    """Sweep a dirty patch with the brush. TaskCfg.sweep_rule "scrub": a dirt cell under the bristle pad accumulates
+    pad force x sliding speed x dt while the force is at least its adhesion (TaskCfg.dirt_forces, by dirt level), and
+    is removed at scrub_len x adhesion. "force": removed as soon as the pad pushes on it with its adhesion force."""
 
     name = "sweep"
 
@@ -958,6 +978,8 @@ class SweepTask(Task):
         j = name(OBJ.mjOBJ_JOINT, "tool_pad_slide")
         self.pad_qadr, self.pad_dadr = int(m.jnt_qposadr[j]), int(m.jnt_dofadr[j])
         env.env_geoms = env.env_geoms | {self.board_gid}
+        if self.tc.sweep_rule not in ("scrub", "force"):
+            raise ValueError(f"sweep_rule must be 'scrub' or 'force', got {self.tc.sweep_rule!r}")
         self.level = np.zeros(len(self.cells_xy), dtype=np.int64)
         self.depth_cal = None  # (depths, forces) of the pad on the board; per compiled model
 
@@ -1167,15 +1189,25 @@ class SweepTask(Task):
     def begin(self, env) -> None:
         self.cleaned = np.zeros(len(self.cells_xy), dtype=bool)
         self.fmax = np.zeros(len(self.cells_xy))
+        self.scrub = np.zeros(len(self.cells_xy))  # accumulated force x sliding distance above the adhesion (N m)
         self._paint(env, self.cleaned)
 
     def snapshot(self, env):
-        return None if not hasattr(self, "cleaned") else (self.cleaned.copy(), self.fmax.copy())
+        if not hasattr(self, "cleaned"):
+            return None
+        return self.cleaned.copy(), self.fmax.copy(), self.scrub.copy()
 
     def restore(self, env, snap) -> None:
         if snap is not None:
-            self.cleaned, self.fmax = snap
+            self.cleaned, self.fmax, self.scrub = (a.copy() for a in snap)
             self._paint(env, self.cleaned)
+
+    def _pad_slide_speed(self, env) -> float:
+        """Speed of the pad along the board (the board's normal component removed)."""
+        vel = np.zeros(6)
+        mujoco.mj_objectVelocity(env.model, env.data, OBJ.mjOBJ_BODY, self.pad_id, vel, 0)  # world frame: ang, lin
+        lin = vel[3:]
+        return float(np.linalg.norm(lin - (lin @ _UP) * _UP))
 
     def measure(self, env) -> None:
         f = self.pad_force(env)
@@ -1190,7 +1222,13 @@ class SweepTask(Task):
         if not under.any():
             return
         self.fmax[under] = np.maximum(self.fmax[under], f)
-        new = under & ~self.cleaned & (self.level > 0) & (f >= self.required)
+        active = under & ~self.cleaned & (self.level > 0) & (f >= self.required)
+        if self.tc.sweep_rule == "scrub":
+            if active.any():
+                self.scrub[active] += f * self._pad_slide_speed(env) * env.model.opt.timestep
+            new = active & (self.scrub >= self.tc.scrub_len * self.required)
+        else:
+            new = active
         if new.any():
             self.cleaned |= new
             self._paint(env, self.cleaned)
@@ -1208,10 +1246,12 @@ class SweepTask(Task):
             out[f"cleaned_l{lv}"] = float(self.cleaned[sel].mean()) if sel.any() else float("nan")
             out[f"dirt_l{lv}"] = int(sel.sum())  # cells of this level at the start
             out[f"removed_l{lv}"] = int((sel & self.cleaned).sum())
-        missed = dirty & ~self.cleaned & (self.fmax > 0)
+        missed = dirty & ~self.cleaned & (self.fmax > 0) & (self.fmax < self.required)  # touched, too lightly
         out["force_deficit"] = (float(np.mean((self.required[missed] - self.fmax[missed]) / self.required[missed]))
                                 if missed.any() else 0.0)
         out["untouched_cells"] = int((dirty & (self.fmax == 0)).sum())
+        # Pressed hard enough but not slid across far enough (scrub rule only; the force rule removes these).
+        out["unscrubbed_cells"] = int((dirty & ~self.cleaned & (self.fmax >= self.required)).sum())
         return out
 
 

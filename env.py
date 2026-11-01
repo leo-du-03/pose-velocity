@@ -12,6 +12,9 @@ Episode rules (one episode = one goal = one attempt)
   pass_radius of p_g: a "pass". It is a success if the crossing distance, the velocity error and the
   orientation error (full rotation angle to the goal orientation) are all within the curriculum tolerances. Physical grip also terminates on a drop.
 * truncated: time limit (`max_steps`) or physics divergence.
+* Pose-only baseline (EnvCfg.goal_velocity False): the goal velocity is dropped from the observation and the
+  reward. pose_success "touch": the first step within the keypoint tolerance succeeds and terminates. "hold"
+  (SimToolReal): success and termination after success_steps steps within it, the bonus paid per near step.
 * The arm is never re-homed between episodes (except on the very first reset, an explicit
   `reset(seed=...)` / `options={"full": True}`, or after physics divergence).
 
@@ -59,7 +62,11 @@ class PoseVelocityEnv(gym.Env):
             raise ValueError(f"grip_mode must be 'weld' or 'physical', got {self.cfg.grip_mode!r}")
         if self.cfg.action_mode not in ("head_twist", "joint"):
             raise ValueError(f"action_mode must be 'head_twist' or 'joint', got {self.cfg.action_mode!r}")
+        if self.cfg.pose_success not in ("hold", "touch"):
+            raise ValueError(f"pose_success must be 'hold' or 'touch', got {self.cfg.pose_success!r}")
         self.weld = self.cfg.grip_mode == "weld"
+        # Pose-only baseline (goal_velocity False): "hold" counts near steps (SimToolReal), "touch" ends on the first.
+        self.pose_hold = (not self.cfg.goal_velocity) and self.cfg.pose_success == "hold"
         self.render_mode = render_mode
         self._np_random, _ = seeding.np_random(self.cfg.seed)
         self.builder = SceneBuilder(self.cfg.scene)
@@ -627,6 +634,8 @@ class PoseVelocityEnv(gym.Env):
         half = 0.05 + 0.15 * g.speed  # arrow length scales with target speed
         m.geom_size[self.goal_vel_gid][1] = half
         m.geom_pos[self.goal_vel_gid][2] = half
+        if not self.cfg.goal_velocity:
+            m.geom_rgba[self.goal_vel_gid][3] = 0.0  # pose-only: the goal velocity is not part of the task
         mujoco.mj_forward(m, d)
 
     # ------------------------------------------------------------------ gym API
@@ -638,6 +647,7 @@ class PoseVelocityEnv(gym.Env):
         self.closest: dict = {}
         self.pass_info: dict = {}
         self.kp_best: Optional[float] = None  # closest keypoint pose distance while holding (the reward's d*)
+        self.near_steps = 0  # pose-only "hold": steps within the keypoint tolerance this episode
         self.table_force = 0.0
         self.ep_return = 0.0
         self.ep_terms: dict = {}
@@ -759,11 +769,24 @@ class PoseVelocityEnv(gym.Env):
         held_ok = holding or not cfg.success_requires_grasp
         dv_norm = float(np.linalg.norm(dv))
         d_kp = self.kp_distance(head)
-        # The attempt: the first step within the keypoint tolerance (position and orientation). The episode ends
-        # there; it is a success if the head also moves at the goal velocity.
-        attempt = bool(held_ok and d_kp <= self.eps_kp())
-        success = bool(attempt and dv_norm < eps_v)
-        passed = attempt
+        near = bool(held_ok and d_kp <= self.eps_kp())
+        first_near = near and not self.pass_info
+        bonus_frac = None  # pose + velocity: q_v on the attempt (rewards.step_terms)
+        if cfg.goal_velocity:
+            # The attempt: the first step within the keypoint tolerance (position and orientation). The episode ends
+            # there; it is a success if the head also moves at the goal velocity.
+            attempt = near
+            success = bool(attempt and dv_norm < eps_v)
+        elif self.pose_hold:
+            # SimToolReal: success after success_steps near steps (not necessarily consecutive), bonus per near step.
+            self.near_steps += int(near)
+            attempt = first_near  # diagnostics only
+            success = self.near_steps >= cfg.success_steps
+            bonus_frac = 1.0 / cfg.success_steps if near else 0.0
+        else:  # pose-only "touch": the first near step succeeds and ends the episode
+            attempt = success = near
+            bonus_frac = 1.0 if near else 0.0
+        passed = success if self.pose_hold else attempt
         d_perp = plane_crossing(prev_head, head, g.p, g.direction)  # goal-plane crossing (diagnostics only)
 
         dropped = False
@@ -786,7 +809,7 @@ class PoseVelocityEnv(gym.Env):
         else:
             d_star = d_kp
         terms, q_v = step_terms(rc, d=d_kp, d_star=d_star, attempt=attempt, dv=dv_norm, speed=g.speed,
-                                qvel_l1=float(np.abs(self.data.qvel[self.arm_dadr]).sum()))
+                                qvel_l1=float(np.abs(self.data.qvel[self.arm_dadr]).sum()), bonus_frac=bonus_frac)
         if attempt:
             v_along = float(lin @ g.direction)
             v_side = float(np.linalg.norm(lin - v_along * g.direction))
@@ -828,7 +851,7 @@ class PoseVelocityEnv(gym.Env):
 
     def _episode_info(self, success: bool, dropped: bool, passed: bool, kind: str, pushed: bool = False) -> dict:
         return {"return": self.ep_return, "length": self.t, "success": float(success), "dropped": float(dropped),
-                "passed": float(passed), "pushed": float(pushed),
+                "passed": float(passed), "pushed": float(pushed), "near_steps": self.near_steps,
                 "d_kp_min": float(self.kp_best) if self.kp_best is not None else float("nan"), "d_min": float(self.d_best) if np.isfinite(self.d_best) else float("nan"),
                 "ever_grasped": float(self.ever_grasped), "diverged": float(self.diverged),
                 "goal_fallback": float(self.goal_fallback), "goal_recovery": float(self.goal_recovery),
@@ -855,11 +878,16 @@ class PoseVelocityEnv(gym.Env):
             # Tool pose in the palm frame (for weld this is the grasp).
             R_palm.T @ (d.xpos[self.tool_id] - palm), mu.rot6d(R_palm.T @ R_tool),
             self.tool.features(),
-            g.p, g.v, mu.rot6d(mu.quat_to_mat(g.quat)),
-            head - g.p, lin - g.v, self._rot_error(),
-            self.lead_point() - head,
-            [eps_p, eps_v, eps_th],
         ]
+        if self.cfg.goal_velocity:
+            parts += [
+                g.p, g.v, mu.rot6d(mu.quat_to_mat(g.quat)),
+                head - g.p, lin - g.v, self._rot_error(),
+                self.lead_point() - head,
+                [eps_p, eps_v, eps_th],
+            ]
+        else:  # pose-only: nothing that depends on the goal velocity
+            parts += [g.p, mu.rot6d(mu.quat_to_mat(g.quat)), head - g.p, self._rot_error(), [eps_p, eps_th]]
         if not self.weld:
             parts.append([float(self._holding()), float(self._grasp_condition())])
         parts.append([1.0 - self.t / self.cfg.max_steps])
@@ -872,7 +900,7 @@ class PoseVelocityEnv(gym.Env):
             np.minimum(self.tip_force, 50.0) / 10.0,
             [min(self.d_best, 1.0) if np.isfinite(self.d_best) else 1.0, self.level,
              float(self.ever_grasped), min(self.no_contact, 20) / 10.0, float(self.c_tool_table), self._tool_lift()],
-        ])
+        ] + ([[self.near_steps / self.cfg.success_steps]] if self.pose_hold else []))
         return priv.astype(np.float32)
 
     def oracle_action(self) -> np.ndarray:
@@ -881,9 +909,9 @@ class PoseVelocityEnv(gym.Env):
         The oracle is stateful (approach, then strike), so call this once per step, before stepping.
         """
         if self._oracle is None:
-            from oracle import Oracle
+            from oracle import Oracle, PoseOracle
 
-            self._oracle = Oracle()
+            self._oracle = Oracle() if self.cfg.goal_velocity else PoseOracle()
         return self._oracle(self).astype(np.float32)
 
     # ------------------------------------------------------------------ test / debug helpers

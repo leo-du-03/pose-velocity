@@ -10,6 +10,9 @@ actually visits.
 The oracle is stateful (approach the lead-in point, then strike) and reads privileged env state, so each env worker
 runs its own oracle (PoseVelocityEnv.oracle_action). Weld grip and head_twist actions only.
 
+--pose-only {hold,touch} clones the pose-only baseline instead (EnvCfg.goal_velocity False, oracle.PoseOracle); the
+setting is saved in the checkpoint's env_cfg, so train.py --init-from fine-tunes the same task.
+
 The envs are spread evenly over --levels: the curriculum tolerances are part of the observation, so the cloned
 policy has to have seen the levels PPO will run at.
 
@@ -63,6 +66,9 @@ def parse_args():
                         "data is mostly the oracle's own (easy) states and otherwise dominates the loss")
     p.add_argument("--levels", type=float, nargs=2, metavar=("LO", "HI"), default=(0.0, 1.0),
                    help="curriculum levels the envs are spread over")
+    p.add_argument("--pose-only", default=None, choices=["hold", "touch"],
+                   help="pose-only baseline (no goal velocity) with this success rule: 'hold' = SimToolReal's "
+                        "success_steps steps within tolerance, 'touch' = the first step within tolerance")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--serial", action="store_true", help="run envs in the main process (debugging)")
     p.add_argument("--logdir", default="runs")
@@ -84,6 +90,8 @@ def main():
         torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
 
     env_cfg, ppo_cfg = EnvCfg(), PPOCfg(num_envs=args.num_envs)
+    if args.pose_only is not None:
+        env_cfg.goal_velocity, env_cfg.pose_success = False, args.pose_only
     if env_cfg.grip_mode != "weld" or env_cfg.action_mode != "head_twist":
         raise SystemExit("the oracle needs grip_mode 'weld' and action_mode 'head_twist'")
     K, N, T = args.eval_envs, args.num_envs, args.rollout_steps
@@ -110,7 +118,9 @@ def main():
            for i, lv in enumerate(levels)]
     venv = SerialVecEnv(fns) if (args.serial or N == 1) else SubprocVecEnv(fns)
     obs_dim, act_dim, priv_dim = venv.observation_space.shape[0], venv.action_space.shape[0], venv.priv_dim
-    print(f"device={device}  num_envs={N} ({K} eval)  levels {lo:.2f}-{hi:.2f}  noise std {noise_std:.3f}  "
+    goal_txt = "pose+velocity" if env_cfg.goal_velocity else f"pose-only ({env_cfg.pose_success})"
+    print(f"goal={goal_txt}  device={device}  num_envs={N} ({K} eval)  levels {lo:.2f}-{hi:.2f}  "
+          f"noise std {noise_std:.3f}  "
           f"run_dir={run_dir}")
 
     agent = ActorCritic(obs_dim, priv_dim, act_dim, ppo_cfg).to(device)

@@ -138,6 +138,14 @@ class EnvCfg:
     # "head_twist": arm actions are the tool head's linear + angular velocity, mapped to joints by damped
     # least squares. "joint": arm actions are changes to the joint-position targets.
     action_mode: str = "head_twist"
+    # False: pose-only baseline. Goals are sampled as usual but their velocity is neither observed nor scored.
+    # Kept in EnvCfg (not RewardCfg) so it travels with checkpoints through train.py --init-from.
+    goal_velocity: bool = True
+    # Pose-only success rule. "hold" (SimToolReal): success after success_steps steps within the keypoint tolerance
+    # (not necessarily consecutive), the bonus paid per near step. "touch": the first near step succeeds and ends the
+    # episode, as in the pose + velocity setup (passing through the pose is allowed).
+    pose_success: str = "hold"
+    success_steps: int = 10
     head_v_max: float = 0.8  # m/s at action 1
     head_w_max: float = 2.5  # rad/s at action 1
     ik_damping: float = 0.05
@@ -231,7 +239,17 @@ class TaskCfg:
     board_height: float = 0.12  # m above the table (in_dist); realistic sweeps the table itself
     dirt_size: Tuple[float, float] = (0.30, 0.22)  # dirty region: along the strokes, across them
     dirt_cell: float = 0.02
-    dirt_forces: Tuple[float, ...] = (3.0, 8.0, 14.0)  # N needed to remove dirt of level 1, 2, 3
+    dirt_forces: Tuple[float, ...] = (3.0, 14.0, 18.0)  # N needed to remove dirt of level 1, 2, 3 (its adhesion)
+    # How dirt comes off. "scrub" (Preston's wear law with an adhesion threshold): a cell under the pad accumulates
+    # pad force x sliding speed x dt while the force is at least its dirt_forces value, and is removed once that
+    # reaches scrub_len x dirt_forces. So the pad has to slide across the cell (pressing in place removes nothing),
+    # removal depends on the distance slid, not the speed, and pressing harder scrubs faster. "force": removed as soon
+    # as the pad presses on the cell with its dirt_forces value, even standing still (the original rule).
+    sweep_rule: str = "scrub"
+    # m: sliding distance needed at exactly the adhesion force (less when pressing harder). The pad is 7 cm long
+    # along the stroke, so one pass of the trace (pressing force_margin above the adhesion) scrubs a cell about twice
+    # over.
+    scrub_len: float = 0.04
     dirt_blobs: Tuple[int, int] = (3, 6)
     force_margin: float = 0.15  # the trace presses this fraction above the required force
     sweep_speed: float = 0.35  # m/s along a stroke (>= GoalCfg.speed_min so keypoints are in distribution)

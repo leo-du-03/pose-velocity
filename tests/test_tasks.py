@@ -69,10 +69,15 @@ def test_hammer_trace_hits_target_force(cfg, task):
     env.close()
 
 
+# Sweep tests use the reference dirt forces, so they don't depend on how TaskCfg.dirt_forces is tuned.
+SWEEP_FORCES = (3.0, 8.0, 14.0)
+
+
 def test_sweep_trace_cleans_everything(cfg):
+    from config import TaskCfg
     from tasks import TaskEnv
 
-    env = TaskEnv("sweep", cfg)
+    env = TaskEnv("sweep", cfg, TaskCfg(dirt_forces=SWEEP_FORCES))
     env.reset(seed=0)
     for _ in range(2):
         for kp in env.trace.keypoints:  # in the training goal distribution
@@ -85,9 +90,10 @@ def test_sweep_trace_cleans_everything(cfg):
 
 def test_sweep_force_gates_cleaning(cfg):
     """Pressing just hard enough for light dirt everywhere removes the light dirt and nothing heavier."""
+    from config import TaskCfg
     from tasks import TaskEnv
 
-    env = TaskEnv("sweep", cfg)
+    env = TaskEnv("sweep", cfg, TaskCfg(dirt_forces=SWEEP_FORCES))
     env.reset(seed=0)
     task = env.task
     light = task.tc.dirt_forces[0] * (1.0 + task.tc.force_margin)
@@ -103,6 +109,58 @@ def test_sweep_force_gates_cleaning(cfg):
                 assert m[f"cleaned_l{lv}"] == 0.0, m
         env.reset()
     assert seen
+    env.close()
+
+
+def _pad_over_all_cells(env, rule):
+    """Sweep env with every dirt cell moved under the pad's face, all heavy; pad force and sliding speed mocked."""
+    task = env.task
+    task.tc.sweep_rule = rule
+    d = env.data
+    R = d.xmat[task.pad_id].reshape(3, 3)
+    face = d.xpos[task.pad_id] + R @ np.array([0.0, 0.0, 2 * task.tc.pad_half_thick])
+    task.cells_world = np.tile(face, (len(task.cells_xy), 1))
+    task.level[:] = len(task.tc.dirt_forces)
+    task.required = np.full(len(task.cells_xy), task.tc.dirt_forces[-1])
+    task.begin(env)
+    return task
+
+
+@pytest.mark.parametrize("rule, slide, expect_clean", [("scrub", 0.0, False), ("scrub", 0.3, True),
+                                                      ("force", 0.0, True)])
+def test_sweep_scrub_needs_sliding(cfg, rule, slide, expect_clean):
+    """Scrub rule: pressing above the adhesion force in place removes nothing; sliding removes the dirt after
+    about scrub_len x adhesion / force of travel. The force rule removes it on contact."""
+    from config import TaskCfg
+    from tasks import TaskEnv
+
+    env = TaskEnv("sweep", cfg, TaskCfg(dirt_forces=SWEEP_FORCES))
+    env.reset(seed=0)
+    task = _pad_over_all_cells(env, rule)
+    f = 2.0 * task.required[0]
+    task.pad_force = lambda e: f
+    task._pad_slide_speed = lambda e: slide
+    dt = env.model.opt.timestep
+    n_needed = task.tc.scrub_len * task.required[0] / (f * slide * dt) if slide > 0 else 1e9
+    for _ in range(int(min(n_needed, 2000)) + 2):
+        task.measure(env)
+    assert task.cleaned.all() == expect_clean and task.cleaned.any() == expect_clean
+    env.close()
+
+
+def test_sweep_scrub_needs_the_adhesion_force(cfg):
+    """Sliding below the adhesion force never removes the dirt, however far."""
+    from config import TaskCfg
+    from tasks import TaskEnv
+
+    env = TaskEnv("sweep", cfg, TaskCfg(dirt_forces=SWEEP_FORCES))
+    env.reset(seed=0)
+    task = _pad_over_all_cells(env, "scrub")
+    task.pad_force = lambda e: 0.9 * task.required[0]
+    task._pad_slide_speed = lambda e: 0.3
+    for _ in range(5000):  # 3 m of sliding
+        task.measure(env)
+    assert not task.cleaned.any() and task.scrub.max() == 0.0
     env.close()
 
 

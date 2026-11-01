@@ -40,3 +40,15 @@ def test_step_terms_pay_progress_below_the_best_and_the_bonus_only_on_the_attemp
     t, _ = step_terms(c, d=0.02, d_star=0.02, attempt=True, dv=0.4, speed=0.4, qvel_l1=2.0)
     assert t["bonus"] < 0.02 * c.reach_goal_bonus
     assert np.isclose(t["smooth"], -c.arm_vel_penalty * 2.0)
+
+
+def test_step_terms_bonus_frac_overrides_the_velocity_match():
+    """Pose-only: the env passes bonus_frac (1 for "touch", 1 / success_steps per near step for "hold")."""
+    c = RewardCfg()
+    kw = dict(d=0.02, d_star=0.02, dv=0.4, speed=0.4, qvel_l1=0.0)  # wrong velocity: q_v would be ~0
+    t, _ = step_terms(c, attempt=True, bonus_frac=1.0, **kw)
+    assert np.isclose(t["bonus"], c.reach_goal_bonus)
+    t, _ = step_terms(c, attempt=False, bonus_frac=0.1, **kw)
+    assert np.isclose(t["bonus"], 0.1 * c.reach_goal_bonus)
+    t, _ = step_terms(c, attempt=True, bonus_frac=0.0, **kw)
+    assert t["bonus"] == 0.0

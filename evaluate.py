@@ -15,7 +15,7 @@ import numpy as np
 
 from config import EnvCfg, RewardCfg
 from env import PoseVelocityEnv
-from oracle import Oracle
+from oracle import Oracle, PoseOracle
 
 
 def main():
@@ -27,6 +27,9 @@ def main():
                    help="override the grip mode (default: from checkpoint, else config.py)")
     p.add_argument("--action-mode", default=None, choices=["head_twist", "joint"],
                    help="override the action mode (default: from checkpoint, else config.py)")
+    p.add_argument("--pose-only", default=None, choices=["hold", "touch"],
+                   help="without --ckpt: pose-only baseline (no goal velocity) with this success rule "
+                        "(a checkpoint carries its own setting)")
     p.add_argument("--episodes", type=int, default=5)
     p.add_argument("--render", default="none", choices=["none", "human", "rgb_array"])
     p.add_argument("--video", default=None, help="write an mp4 (implies --render rgb_array)")
@@ -63,7 +66,11 @@ def main():
         if cfg.grip_mode != "physical":
             p.error("--table-start needs --grip-mode physical")
         cfg.curriculum.start_in_hand_prob = (0.0, 0.0)
-    oracle = Oracle() if policy == "oracle" else None
+    if args.pose_only is not None:
+        if policy == "ckpt":
+            p.error("--pose-only is taken from the checkpoint; drop it with --ckpt")
+        cfg.goal_velocity, cfg.pose_success = False, args.pose_only
+    oracle = (Oracle() if cfg.goal_velocity else PoseOracle()) if policy == "oracle" else None
 
     render_mode = "rgb_array" if args.video else (None if args.render == "none" else args.render)
     env = PoseVelocityEnv(cfg, render_mode=render_mode)
@@ -109,6 +116,8 @@ def main():
         ps = e["pass"]
         pass_txt = (f"attempt kp {ps['d_kp'] * 100:4.1f}cm head {ps['dp'] * 100:4.1f}cm v {ps['dv_frac']:.2f}xv "
                     f"(q_v {ps['q_v']:.2f}) rot {ps['theta_deg']:3.0f}deg" if ps else "no attempt")
+        if env.pose_hold:
+            pass_txt += f"  near steps {e['near_steps']}"
         print(f"episode {ep}: start {start_kind:7s}  return {ep_ret:8.2f}  len {e['length']:4d}  "
               f"success {bool(e['success'])}  dropped {bool(e['dropped'])}  {pass_txt}  "
               f"d_min {e['d_min'] * 100:.1f}cm")

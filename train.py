@@ -222,7 +222,8 @@ def main():
         env_cfg.goal.min_dir_z = args.min_dir_z
     if args.grasp_slide is not None:
         env_cfg.grasp_slide = args.grasp_slide
-    print(f"grip={env_cfg.grip_mode} actions={env_cfg.action_mode}  "
+    goal_txt = "pose+velocity" if env_cfg.goal_velocity else f"pose-only ({env_cfg.pose_success})"
+    print(f"goal={goal_txt}  grip={env_cfg.grip_mode} actions={env_cfg.action_mode}  "
           f"eps_kp (level 0 -> 1) = {env_cfg.curriculum.eps_kp}  "
           f"eps_v_frac = {env_cfg.curriculum.eps_v_frac}  sigma_v_frac = {env_cfg.reward.sigma_v_frac}  "
           f"min_dir_z = {env_cfg.goal.min_dir_z}  grasp_slide = {env_cfg.grasp_slide}")

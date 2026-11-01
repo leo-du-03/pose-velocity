@@ -100,3 +100,26 @@ class Oracle:
         v = (1.0 - self.alpha) * v_app + self.alpha * v_strike
         a = np.concatenate([v / env.cfg.head_v_max, w / env.cfg.head_w_max])
         return np.clip(a, -1.0, 1.0)
+
+
+class PoseOracle:
+    """Scripted reach for the pose-only baseline (EnvCfg.goal_velocity False), head_twist actions.
+
+    Flies the head straight to the goal point while turning the tool onto the goal orientation:
+    v = k_pos * (p_g - head), capped at v_approach, and w = k_rot * rot_error. It uses only quantities in the
+    pose-only observation (no goal velocity) and has no switches, so it can be cloned. Being proportional it settles
+    at the goal, which serves both success rules ("hold" needs to stay there, "touch" ends on arrival).
+    """
+
+    def __init__(self, k_pos: float = 4.0, v_approach: float = 0.4, k_rot: float = 4.0):
+        self.k_pos, self.v_approach, self.k_rot = k_pos, v_approach, k_rot
+
+    def __call__(self, env) -> np.ndarray:
+        if env.cfg.action_mode != "head_twist":
+            raise ValueError("the oracle needs action_mode 'head_twist'")
+        v = self.k_pos * (env.goal.p - env._head_state()[0])
+        n = np.linalg.norm(v)
+        if n > self.v_approach:
+            v *= self.v_approach / n
+        w = self.k_rot * env._rot_error()
+        return np.clip(np.concatenate([v / env.cfg.head_v_max, w / env.cfg.head_w_max]), -1.0, 1.0)

@@ -5,8 +5,11 @@ The SimToolReal reward (see strl_env.py), extended with a goal velocity. Per ste
             episode, so a wind-up away from the goal costs nothing. d is the largest distance between 4 keypoints
             on the tool and the same keypoints at the goal pose, so it covers position and orientation.
   smooth    -arm_vel_penalty * L1 norm of the arm joint velocities
-  bonus     paid once, on the attempt (the first step with d within tolerance; the episode ends there):
-            reach_goal_bonus * velocity_match, so arriving slowly or sideways earns little
+  bonus     reach_goal_bonus * bonus_frac, with bonus_frac chosen by the env:
+            pose + velocity: velocity_match on the attempt (the first step with d within tolerance; the episode ends
+            there), so arriving slowly or sideways earns little.
+            pose-only "touch": 1 on the attempt. Pose-only "hold" (SimToolReal): 1 / success_steps on every step
+            within tolerance.
 Physical grip adds a grasp potential (Phi' - Phi) and a drop penalty.
 """
 from __future__ import annotations
@@ -41,16 +44,19 @@ def velocity_match(dv: float, speed: float, sigma_v_frac: float) -> float:
 
 
 def step_terms(cfg: RewardCfg, *, d: float, d_star: float, attempt: bool, dv: float, speed: float,
-               qvel_l1: float) -> tuple[dict, float]:
+               qvel_l1: float, bonus_frac: float | None = None) -> tuple[dict, float]:
     """Reward terms of one step and the velocity match q_v (computed for diagnostics even when not paid).
 
     d_star: the closest keypoint distance before this step.
+    bonus_frac: fraction of reach_goal_bonus paid this step. None (pose + velocity): q_v on the attempt, else 0.
     """
     q_v = velocity_match(dv, speed, cfg.sigma_v_frac)
+    if bonus_frac is None:
+        bonus_frac = q_v if attempt else 0.0
     terms = {
         "keypoint": cfg.keypoint_rew_scale * max(d_star - d, 0.0),
         "smooth": -cfg.arm_vel_penalty * qvel_l1,
-        "bonus": cfg.reach_goal_bonus * q_v if attempt else 0.0,
+        "bonus": cfg.reach_goal_bonus * bonus_frac,
     }
     return terms, q_v
 

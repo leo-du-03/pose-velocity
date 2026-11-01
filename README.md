@@ -129,6 +129,27 @@ Run every command from the project root.
    - The oracle-mixing schedule decays per round, so with fewer envs scale `--rounds` and `--beta-decay` to keep the total data and the oracle-guided share about the same. The training envs execute about `(training envs × rollout steps) / (1 − beta_decay)` oracle actions in total. For example, `--num-envs 24 --rounds 180 --beta-decay 0.86` gives about 1.1M samples and 37k oracle actions, close to the 32-env defaults over 150 rounds.
    - `--init-from` loads the weights and observation normalizers. The optimizer, curriculum and step count start fresh, and the reward comes from `config.py` (the fine-tuning reward), not from the checkpoint. For the first `--critic-warmup` iterations (20 by default) only the critic trains: advantages from an untrained critic would otherwise push the actor off the cloned behavior before PPO has a useful signal. A lower `--lr` than from scratch also helps keep it close.
 
+   **Pose-only baselines.** The same pipeline, but the goal is only the head position and tool orientation. Goals
+   are sampled exactly as before, but the goal velocity is removed from the observation (10 fewer dims) and from the
+   reward (`EnvCfg.goal_velocity = False`). The scripted expert is `oracle.PoseOracle`, which flies straight to the
+   goal pose. There are two success rules (`EnvCfg.pose_success`):
+   - `hold`: SimToolReal's rule. The goal is reached after `success_steps` (10) steps within the keypoint
+     tolerance; they don't have to be in a row. The bonus is paid as `reach_goal_bonus / 10` per near step, so the
+     reward has the same per-step formula as SimToolReal's. The near-step count is given to the critic.
+   - `touch`: pass-through allowed. The first step within tolerance succeeds and ends the episode, with the full
+     bonus, like the pose + velocity setup without the velocity check.
+
+   The setting is saved in the checkpoint, so `train.py --init-from`, `evaluate.py --ckpt` and
+   `evaluate_tasks.py --ckpt` pick it up. In the task env, a pose-only policy moves on to the next waypoint by the
+   same rule instead of by crossing the waypoint's plane, since it stops at each pose. The exception is the hammer's
+   last waypoint, the hit, which still ends on contact.
+   ```bash
+   python evaluate.py --policy oracle --pose-only hold --episodes 100      # ~99-100% at levels 0 and 1
+   python bc.py --name bc_pose_hold --pose-only hold
+   python train.py --init-from runs/bc_pose_hold/bc_latest.pt --name strike_bc_pose_hold --lr 1e-4
+   # same with --pose-only touch / bc_pose_touch / strike_bc_pose_touch
+   ```
+
 9. **Task evaluation**: hammer a plate, hammer a nail, sweep a dirty board.
    ```bash
    python evaluate_tasks.py --task plate --policy trace --episodes 20                   # the trace's own accuracy, ~100%
@@ -176,10 +197,12 @@ Each episode samples an instance and builds a **trace**: head position, tool ori
   - With `windup = False`, the trace is a straight run-up instead: approach, hold at the pre-strike point, accelerate, constant speed over `lead_in` to the contact, then follow-through.
 - **Sweep:**
   - The brush's bristle pad is a spring along the tool's axis, so its force is set by how far the head is pressed down. A static calibration of the pad on the board maps depth to force.
-  - Each dirt cell needs a minimum force by level: 3, 8 and 14 N. A cell is removed whenever it is under the pad while the pad pushes at least that hard.
+  - Each dirt cell has an adhesion force by level (`TaskCfg.dirt_forces`; the reference values are 3, 8 and 14 N).
+  - With the default rule (`TaskCfg.sweep_rule = "scrub"`, Preston's wear law with an adhesion threshold), a cell under the pad builds up scrubbing, pad force × sliding speed × time, while the force is at least its adhesion. The cell is removed once that reaches `scrub_len` (4 cm) × the adhesion. Pressing in place removes nothing. Removal depends on the distance slid, not the speed, and pressing harder scrubs faster.
+  - `sweep_rule = "force"` is the original rule: a cell is removed as soon as the pad pushes on it with its adhesion force, even standing still.
   - Along each stroke, the trace presses for the strongest dirt under the brush plus a 15% margin, smoothed so the requirement is never undercut.
   - Strokes run back and forth across the patch. Each starts with a `lead_in`-long run-up and ends with lift, transfer and lower moves to the next.
-- **"Followed exactly"** is defined by `traces.TraceFollower` (`--policy trace`). It tracks the trace with feedforward plus feedback, and inverts the action EMA so the smoothed command equals what it asks for. On the in-distribution layout it hits the target force to within about 1% and clears all of the dirt, with about 2 mm of path error.
+- **"Followed exactly"** is defined by `traces.TraceFollower` (`--policy trace`). It tracks the trace with feedforward plus feedback, and inverts the action EMA so the smoothed command equals what it asks for. On the in-distribution layout it hits the target force to within about 1% and clears all of the dirt under the `force` rule (about 91% of episodes clear ≥95% under `scrub`, where it sometimes falls short of the force on a stroke), with about 2 mm of path error.
 
 **How a trained policy sees a trace:**
 - Policies only know single goals, so the env gives them the trace's **keypoints** one at a time, as ordinary goals in the training observation format:
@@ -207,7 +230,8 @@ Every task episode starts from home with a new grasp (`TaskCfg.rehome_each_episo
   - how many of the windup goals the policy passed.
 - **Sweep:**
   - the fraction cleaned, overall and per dirt level;
-  - the mean force shortfall on cells that were touched but not cleaned.
+  - the mean force shortfall on cells that were touched but never pressed hard enough;
+  - `unscrubbed`: cells pressed hard enough but not slid across far enough (scrub rule only).
 - **Path:** the mean distance from the head to the trace's path, ignoring timing. It includes the approach, where a policy takes its own route.
 
 ## Command-line flags
@@ -304,6 +328,9 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 | `--video PATH` | none | Write an mp4 (implies `--render rgb_array`) |
 | `--realtime` | off | Slow down to real time in the viewer |
 | `--save-traces DIR` | none | Save each episode's trace to `DIR/ep<k>.npz` (`t`, `p`, `quat`, `v`, `w`, `phase`, `force_target`, `keypoint_idx`, `meta`) |
+| `--sweep-rule {scrub,force}` | from config | How sweep dirt comes off (`TaskCfg.sweep_rule`) |
+| `--scrub-len M` | from config | Scrub rule: sliding distance needed at the adhesion force (`TaskCfg.scrub_len`) |
+| `--dirt-forces N [N ...]` | from config | Adhesion force of each dirt level (`TaskCfg.dirt_forces`) |
 | `--seed N` | `0` | Seed |
 | `--device DEVICE` | `cpu` | Torch device for the policy |
 

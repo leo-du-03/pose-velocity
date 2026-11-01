@@ -29,7 +29,8 @@ COLUMNS = {
              ("nail_driven", "driven", "{:4.1f}mm", 1000), ("hit", "hit", "{}", None)],
     "sweep": [("cleaned", "cleaned", "{:5.1%}", 1), ("cleaned_l1", "light", "{:5.1%}", 1),
               ("cleaned_l2", "medium", "{:5.1%}", 1), ("cleaned_l3", "heavy", "{:5.1%}", 1),
-              ("force_deficit", "deficit", "{:5.1%}", 1), ("untouched_cells", "untouched", "{}", None)],
+              ("force_deficit", "deficit", "{:5.1%}", 1), ("untouched_cells", "untouched", "{}", None),
+              ("unscrubbed_cells", "unscrubbed", "{}", None)],
 }
 SUMMARY = {"plate": ["force_err", "contact_err", "contact_speed"], "nail": ["force_err", "speed_err", "contact_err", "nail_driven"],
            "sweep": ["cleaned", "cleaned_l1", "cleaned_l2", "cleaned_l3", "force_deficit"]}
@@ -62,6 +63,12 @@ def main():
                         "(TaskCfg.swing_straight; default from config)")
     p.add_argument("--face-crown", type=float, default=None, metavar="M",
                    help="plate/nail: crowned hammer face, bulging this much at its center (TaskCfg.face_crown)")
+    p.add_argument("--sweep-rule", default=None, choices=["scrub", "force"],
+                   help="sweep: how dirt comes off (TaskCfg.sweep_rule; default from config)")
+    p.add_argument("--scrub-len", type=float, default=None, metavar="M",
+                   help="sweep, scrub rule: sliding distance (m) needed at the adhesion force (TaskCfg.scrub_len)")
+    p.add_argument("--dirt-forces", type=float, nargs="+", default=None, metavar="N",
+                   help="sweep: adhesion force (N) of each dirt level, e.g. --dirt-forces 3 8 14 (TaskCfg.dirt_forces)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
@@ -90,6 +97,12 @@ def main():
         task_cfg.swing_straight = args.swing_straight
     if args.face_crown is not None:
         task_cfg.face_crown = args.face_crown
+    if args.sweep_rule is not None:
+        task_cfg.sweep_rule = args.sweep_rule
+    if args.scrub_len is not None:
+        task_cfg.scrub_len = args.scrub_len
+    if args.dirt_forces is not None:
+        task_cfg.dirt_forces = tuple(args.dirt_forces)
     env = TaskEnv(args.task, cfg, task_cfg, render_mode=render_mode)
     env.set_curriculum(level)
     if agent is not None and env.observation_space.shape[0] != ck["obs_dim"]:
