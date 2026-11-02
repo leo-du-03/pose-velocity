@@ -1,0 +1,165 @@
+policy=ckpt tol=3.00 cm (keypoint threshold 4.50 cm) dr=False
+ep   0: goals reached   0 | steps   241 | end table_force   | last distance  17.8 cm
+ep   1: goals reached  18 | steps   940 | end table_force   | last distance  59.2 cm
+ep   2: goals reached   3 | steps   617 | end timeout       | last distance   8.1 cm
+ep   3: goals reached   0 | steps   500 | end timeout       | last distance  27.0 cm
+ep   4: goals reached   3 | steps   625 | end timeout       | last distance  28.0 cm
+ep   5: goals reached   0 | steps   500 | end timeout       | last distance  14.0 cm
+ep   6: goals reached   0 | steps    89 | end table_force   | last distance  24.8 cm
+ep   7: goals reached   5 | steps   931 | end timeout       | last distance   5.4 cm
+ep   8: goals reached   0 | steps   249 | end table_force   | last distance  52.4 cm
+ep   9: goals reached   3 | steps   486 | end table_force   | last distance  32.5 cm
+ep  10: goals reached  11 | steps   900 | end timeout       | last distance   7.1 cm
+ep  11: goals reached   0 | steps   500 | end timeout       | last distance  14.4 cm
+ep  12: goals reached   7 | steps   871 | end timeout       | last distance  37.8 cm
+ep  13: goals reached  13 | steps  1285 | end timeout       | last distance   4.9 cm
+ep  14: goals reached   0 | steps   500 | end timeout       | last distance  25.3 cm
+ep  15: goals reached   0 | steps   248 | end table_force   | last distance  27.1 cm
+ep  16: goals reached   9 | steps   961 | end timeout       | last distance  12.5 cm
+ep  17: goals reached   4 | steps   698 | end timeout       | last distance  26.5 cm
+ep  18: goals reached   2 | steps   666 | end timeout       | last distance   5.4 cm
+ep  19: goals reached   0 | steps   354 | end table_force   | last distance  36.9 cm
+ep  20: goals reached   3 | steps   655 | end timeout       | last distance   6.8 cm
+ep  21: goals reached   0 | steps   500 | end timeout       | last distance  42.6 cm
+ep  22: goals reached   7 | steps   893 | end timeout       | last distance  13.5 cm
+ep  23: goals reached   7 | steps   836 | end timeout       | last distance   6.8 cm
+ep  24: goals reached   0 | steps   500 | end timeout       | last distance  14.4 cm
+ep  25: goals reached   2 | steps   348 | end table_force   | last distance  36.7 cm
+ep  26: goals reached  12 | steps   772 | end table_force   | last distance  25.3 cm
+ep  27: goals reached  16 | steps  1253 | end timeout       | last distance   5.5 cm
+ep  28: goals reached   0 | steps   500 | end timeout       | last distance  21.3 cm
+ep  29: goals reached  10 | steps   827 | end table_force   | last distance  10.2 cm
+ep  30: goals reached   0 | steps   476 | end table_force   | last distance  21.8 cm
+ep  31: goals reached   0 | steps   500 | end timeout       | last distance  23.3 cm
+ep  32: goals reached   0 | steps   500 | end timeout       | last distance  20.2 cm
+ep  33: goals reached   0 | steps   500 | end timeout       | last distance  22.5 cm
+ep  34: goals reached   0 | steps   378 | end table_force   | last distance  34.3 cm
+ep  35: goals reached   0 | steps   500 | end timeout       | last distance  24.9 cm
+ep  36: goals reached   0 | steps   450 | end table_force   | last distance  36.6 cm
+ep  37: goals reached  14 | steps  1297 | end timeout       | last distance  15.2 cm
+ep  38: goals reached   2 | steps   626 | end timeout       | last distance  15.7 cm
+ep  39: goals reached   4 | steps   656 | end timeout       | last distance   5.8 cm
+ep  40: goals reached   0 | steps   500 | end timeout       | last distance  28.0 cm
+ep  41: goals reached   0 | steps   500 | end timeout       | last distance  12.9 cm
+ep  42: goals reached   0 | steps   500 | end timeout       | last distance  19.9 cm
+ep  43: goals reached   0 | steps   500 | end timeout       | last distance  28.4 cm
+ep  44: goals reached  12 | steps  1551 | end timeout       | last distance  44.8 cm
+ep  45: goals reached   0 | steps   138 | end table_force   | last distance  30.0 cm
+ep  46: goals reached   0 | steps   500 | end timeout       | last distance  31.7 cm
+ep  47: goals reached   2 | steps   584 | end timeout       | last distance  19.2 cm
+ep  48: goals reached   0 | steps   500 | end timeout       | last distance  26.4 cm
+ep  49: goals reached   2 | steps   555 | end timeout       | last distance   5.2 cm
+
+goals per episode: mean 3.42  median 0.0  max 18
+episode ends: {'table_force': 14, 'timeout': 36}
+per-goal success 77% | failed by timeout 16%, table 6%
+policy=ckpt tol=2.00 cm (keypoint threshold 3.00 cm) dr=False
+ep   0: goals reached   0 | steps   241 | end table_force   | last distance  17.8 cm
+ep   1: goals reached   5 | steps   785 | end timeout       | last distance   3.7 cm
+ep   2: goals reached   2 | steps   585 | end timeout       | last distance   6.5 cm
+ep   3: goals reached   0 | steps   500 | end timeout       | last distance  27.0 cm
+ep   4: goals reached   3 | steps   657 | end timeout       | last distance  45.3 cm
+ep   5: goals reached   0 | steps   500 | end timeout       | last distance  14.0 cm
+ep   6: goals reached   0 | steps    89 | end table_force   | last distance  24.8 cm
+ep   7: goals reached   1 | steps   542 | end timeout       | last distance   7.0 cm
+ep   8: goals reached   0 | steps   249 | end table_force   | last distance  52.4 cm
+ep   9: goals reached   2 | steps   253 | end table_force   | last distance   7.3 cm
+ep  10: goals reached   4 | steps   333 | end table_force   | last distance  28.3 cm
+ep  11: goals reached   0 | steps   500 | end timeout       | last distance  14.4 cm
+ep  12: goals reached   4 | steps   926 | end timeout       | last distance   4.9 cm
+ep  13: goals reached   6 | steps   879 | end timeout       | last distance   3.2 cm
+ep  14: goals reached   0 | steps   500 | end timeout       | last distance  25.3 cm
+ep  15: goals reached   0 | steps   248 | end table_force   | last distance  27.1 cm
+ep  16: goals reached   5 | steps   837 | end timeout       | last distance   4.0 cm
+ep  17: goals reached   2 | steps   639 | end timeout       | last distance   7.6 cm
+ep  18: goals reached   1 | steps   566 | end timeout       | last distance   5.0 cm
+ep  19: goals reached   0 | steps   354 | end table_force   | last distance  36.9 cm
+ep  20: goals reached   0 | steps   500 | end timeout       | last distance   3.9 cm
+ep  21: goals reached   0 | steps   500 | end timeout       | last distance  42.6 cm
+ep  22: goals reached   6 | steps   777 | end timeout       | last distance   4.5 cm
+ep  23: goals reached   4 | steps   723 | end timeout       | last distance   4.1 cm
+ep  24: goals reached   0 | steps   500 | end timeout       | last distance  14.4 cm
+ep  25: goals reached   1 | steps   545 | end timeout       | last distance   4.9 cm
+ep  26: goals reached   4 | steps   680 | end timeout       | last distance   4.2 cm
+ep  27: goals reached   7 | steps   952 | end timeout       | last distance   4.5 cm
+ep  28: goals reached   0 | steps   500 | end timeout       | last distance  21.3 cm
+ep  29: goals reached   2 | steps   566 | end timeout       | last distance   4.4 cm
+ep  30: goals reached   0 | steps   476 | end table_force   | last distance  21.8 cm
+ep  31: goals reached   0 | steps   500 | end timeout       | last distance  23.3 cm
+ep  32: goals reached   0 | steps   500 | end timeout       | last distance  20.2 cm
+ep  33: goals reached   0 | steps   500 | end timeout       | last distance  22.5 cm
+ep  34: goals reached   0 | steps   378 | end table_force   | last distance  34.3 cm
+ep  35: goals reached   0 | steps   500 | end timeout       | last distance  24.9 cm
+ep  36: goals reached   0 | steps   450 | end table_force   | last distance  36.6 cm
+ep  37: goals reached   7 | steps  1087 | end timeout       | last distance   3.3 cm
+ep  38: goals reached   2 | steps   751 | end timeout       | last distance  15.7 cm
+ep  39: goals reached   4 | steps   818 | end timeout       | last distance   5.9 cm
+ep  40: goals reached   0 | steps   500 | end timeout       | last distance  28.0 cm
+ep  41: goals reached   0 | steps   500 | end timeout       | last distance  12.9 cm
+ep  42: goals reached   0 | steps   500 | end timeout       | last distance  19.9 cm
+ep  43: goals reached   0 | steps   500 | end timeout       | last distance  28.4 cm
+ep  44: goals reached   4 | steps   704 | end timeout       | last distance   3.7 cm
+ep  45: goals reached   0 | steps   138 | end table_force   | last distance  30.0 cm
+ep  46: goals reached   0 | steps   500 | end timeout       | last distance  31.7 cm
+ep  47: goals reached   2 | steps   603 | end timeout       | last distance  19.2 cm
+ep  48: goals reached   0 | steps   500 | end timeout       | last distance  26.4 cm
+ep  49: goals reached   2 | steps   586 | end timeout       | last distance   4.6 cm
+
+goals per episode: mean 1.60  median 0.0  max 7
+episode ends: {'table_force': 11, 'timeout': 39}
+per-goal success 62% | failed by timeout 30%, table 8%
+policy=ckpt tol=1.00 cm (keypoint threshold 1.50 cm) dr=False
+ep   0: goals reached   0 | steps   241 | end table_force   | last distance  17.8 cm
+ep   1: goals reached   0 | steps   500 | end timeout       | last distance   2.7 cm
+ep   2: goals reached   1 | steps   435 | end table_force   | last distance  56.9 cm
+ep   3: goals reached   0 | steps   500 | end timeout       | last distance  27.0 cm
+ep   4: goals reached   1 | steps   704 | end timeout       | last distance   2.5 cm
+ep   5: goals reached   0 | steps   500 | end timeout       | last distance  14.0 cm
+ep   6: goals reached   0 | steps    89 | end table_force   | last distance  24.8 cm
+ep   7: goals reached   1 | steps   606 | end timeout       | last distance   7.1 cm
+ep   8: goals reached   0 | steps   249 | end table_force   | last distance  52.4 cm
+ep   9: goals reached   0 | steps   500 | end timeout       | last distance   4.3 cm
+ep  10: goals reached   3 | steps   668 | end timeout       | last distance   1.9 cm
+ep  11: goals reached   0 | steps   500 | end timeout       | last distance  14.4 cm
+ep  12: goals reached   0 | steps   500 | end timeout       | last distance   4.7 cm
+ep  13: goals reached   1 | steps   611 | end timeout       | last distance   3.4 cm
+ep  14: goals reached   0 | steps   500 | end timeout       | last distance  25.3 cm
+ep  15: goals reached   0 | steps   248 | end table_force   | last distance  27.1 cm
+ep  16: goals reached   0 | steps   500 | end timeout       | last distance   2.1 cm
+ep  17: goals reached   0 | steps   500 | end timeout       | last distance   2.9 cm
+ep  18: goals reached   0 | steps   500 | end timeout       | last distance   4.6 cm
+ep  19: goals reached   0 | steps   354 | end table_force   | last distance  36.9 cm
+ep  20: goals reached   0 | steps   500 | end timeout       | last distance   3.9 cm
+ep  21: goals reached   0 | steps   500 | end timeout       | last distance  42.6 cm
+ep  22: goals reached   0 | steps   500 | end timeout       | last distance   2.8 cm
+ep  23: goals reached   0 | steps   500 | end timeout       | last distance   2.6 cm
+ep  24: goals reached   0 | steps   500 | end timeout       | last distance  14.4 cm
+ep  25: goals reached   0 | steps   500 | end timeout       | last distance   2.6 cm
+ep  26: goals reached   0 | steps   500 | end timeout       | last distance   2.9 cm
+ep  27: goals reached   0 | steps   500 | end timeout       | last distance   3.9 cm
+ep  28: goals reached   0 | steps   500 | end timeout       | last distance  21.3 cm
+ep  29: goals reached   0 | steps   500 | end timeout       | last distance   2.6 cm
+ep  30: goals reached   0 | steps   476 | end table_force   | last distance  21.8 cm
+ep  31: goals reached   0 | steps   500 | end timeout       | last distance  23.3 cm
+ep  32: goals reached   0 | steps   500 | end timeout       | last distance  20.2 cm
+ep  33: goals reached   0 | steps   500 | end timeout       | last distance  22.5 cm
+ep  34: goals reached   0 | steps   378 | end table_force   | last distance  34.3 cm
+ep  35: goals reached   0 | steps   500 | end timeout       | last distance  24.9 cm
+ep  36: goals reached   0 | steps   450 | end table_force   | last distance  36.6 cm
+ep  37: goals reached   3 | steps   934 | end timeout       | last distance   3.8 cm
+ep  38: goals reached   1 | steps   625 | end timeout       | last distance   2.9 cm
+ep  39: goals reached   0 | steps   500 | end timeout       | last distance   2.4 cm
+ep  40: goals reached   0 | steps   500 | end timeout       | last distance  28.0 cm
+ep  41: goals reached   0 | steps   500 | end timeout       | last distance  12.9 cm
+ep  42: goals reached   0 | steps   500 | end timeout       | last distance  19.9 cm
+ep  43: goals reached   0 | steps   500 | end timeout       | last distance  28.4 cm
+ep  44: goals reached   1 | steps   590 | end timeout       | last distance   2.8 cm
+ep  45: goals reached   0 | steps   138 | end table_force   | last distance  30.0 cm
+ep  46: goals reached   0 | steps   500 | end timeout       | last distance  31.7 cm
+ep  47: goals reached   1 | steps   545 | end timeout       | last distance   2.5 cm
+ep  48: goals reached   0 | steps   500 | end timeout       | last distance  26.4 cm
+ep  49: goals reached   0 | steps   500 | end timeout       | last distance   2.9 cm
+
+goals per episode: mean 0.26  median 0.0  max 3
+episode ends: {'table_force': 10, 'timeout': 40}
+per-goal success 21% | failed by timeout 63%, table 16%

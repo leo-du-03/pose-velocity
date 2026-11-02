@@ -42,6 +42,13 @@ def parse_args():
     p.add_argument("--tol-window", type=int, default=None,
                    help="episodes averaged by the tolerance curriculum (overrides StrlCfg / a resumed checkpoint)")
     p.add_argument("--dr", action="store_true", help="enable domain randomization (off by default)")
+    p.add_argument("--table-penalty", type=float, default=None,
+                   help="reward added when a table contact ends the episode (default 0 = paper; e.g. 500)")
+    p.add_argument("--contact-penalty", type=float, default=None,
+                   help="reward added on every step with any table / floor contact (default 0 = paper; e.g. 3)")
+    p.add_argument("--arm-delta-scale", type=float, default=None,
+                   help="rad per step of arm joint-target change at action 1 (default 0.03; paper-like 0.003). "
+                        "The initial action std is rescaled to keep the same joint-speed exploration noise.")
     p.add_argument("--serial", action="store_true", help="run envs in the main process (debugging)")
     p.add_argument("--logdir", default="runs")
     p.add_argument("--name", default=None)
@@ -93,13 +100,24 @@ def main():
     else:
         scfg = StrlCfg()
         scfg.dr = bool(args.dr)
+        if args.table_penalty is not None:
+            scfg.table_penalty = args.table_penalty
+        if args.contact_penalty is not None:
+            scfg.contact_penalty = args.contact_penalty
+        if args.arm_delta_scale is not None:
+            scfg.arm_delta_scale = args.arm_delta_scale
         env_cfg = make_env_cfg(scfg)
     if args.tol_window is not None:
         scfg.tolerance_min_episodes = args.tol_window
     print(f"tolerance curriculum: mean of the last {scfg.tolerance_min_episodes} episodes "
           f">= {scfg.tolerance_success_threshold} goals")
+    # Initial std 0.1 at 0.03 rad per step; keep std x scale (the joint-speed exploration noise) fixed.
+    init_log_std = float(np.log(0.1 * 0.03 / scfg.arm_delta_scale))
     ppo_cfg = make_ppo_cfg(num_envs=args.num_envs, rollout_steps=args.rollout_steps, total_steps=args.total_steps,
-                           lr=args.lr, epochs=args.epochs, save_every=args.save_every)
+                           lr=args.lr, epochs=args.epochs, save_every=args.save_every, init_log_std=init_log_std)
+    print(f"table_penalty={getattr(scfg, 'table_penalty', 0.0)} contact_penalty={getattr(scfg, 'contact_penalty', 0.0)} "
+          f"arm_delta_scale={scfg.arm_delta_scale} "
+          f"init_std={np.exp(init_log_std):.3f}")
 
     run_name = args.name or time.strftime("strl_%Y%m%d_%H%M%S")
     run_dir = os.path.join(args.logdir, run_name)

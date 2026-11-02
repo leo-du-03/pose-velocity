@@ -294,6 +294,9 @@ class StrlEnv(PoseVelocityEnv):
             bonus = s.reach_goal_bonus / s.success_steps if near else 0.0
         smooth = -s.arm_vel_penalty * float(np.abs(d.qvel[self.arm_dadr]).sum())
         terms = {"keypoint": kp_rew, "bonus": bonus, "smooth": smooth}
+        contact_penalty = float(getattr(s, "contact_penalty", 0.0))  # older checkpoints lack the field
+        if contact_penalty > 0.0:
+            terms["contact"] = -contact_penalty if self._table_force > 0.0 else 0.0
         reward = float(sum(terms.values()))
         self._last_reward = reward
         self.ep_return += reward
@@ -317,6 +320,12 @@ class StrlEnv(PoseVelocityEnv):
         truncated = (not terminated) and self.t_goal >= s.goal_steps
         if truncated:
             reason = "timeout"
+        table_penalty = float(getattr(s, "table_penalty", 0.0))  # older checkpoints lack the field
+        if reason == "table_force" and table_penalty > 0.0:
+            reward -= table_penalty
+            self._last_reward = reward
+            self.ep_return -= table_penalty
+            self.ep_terms["table"] = self.ep_terms.get("table", 0.0) - table_penalty
 
         self.prev_action = a
         obs = self._get_obs()

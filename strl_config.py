@@ -56,12 +56,23 @@ class StrlCfg:
     arm_vel_penalty: float = 0.03  # L1 norm of arm joint velocities
     # ---- termination
     table_force_limit: float = 100.0  # N, net normal force of robot/tool contacts with table, pedestal or floor
+    # Reward added on the step a table contact ends the episode. 0 = the paper (termination only). DEVIATION when > 0:
+    # with termination only, hitting the table costs nothing beyond the lost future reward, and while the policy is
+    # stuck on a goal that future reward is about zero, so crashing is free. (strl_diagnose.py: the policy's table
+    # hits are mostly forearm / wrist_2 contacts during large rotations.) Set with strl_train.py --table-penalty.
+    table_penalty: float = 0.0
+    # Reward added on every step the robot, hand or tool touches the table, pedestal or floor (any force). 0 = the
+    # paper. DEVIATION when > 0, modeled on simplify-weld's w_env_contact (0.1 per step against at most 30 per
+    # attempt, i.e. ~3 per step against our 1000 success bonus). Set with strl_train.py --contact-penalty.
+    contact_penalty: float = 0.0
     # ---- control
     # Arm: joint-position-target deltas. The paper's arm pipeline (target += moving_average * dof_speed_scale * dt *
     # action, with moving_average 0.1, dof_speed_scale 1.5, dt 1/60) caps the joints at 0.15 rad/s.
-    # DEVIATION: we use 0.03 rad per 50 Hz step (1.5 rad/s), the same limit as simplify-weld's joint action mode, so the
-    # comparison is about the training method and goals, not about a 10x slower arm. Set to 0.003 for the paper's cap.
-    arm_delta_scale: float = 0.03
+    # DEVIATION: we use 0.01 rad per 50 Hz step (0.5 rad/s). The paper's 0.15 rad/s cannot cover the >= 90 deg joint
+    # changes that ~20% of our goals need within the 10 s per goal (the weld removes in-hand rotation, so all tool
+    # rotation comes from the arm). A first version used 0.03 (1.5 rad/s); at 0.01 the 20M-step screening run reached
+    # 48% vs 28% per-goal success at 3 cm, and the 100M run 60% vs 21% at 1 cm with the same curriculum window.
+    arm_delta_scale: float = 0.01
     home_noise: float = 0.1  # rad, uniform, per arm joint at reset (Table I: robot joint pos range +-0.1 rad)
     # A new random tool (a recompiled model) every this many episodes; in between, the arm returns home and the same
     # tool is welded at a new random grasp. DEVIATION: in the official code each env keeps one object for the whole run
@@ -117,8 +128,9 @@ def make_ppo_cfg(**overrides) -> PPOCfg:
         actor_hidden=(1024, 1024, 512, 512),
         critic_hidden=(1024, 1024, 512, 512),
         # DEVIATION: the paper starts at std 1 (sigma_init 0), but its actions are scaled to at most 0.15 rad/s of joint
-        # speed, so the exploration noise is ~0.15 rad/s. Our action scale allows 1.5 rad/s; std 0.1 keeps the same
-        # joint-speed exploration noise. (At std 1 the arm random-walks ~10x more and PPO only learned to lift away.)
+        # speed, so the exploration noise is ~0.15 rad/s. strl_train.py sets init_log_std = log(0.1 * 0.03 /
+        # arm_delta_scale) to keep that joint-speed noise (std 0.3 at 0.01, 0.1 at 0.03). (At std 1 with 0.03 the arm
+        # random-walked ~10x more and PPO only learned to lift away.)
         init_log_std=-2.3,
         scale_rewards=True,
         save_every=50,

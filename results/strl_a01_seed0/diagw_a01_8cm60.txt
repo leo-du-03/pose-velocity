@@ -1,0 +1,74 @@
+policy=ckpt metric=weld eps_p=8.0 cm eps_theta=60 deg hold=10 episodes=100
+  10 episodes, 65 goals
+  20 episodes, 110 goals
+  30 episodes, 173 goals
+  40 episodes, 239 goals
+  50 episodes, 302 goals
+  60 episodes, 387 goals
+  70 episodes, 439 goals
+  80 episodes, 515 goals
+  90 episodes, 587 goals
+  100 episodes, 653 goals
+
+653 goals: reached 85%, timeout_near 7%, timeout_far 5%, table 3%
+
+goal kind (first = absolute goal at episode start):
+  group                   goals  reached  tmo_near  tmo_far  table
+  delta                     553      82%        8%       6%     3%
+  first                     100      98%        1%       1%     0%
+
+rotation needed (deg):
+  group                   goals  reached  tmo_near  tmo_far  table
+  0-30                      116     100%        0%       0%     0%
+  30-60                     314      96%        1%       3%     0%
+  60-90                     165      71%       13%       8%     7%
+  90-120                     55      36%       36%      20%     7%
+  120-150                     3       0%       33%      33%    33%
+
+position distance (cm):
+  group                   goals  reached  tmo_near  tmo_far  table
+  0-5                        42      79%       12%      10%     0%
+  5-10                      254      81%        9%       6%     4%
+  10-15                     258      84%        8%       6%     2%
+  15-20                      32      94%        0%       3%     3%
+  20-30                      46     100%        0%       0%     0%
+  >=30                       21      95%        0%       5%     0%
+
+largest arm joint change to the goal's IK solution (deg):
+  group                   goals  reached  tmo_near  tmo_far  table
+  0-10                        5     100%        0%       0%     0%
+  10-20                      37     100%        0%       0%     0%
+  20-40                     185      98%        1%       1%     0%
+  40-60                     182      92%        3%       5%     1%
+  60-90                     146      77%       15%       4%     3%
+  >=90                       98      50%       19%      18%    12%
+
+goal height above the table (lower of handle / head, cm):
+  group                   goals  reached  tmo_near  tmo_far  table
+  0-5                         5      80%        0%      20%     0%
+  5-10                       20      65%       10%       5%    20%
+  10-15                      34      82%       12%       6%     0%
+  15-20                      81      88%        7%       2%     2%
+  20-30                     219      85%        7%       4%     4%
+  >=30                      294      85%        7%       7%     1%
+
+tool (handle / head):
+  group                   goals  reached  tmo_near  tmo_far  table
+  box/box                    38      76%       18%       3%     3%
+  box/capsule                10      80%       10%       0%    10%
+  box/cylinder               89      89%        3%       7%     1%
+  box/ellipsoid              32      81%        3%       6%     9%
+  box/sphere                 42      86%       10%       5%     0%
+  capsule/box                59      86%        8%       3%     2%
+  capsule/capsule            62      87%        5%       6%     2%
+  capsule/cylinder           30      80%       10%       7%     3%
+  capsule/ellipsoid          23      83%        9%       9%     0%
+  capsule/sphere             65      85%        8%       5%     3%
+  cylinder/box               54      83%        7%       6%     4%
+  cylinder/capsule           53      89%        6%       6%     0%
+  cylinder/ellipsoid         18      83%       17%       0%     0%
+  cylinder/sphere            78      83%        4%       6%     6%
+
+timeouts, at their closest (by max(pos/8cm, angle/60deg)): limited by position 30%, by angle 70%; median head error 8.4 cm, median angle 68 deg
+
+table contacts by body: {'wrist_2_link': 12, 'forearm_link': 3, 'tool': 2, 'tool+wrist_2_link': 1}
