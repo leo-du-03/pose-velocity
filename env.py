@@ -95,6 +95,7 @@ class PoseVelocityEnv(gym.Env):
         self.action_space = spaces.Box(-1.0, 1.0, (self.n_act,), np.float32)
         self.prev_action = np.zeros(self.n_act)
         self._a_filt = np.zeros(self.n_act)
+        self._ctrl_ref = None  # (arm targets, arm joints) at the last _apply_action
         if self.weld:
             self._weld_tool()
         self._update_contacts()
@@ -466,17 +467,24 @@ class PoseVelocityEnv(gym.Env):
                 and float(np.max(np.abs(d.qvel))) < 1e3)
 
     # ------------------------------------------------------------------ control
-    def _head_twist_targets(self, a: np.ndarray) -> np.ndarray:
-        """Arm targets that drive the head (as a point rigidly attached to the palm) at the commanded twist."""
+    def _head_jacobian(self) -> np.ndarray:
+        """6 x n_arm Jacobian of the head (as a point rigidly attached to the palm): rows linear, then angular."""
         m, d = self.model, self.data
         jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
         mujoco.mj_jac(m, d, jacp, jacr, d.site_xpos[self.head_site], self.palm_id)
-        J = np.vstack([jacp[:, self.arm_dadr], jacr[:, self.arm_dadr]])
+        return np.vstack([jacp[:, self.arm_dadr], jacr[:, self.arm_dadr]])
+
+    def _twist_dq(self, a: np.ndarray) -> np.ndarray:
+        """Arm joint velocities (damped least squares, unclipped) that move the head at the twist action a."""
+        J = self._head_jacobian()
         twist = np.concatenate([a[:3] * self.cfg.head_v_max, a[3:6] * self.cfg.head_w_max])
         lam2 = self.cfg.ik_damping ** 2
-        dq = J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), twist)
-        dq = np.clip(dq, -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
-        return d.qpos[self.arm_qadr] + dq * self.arm_lead
+        return J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), twist)
+
+    def _head_twist_targets(self, a: np.ndarray) -> np.ndarray:
+        """Arm targets that drive the head (as a point rigidly attached to the palm) at the commanded twist."""
+        dq = np.clip(self._twist_dq(a), -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
+        return self.data.qpos[self.arm_qadr] + dq * self.arm_lead
 
     # ------------------------------------------------------------------ goals / curriculum
     def set_curriculum(self, level: float) -> None:
@@ -725,6 +733,8 @@ class PoseVelocityEnv(gym.Env):
             self.targets[na:] = self.targets[na:] + a[na:] * self.act_scale[na:]
         self.targets = np.clip(self.targets, self.ctrl_lo, self.ctrl_hi)
         self.data.ctrl[self.act_ids] = self.targets
+        # The arm joints when these targets were set: prev_twist reads the commanded joint velocity off them.
+        self._ctrl_ref = (self.targets[:na].copy(), self.data.qpos[self.arm_qadr].copy())
         return a
 
     def _physics_step(self) -> None:
@@ -869,7 +879,11 @@ class PoseVelocityEnv(gym.Env):
         parts = [d.qpos[self.arm_qadr], d.qvel[self.arm_dadr]]
         if not self.weld:
             parts += [d.qpos[self.hand_qadr], d.qvel[self.hand_dadr]]
-        parts += [self.prev_action, palm, mu.rot6d(R_palm)]
+        parts += [self.prev_action]
+        if self.cfg.action_mode == "joint":
+            # Joint actions move the servo targets, which then lead the joints; the gap drives the arm.
+            parts.append(self.targets[:self.n_arm_act] - d.qpos[self.arm_qadr])
+        parts += [palm, mu.rot6d(R_palm)]
         if not self.weld:
             parts += [(d.xpos[self.tip_ids] - palm).ravel(), self.tip_contact, [self.palm_contact]]
         eps_p, eps_v, eps_th = self.tolerances()
@@ -907,12 +921,61 @@ class PoseVelocityEnv(gym.Env):
         """The scripted oracle's action for the current state: behavior-cloning labels (see bc.py).
 
         The oracle is stateful (approach, then strike), so call this once per step, before stepping.
+        The oracle plans head twists; in joint mode they are converted with joint_action_for_twist.
         """
         if self._oracle is None:
             from oracle import Oracle, PoseOracle
 
             self._oracle = Oracle() if self.cfg.goal_velocity else PoseOracle()
-        return self._oracle(self).astype(np.float32)
+        a = self._oracle(self)
+        if self.cfg.action_mode == "joint":
+            a = self.joint_action_for_twist(a)
+        return a.astype(np.float32)
+
+    def _commanded_dq(self) -> np.ndarray:
+        """The arm joint velocity the servo targets command (joint mode): (targets - q0) / lead.
+
+        Targets q0 + lead * dq make the PD servos a velocity servo toward dq (see _index_model), with q0 the joints
+        when the targets were set. q0 is not observed, but q - qvel * dt matches it to ~2% (targets - q is in the
+        joint-mode observation), so oracle labels are nearly a function of what the policy sees. The labels smooth
+        from this value, which multiplies a gain error by 1 / (1 - action_ema) = 5, hence q0 itself.
+        """
+        d, na = self.data, self.n_arm_act
+        ref = self._ctrl_ref
+        # Resets set the targets to the current joints (no command); then ref is stale and q0 = q gives dq = 0.
+        q0 = ref[1] if ref is not None and np.array_equal(ref[0], self.targets[:na]) else d.qpos[self.arm_qadr]
+        return (self.targets[:na] - q0) / self.arm_lead
+
+    def prev_twist(self) -> np.ndarray:
+        """The last step's smoothed head-twist command in action units (lin / head_v_max, ang / head_w_max).
+
+        head_twist: the previous action. joint: the head twist of the commanded joint velocity (_commanded_dq).
+        """
+        if self.cfg.action_mode == "head_twist":
+            return self.prev_action[:6].copy()
+        twist = self._head_jacobian() @ self._commanded_dq()
+        return np.clip(np.concatenate([twist[:3] / self.cfg.head_v_max, twist[3:] / self.cfg.head_w_max]), -1.0, 1.0)
+
+    def joint_action_for_twist(self, twist_action: np.ndarray) -> np.ndarray:
+        """Joint-mode arm action that sets the servo targets as head_twist mode would for twist_action.
+
+        head_twist smooths the twist (action_ema), maps it to joint velocities dq and sets the targets to
+        q + lead * dq. Here the smoothing is done on dq instead, from the commanded dq: mapping dq back to a twist
+        loses gain to the IK damping, and smoothing multiplies that loss by 5 (strikes then fall short of the goal
+        speed). The result is the raw joint action whose smoothed value moves the targets there (the EMA inverted,
+        as in traces.TraceFollower). Exact unless it clips at +-1, i.e. when the targets have to move by more than
+        about arm_action_scale per step (fast changes of speed: lead is 10 control steps).
+        """
+        cfg, na = self.cfg, self.n_arm_act
+        ema = cfg.action_ema
+        dq = self._twist_dq(np.clip(np.asarray(twist_action, dtype=np.float64)[:6], -1.0, 1.0))
+        if ema > 0:
+            dq = ema * self._commanded_dq() + (1.0 - ema) * dq
+        dq = np.clip(dq, -cfg.max_joint_speed, cfg.max_joint_speed)
+        target = np.clip(self.data.qpos[self.arm_qadr] + dq * self.arm_lead, self.ctrl_lo[:na], self.ctrl_hi[:na])
+        smoothed = (target - self.targets[:na]) / self.act_scale[:na]
+        a = (smoothed - ema * self._a_filt[:na]) / (1.0 - ema) if ema > 0 else smoothed
+        return np.clip(a, -1.0, 1.0)
 
     # ------------------------------------------------------------------ test / debug helpers
     def debug_set_head_state(self, head_pos, quat, lin_vel) -> None:

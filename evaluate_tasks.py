@@ -20,7 +20,8 @@ from tasks import TASKS, TaskEnv
 # Per-task columns of the episode line: (metric key, label, format, scale)
 COLUMNS = {
     "plate": [("force_target", "F*", "{:6.1f}N", 1), ("peak_force", "F", "{:6.1f}N", 1),
-              ("force_err", "err", "{:+6.1%}", 1), ("contact_speed", "v", "{:4.2f}m/s", 1),
+              ("force_err", "err", "{:+6.1%}", 1), ("contact_speed", "v", "{:5.2f}m/s", 1),
+              ("follower_contact_speed", "v*", "{:4.2f}m/s", 1), ("speed_err", "v err", "{:+6.1%}", 1),
               ("contact_err", "pos", "{:4.1f}cm", 100), ("contact_theta_deg", "rot", "{:3.0f}deg", 1)],
     "nail": [("force_target", "F*", "{:6.1f}N", 1), ("peak_force", "F", "{:6.1f}N", 1),
              ("force_err", "err", "{:+6.1%}", 1), ("contact_speed", "v", "{:4.2f}m/s", 1),
@@ -32,8 +33,24 @@ COLUMNS = {
               ("force_deficit", "deficit", "{:5.1%}", 1), ("untouched_cells", "untouched", "{}", None),
               ("unscrubbed_cells", "unscrubbed", "{}", None)],
 }
-SUMMARY = {"plate": ["force_err", "contact_err", "contact_speed"], "nail": ["force_err", "speed_err", "contact_err", "nail_driven"],
-           "sweep": ["cleaned", "cleaned_l1", "cleaned_l2", "cleaned_l3", "force_deficit"]}
+# Metrics summarized over episodes, each with the unit to print it in (metrics are stored as fractions and meters)
+UNITS = {"%": 100, "cm": 100, "mm": 1000, "m/s": 1, "deg": 1, "N": 1}
+# force_diff / speed_diff are the same errors as force_err / speed_err, as differences instead of fractions.
+SUMMARY = {"plate": [("force_err", "%"), ("force_diff", "N"), ("speed_err", "%"), ("speed_diff", "m/s"),
+                     ("contact_speed", "m/s"), ("contact_err", "cm")],
+           "nail": [("force_err", "%"), ("force_diff", "N"), ("speed_err", "%"), ("speed_diff", "m/s"),
+                    ("contact_speed", "m/s"), ("contact_err", "cm"), ("nail_driven", "mm")],
+           "sweep": [("cleaned", "%"), ("cleaned_l1", "%"), ("cleaned_l2", "%"), ("cleaned_l3", "%"),
+                     ("force_deficit", "%")]}
+
+
+def _add_diffs(m: dict) -> None:
+    """Hammer tasks: peak force minus target (N), and contact speed minus the reference follower's (m/s)."""
+    if "force_target" in m and m["force_target"] > 0:
+        m["force_diff"] = float(m["peak_force"] - m["force_target"])
+    v, v_ref = m.get("contact_speed", np.nan), m.get("follower_contact_speed", np.nan)
+    if np.isfinite(v) and np.isfinite(v_ref) and v_ref > 0:  # same episodes as speed_err
+        m["speed_diff"] = float(v - v_ref)
 
 
 def _fmt(m: dict, key: str, fmt: str, scale) -> str:
@@ -141,6 +158,7 @@ def main():
             if args.realtime and render_mode == "human":
                 time.sleep(max(0.0, dt - (time.time() - t0)))
         m = info["task"]
+        _add_diffs(m)
         results.append(m)
         cols = "  ".join(f"{label} {_fmt(m, key, fmt, scale)}" for key, label, fmt, scale in COLUMNS[args.task])
         end = "timeout" if m.get("timeout") else ("diverged" if m.get("diverged") else "done")
@@ -154,11 +172,14 @@ def main():
 
     print(f"\n{args.task} ({args.layout}, policy {policy}, level {level:.2f}): "
           f"success rate {np.mean([r['success'] for r in results]):.2f} over {len(results)} episodes")
-    for key in SUMMARY[args.task] + ["path_dev_mean"]:
+    # mean|x| is the typical size of a signed error; mean is its bias. n < episodes when a metric is undefined
+    # for some episodes (e.g. no contact).
+    for key, unit in SUMMARY[args.task] + [("path_dev_mean", "cm")]:
         vals = np.array([r.get(key, np.nan) for r in results], dtype=np.float64)
-        vals = vals[np.isfinite(vals)]
+        vals = vals[np.isfinite(vals)] * UNITS[unit]
         if len(vals):
-            print(f"  {key:18s} mean {vals.mean():+.4f}  std {vals.std():.4f}  |mean| {np.abs(vals).mean():.4f}")
+            print(f"  {key:18s} mean {vals.mean():+8.2f}{unit:3s}  median {np.median(vals):+8.2f}{unit:3s}  "
+                  f"std {vals.std():7.2f}{unit:3s}  mean|x| {np.abs(vals).mean():7.2f}{unit:3s}  (n={len(vals)})")
     if args.task == "sweep":
         cell_cm2 = (env.task_cfg.dirt_cell * 100) ** 2
         print(f"  dirt per episode by level (cells of {cell_cm2:.0f} cm^2), and the share removed over all runs:")

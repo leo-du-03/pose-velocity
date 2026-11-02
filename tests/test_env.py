@@ -194,7 +194,7 @@ def _run_attempt(env, policy):
 
 def _speed_scaled_oracle(mult):
     """The oracle, but striking at mult x the goal speed."""
-    from evaluate import Oracle
+    from oracle import Oracle
 
     class Scaled(Oracle):
         def __call__(self, env):
@@ -291,9 +291,9 @@ def test_scripted_pass_through_succeeds(physical_cfg):
 
 
 def test_oracle_succeeds(cfg):
-    """The scripted strike (evaluate.Oracle) succeeds on most weld goals: they are feasible."""
+    """The scripted strike (oracle.Oracle) succeeds on most weld goals: they are feasible."""
     from env import PoseVelocityEnv
-    from evaluate import Oracle
+    from oracle import Oracle
 
     env = PoseVelocityEnv(cfg)
     env.reset(seed=1)

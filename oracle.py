@@ -4,13 +4,19 @@ from __future__ import annotations
 import numpy as np
 
 
+def _prev_twist(env) -> np.ndarray:
+    """The last smoothed head-twist command in action units (PoseVelocityEnv.prev_twist; head_twist: prev_action)."""
+    return env.prev_action[:6] if env.cfg.action_mode == "head_twist" else env.prev_twist()
+
+
 def _ramp(x: float, x0: float, x1: float) -> float:
     """0 at x0, 1 at x1, linear in between (x0 may be above x1)."""
     return float(np.clip((x - x0) / (x1 - x0), 0.0, 1.0))
 
 
 class Oracle:
-    """Scripted strike for head_twist actions, using privileged goal knowledge.
+    """Scripted strike, using privileged goal knowledge. Returns head_twist actions; in joint mode
+    PoseVelocityEnv.oracle_action converts them to joint actions.
 
     1. Fly the head to the lead-in point p_g - lead_in * v_hat while turning the tool onto the goal orientation.
     2. Once there and aligned, move at v_g along v_hat (correcting lateral error), holding the goal orientation,
@@ -25,8 +31,9 @@ class Oracle:
         strike_lat_slope per metre towards the goal): 1 within c/2, 0 at c;
       * aligned: 1 within strike_axis/2, 0 at strike_axis;
       * committed (once more than lead_tol past the lead-in point, ramped in over another lead_tol): the smoothed
-        commanded velocity (the observation's prev_action) along v_hat is at least commit_frac of the goal speed
-        (ramped up over commit_len), with a soft band of commit_band * goal speed below that.
+        commanded velocity (the observation's prev_action; joint mode: the one the servo targets imply) along v_hat
+        is at least commit_frac of the goal speed (ramped up over commit_len), with a soft band of
+        commit_band * goal speed below that.
     `striking` reports alpha > 0.5 (diagnostics only).
 
     An earlier Markov version switched hard between the two velocities at the edge of that region. Labels on either
@@ -61,7 +68,7 @@ class Oracle:
         s = along + env.cfg.goal.lead_in  # progress past the lead-in point
         lat = float(np.linalg.norm(rel - along * g.direction))
         cone = self.strike_lat + self.strike_lat_slope * max(s, 0.0)
-        v_cmd = float(env.prev_action[:3] @ g.direction) * env.cfg.head_v_max
+        v_cmd = float(_prev_twist(env)[:3] @ g.direction) * env.cfg.head_v_max
         need = self.commit_frac * g.speed * float(np.clip((s - self.lead_tol) / self.commit_len, 0.0, 1.0))
         committed = _ramp(v_cmd, need - self.commit_band * g.speed, need)
         commit_gate = _ramp(s, self.lead_tol, 2 * self.lead_tol)  # no commitment needed near the lead-in point
@@ -72,8 +79,6 @@ class Oracle:
                 * (1.0 - commit_gate * (1.0 - committed)))
 
     def __call__(self, env) -> np.ndarray:
-        if env.cfg.action_mode != "head_twist":
-            raise ValueError("the oracle needs action_mode 'head_twist'")
         g = env.goal
         if self.goal is not g:
             self.goal, self.striking = g, False
@@ -103,7 +108,8 @@ class Oracle:
 
 
 class PoseOracle:
-    """Scripted reach for the pose-only baseline (EnvCfg.goal_velocity False), head_twist actions.
+    """Scripted reach for the pose-only baseline (EnvCfg.goal_velocity False). Returns head_twist actions
+    (converted in joint mode by PoseVelocityEnv.oracle_action).
 
     Flies the head straight to the goal point while turning the tool onto the goal orientation:
     v = k_pos * (p_g - head), capped at v_approach, and w = k_rot * rot_error. It uses only quantities in the
@@ -115,8 +121,6 @@ class PoseOracle:
         self.k_pos, self.v_approach, self.k_rot = k_pos, v_approach, k_rot
 
     def __call__(self, env) -> np.ndarray:
-        if env.cfg.action_mode != "head_twist":
-            raise ValueError("the oracle needs action_mode 'head_twist'")
         v = self.k_pos * (env.goal.p - env._head_state()[0])
         n = np.linalg.norm(v)
         if n > self.v_approach:

@@ -15,7 +15,6 @@ import numpy as np
 
 from config import EnvCfg, RewardCfg
 from env import PoseVelocityEnv
-from oracle import Oracle, PoseOracle
 
 
 def main():
@@ -27,6 +26,8 @@ def main():
                    help="override the grip mode (default: from checkpoint, else config.py)")
     p.add_argument("--action-mode", default=None, choices=["head_twist", "joint"],
                    help="override the action mode (default: from checkpoint, else config.py)")
+    p.add_argument("--arm-action-scale", type=float, default=None,
+                   help="override EnvCfg.arm_action_scale (rad per step at action 1, joint mode)")
     p.add_argument("--pose-only", default=None, choices=["hold", "touch"],
                    help="without --ckpt: pose-only baseline (no goal velocity) with this success rule "
                         "(a checkpoint carries its own setting)")
@@ -62,6 +63,8 @@ def main():
         cfg.grip_mode = args.grip_mode
     if args.action_mode is not None:
         cfg.action_mode = args.action_mode
+    if args.arm_action_scale is not None:
+        cfg.arm_action_scale = args.arm_action_scale
     if args.table_start:
         if cfg.grip_mode != "physical":
             p.error("--table-start needs --grip-mode physical")
@@ -70,7 +73,6 @@ def main():
         if policy == "ckpt":
             p.error("--pose-only is taken from the checkpoint; drop it with --ckpt")
         cfg.goal_velocity, cfg.pose_success = False, args.pose_only
-    oracle = (Oracle() if cfg.goal_velocity else PoseOracle()) if policy == "oracle" else None
 
     render_mode = "rgb_array" if args.video else (None if args.render == "none" else args.render)
     env = PoseVelocityEnv(cfg, render_mode=render_mode)
@@ -94,7 +96,7 @@ def main():
             elif policy == "zero":
                 action = np.zeros(env.action_space.shape)
             elif policy == "oracle":
-                action = oracle(env)
+                action = env.oracle_action()  # converted to joint actions in joint mode
             else:
                 import torch
 
