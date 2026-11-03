@@ -1,0 +1,77 @@
+policy=ckpt tol=3.00 cm episodes=100
+  10 episodes, 132 goals
+  20 episodes, 213 goals
+  30 episodes, 289 goals
+  40 episodes, 362 goals
+  50 episodes, 432 goals
+  60 episodes, 511 goals
+  70 episodes, 615 goals
+  80 episodes, 719 goals
+  90 episodes, 819 goals
+  100 episodes, 893 goals
+
+893 goals: reached 89%, timeout_far 6%, timeout_near 4%, table 1%
+
+goal kind (first = absolute goal at episode start):
+  group                   goals  reached  tmo_near  tmo_far  table
+  delta                     793      88%        4%       7%     1%
+  first                     100      98%        0%       2%     0%
+
+rotation needed (deg):
+  group                   goals  reached  tmo_near  tmo_far  table
+  0-30                      176      98%        0%       2%     0%
+  30-60                     328      94%        1%       3%     2%
+  60-90                     249      86%        3%      10%     1%
+  90-120                    101      75%       11%      12%     2%
+  120-150                    32      50%       28%      19%     3%
+  >=150                       7      71%       29%       0%     0%
+
+position distance (cm):
+  group                   goals  reached  tmo_near  tmo_far  table
+  0-5                        49      82%        4%      12%     2%
+  5-10                      394      87%        5%       7%     1%
+  10-15                     363      89%        4%       6%     2%
+  15-20                      20     100%        0%       0%     0%
+  20-30                      46     100%        0%       0%     0%
+  >=30                       21     100%        0%       0%     0%
+
+largest arm joint change to the goal's IK solution (deg):
+  group                   goals  reached  tmo_near  tmo_far  table
+  0-10                        5     100%        0%       0%     0%
+  10-20                      65      98%        0%       2%     0%
+  20-40                     215      99%        0%       1%     0%
+  40-60                     194      91%        3%       6%     1%
+  60-90                     188      86%        3%      10%     1%
+  >=90                      226      77%       10%      10%     3%
+
+goal height above the table (lower of handle / head, cm):
+  group                   goals  reached  tmo_near  tmo_far  table
+  0-5                         7     100%        0%       0%     0%
+  5-10                       24      75%        8%      12%     4%
+  10-15                      40      92%        5%       2%     0%
+  15-20                     102      90%        3%       4%     3%
+  20-30                     304      91%        3%       5%     1%
+  >=30                      416      87%        5%       7%     1%
+
+tool (handle / head):
+  group                   goals  reached  tmo_near  tmo_far  table
+  box/box                    85      89%        5%       6%     0%
+  box/capsule                14      86%        7%       7%     0%
+  box/cylinder               89      89%        1%      10%     0%
+  box/ellipsoid              38      84%        5%       8%     3%
+  box/sphere                 48      88%        6%       6%     0%
+  capsule/box                85      91%        5%       2%     2%
+  capsule/capsule            72      89%        4%       6%     1%
+  capsule/cylinder           54      89%        2%       6%     4%
+  capsule/ellipsoid          63      94%        2%       5%     0%
+  capsule/sphere             70      86%        0%      14%     0%
+  cylinder/box               87      90%        7%       3%     0%
+  cylinder/capsule           62      90%        3%       3%     3%
+  cylinder/ellipsoid         25      88%        8%       4%     0%
+  cylinder/sphere           101      87%        4%       6%     3%
+
+timeouts, at their closest (by max(pos/3cm, angle/20deg)): limited by position 45%, by angle 55%; median head error 10.2 cm, median angle 77 deg
+  timeouts with angle >= 20 deg at their closest: 86; median roll about the handle 57 deg, median remaining swing 37 deg; roll is the larger part in 59%
+
+table contacts by body: {'wrist_2_link': 6, 'forearm_link': 4, 'tool': 1}
+wrote diag_a01_150m_3cm.csv

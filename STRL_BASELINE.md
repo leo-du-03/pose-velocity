@@ -95,6 +95,13 @@ are mostly the policy stopping just outside the tolerance, and table contacts ar
 those motions. The paper's Fixed Grasp baseline shows the same failure ("arm collides with table during rotation").
 Raw outputs: `results/strl_a01_seed0/`.
 
+**Longer training does not help.** Resuming this run to 150M steps (`--resume ... --total-steps 150000000`) tightened
+the curriculum once more (1.25 -> 1.13 cm, at 111.5M steps) and then not again for 38M steps; training per-goal success
+stayed at ~70 % throughout. Task Progress of its `ckpt_best.pt` (same 100 evaluation episodes): **82 % at 2 cm** (vs 83 %),
+89 % at 3 cm (vs 87 %), 63 % at 1 cm (vs 60 %), all within the ~±3 % spread of 100 episodes; goals needing more than 90
+deg of rotation stay at about one in three at 2 cm. The 100M model is therefore kept as the baseline. Raw outputs:
+`results/strl_a01_seed0_150m/` (checkpoint not included).
+
 ### Earlier model: `strl_seed0` (included in `checkpoints/strl_seed0/`)
 
 Arm action 0.03, curriculum window 50; reached 1.13 cm. Task Progress 85 % (3 cm), 78 % (2 cm), 59 % (1 cm). The window
