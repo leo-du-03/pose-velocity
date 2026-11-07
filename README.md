@@ -316,9 +316,10 @@ Defaults marked `PPOCfg` come from `config.py`.
 | flag | default | description |
 |---|---|---|
 | `--ckpt CKPT` | none | Checkpoint to load; the env config and curriculum level are taken from it |
-| `--policy {ckpt,random,zero,oracle}` | `ckpt` if `--ckpt` is given, else `random` | Which policy drives the robot. `oracle` is the scripted strike (needs `head_twist` actions) |
+| `--policy {ckpt,random,zero,oracle}` | `ckpt` if `--ckpt` is given, else `random` | Which policy drives the robot. `oracle` is the scripted strike (weld grip; converted to joint actions in `joint` mode) |
 | `--grip-mode {weld,physical}` | from checkpoint, else `config.py` | Grip mode override |
 | `--action-mode {head_twist,joint}` | from checkpoint, else `config.py` | Action mode override |
+| `--arm-action-scale S` | from checkpoint, else `config.py` | Joint mode: rad per step at action 1 |
 | `--episodes N` | `5` | Number of episodes |
 | `--render {none,human,rgb_array}` | `none` | Render mode; `human` opens the viewer |
 | `--video PATH` | none | Write an mp4 (implies `--render rgb_array`) |
@@ -331,7 +332,7 @@ Defaults marked `PPOCfg` come from `config.py`.
 
 ### `bc.py`
 
-Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs/<name>/bc_latest.pt` after every round.
+Weld grip only (the oracle needs it). With `--action-mode joint` the oracle's head-twist labels are converted to joint actions (see "Joint actions" above). It writes `runs/<name>/bc_latest.pt` after every round.
 
 | flag | default | description |
 |---|---|---|
@@ -350,6 +351,8 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 | `--recent-rounds N` | `10` | The newest N rounds of data form the "recent" pool |
 | `--recent-frac F` | `0.5` | Fraction of each batch drawn from the recent pool; the rest comes from the whole dataset |
 | `--levels LO HI` | `0 1` | Curriculum levels the envs are spread over |
+| `--action-mode {head_twist,joint}` | `head_twist` (`EnvCfg.action_mode`) | Action space of the cloned policy |
+| `--arm-action-scale S` | `0.03` (`EnvCfg.arm_action_scale`) | Joint mode: rad per step at action 1 (0.1 recommended) |
 | `--seed N` | `0` | Seed |
 | `--serial` | off | Run envs in the main process |
 | `--logdir DIR`, `--name NAME` | `runs`, `bc_<timestamp>` | Output directory |
@@ -438,7 +441,7 @@ An episode is one goal, which gets one attempt.
 
 - **Action (6 values in [-1, 1] with weld; 22 with physical grip):**
   - Arm, `head_twist` (default): the head's linear velocity (up to 0.8 m/s) and angular velocity (up to 2.5 rad/s). Damped least squares maps this to joint velocities `dq`. The servo target is set to `q + (kv/kp)·dq`, which turns the UR5e's PD position servos into velocity servos.
-  - Arm, `joint`: changes to the joint-position targets, up to 0.03 rad per step.
+  - Arm, `joint`: changes to the joint-position targets, up to `arm_action_scale` (0.03 rad) per step.
   - Hand (physical grip only): changes to 16 joint targets, up to 0.08 rad per step.
   - Actions are smoothed with an EMA (`action_ema = 0.8`). The smoothed action is what goes into the observation.
   - Exploration noise starts at std 0.135 (`init_log_std = −2`). Together with the EMA, that's about 0.05 m/s of head-velocity noise per axis. At the earlier settings (std 0.37, EMA 0.5) the noise was about 0.15 m/s per axis, and even the scripted oracle succeeded only 5% of the time with it added.
@@ -449,6 +452,7 @@ An episode is one goal, which gets one attempt.
   - the goal (`p_g`, `v_g`, and `R_g` as a 6D rotation), the position and velocity errors, the orientation error as a world-frame rotation vector, and the offset to the lead-in point;
   - the current success tolerances, and time remaining.
   - Physical grip adds hand joints, fingertip positions, contact flags and grasp flags.
+  - `joint` actions add the arm servo targets' lead over the joints (`targets − q`).
 - **Critic-only inputs** (`info["priv"]`): tool mass, center of mass and friction; contact forces; closest distance so far; curriculum level.
 - **Networks:**
   - Actor: MLP 512-256-128 (ELU) with a Gaussian output.

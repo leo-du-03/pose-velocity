@@ -8,7 +8,11 @@ so the learner's small errors take it to states it never saw labels for; DAgger 
 actually visits.
 
 The oracle is stateful (approach the lead-in point, then strike) and reads privileged env state, so each env worker
-runs its own oracle (PoseVelocityEnv.oracle_action). Weld grip and head_twist actions only.
+runs its own oracle (PoseVelocityEnv.oracle_action). Weld grip only.
+
+--action-mode joint clones the same oracle into a policy that outputs arm joint-target changes: the env converts
+each head-twist label to the joint action that sets the servo targets head_twist mode would
+(PoseVelocityEnv.joint_action_for_twist). The setting travels with the checkpoint, like --pose-only.
 
 --pose-only {hold,touch} clones the pose-only baseline instead (EnvCfg.goal_velocity False, oracle.PoseOracle); the
 setting is saved in the checkpoint's env_cfg, so train.py --init-from fine-tunes the same task.
@@ -69,6 +73,10 @@ def parse_args():
     p.add_argument("--pose-only", default=None, choices=["hold", "touch"],
                    help="pose-only baseline (no goal velocity) with this success rule: 'hold' = SimToolReal's "
                         "success_steps steps within tolerance, 'touch' = the first step within tolerance")
+    p.add_argument("--action-mode", default=None, choices=["head_twist", "joint"],
+                   help="override EnvCfg.action_mode; joint labels are converted from the oracle's head twists")
+    p.add_argument("--arm-action-scale", type=float, default=None,
+                   help="override EnvCfg.arm_action_scale (rad per step at action 1, joint mode)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--serial", action="store_true", help="run envs in the main process (debugging)")
     p.add_argument("--logdir", default="runs")
@@ -92,8 +100,12 @@ def main():
     env_cfg, ppo_cfg = EnvCfg(), PPOCfg(num_envs=args.num_envs)
     if args.pose_only is not None:
         env_cfg.goal_velocity, env_cfg.pose_success = False, args.pose_only
-    if env_cfg.grip_mode != "weld" or env_cfg.action_mode != "head_twist":
-        raise SystemExit("the oracle needs grip_mode 'weld' and action_mode 'head_twist'")
+    if args.action_mode is not None:
+        env_cfg.action_mode = args.action_mode
+    if args.arm_action_scale is not None:
+        env_cfg.arm_action_scale = args.arm_action_scale
+    if env_cfg.grip_mode != "weld":
+        raise SystemExit("the oracle needs grip_mode 'weld'")
     K, N, T = args.eval_envs, args.num_envs, args.rollout_steps
     if not 0 <= K < N:
         raise SystemExit(f"--eval-envs must be in [0, num_envs), got {K}")
@@ -119,7 +131,7 @@ def main():
     venv = SerialVecEnv(fns) if (args.serial or N == 1) else SubprocVecEnv(fns)
     obs_dim, act_dim, priv_dim = venv.observation_space.shape[0], venv.action_space.shape[0], venv.priv_dim
     goal_txt = "pose+velocity" if env_cfg.goal_velocity else f"pose-only ({env_cfg.pose_success})"
-    print(f"goal={goal_txt}  device={device}  num_envs={N} ({K} eval)  levels {lo:.2f}-{hi:.2f}  "
+    print(f"goal={goal_txt}  actions={env_cfg.action_mode}  device={device}  num_envs={N} ({K} eval)  levels {lo:.2f}-{hi:.2f}  "
           f"noise std {noise_std:.3f}  "
           f"run_dir={run_dir}")
 
