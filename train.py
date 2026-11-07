@@ -152,6 +152,9 @@ def parse_args():
     p.add_argument("--grasp-slide", type=float, default=None,
                    help="weld grasps slide up to this fraction of the handle's half length from its center; "
                         "0.7 reaches grips near the end of the handle")
+    p.add_argument("--ik-fail-tol", type=float, default=None,
+                   help="end the episode as a failure when the arm falls short of the commanded head twist by more "
+                        "than this (action units; head_twist only); 0 disables")
     return p.parse_args()
 
 
@@ -222,11 +225,14 @@ def main():
         env_cfg.goal.min_dir_z = args.min_dir_z
     if args.grasp_slide is not None:
         env_cfg.grasp_slide = args.grasp_slide
+    if args.ik_fail_tol is not None:
+        env_cfg.ik_fail_tol = args.ik_fail_tol
     goal_txt = "pose+velocity" if env_cfg.goal_velocity else f"pose-only ({env_cfg.pose_success})"
     print(f"goal={goal_txt}  grip={env_cfg.grip_mode} actions={env_cfg.action_mode}  "
           f"eps_kp (level 0 -> 1) = {env_cfg.curriculum.eps_kp}  "
           f"eps_v_frac = {env_cfg.curriculum.eps_v_frac}  sigma_v_frac = {env_cfg.reward.sigma_v_frac}  "
-          f"min_dir_z = {env_cfg.goal.min_dir_z}  grasp_slide = {env_cfg.grasp_slide}")
+          f"min_dir_z = {env_cfg.goal.min_dir_z}  grasp_slide = {env_cfg.grasp_slide}  "
+          f"ik_fail_tol = {env_cfg.ik_fail_tol}")
 
     run_name = args.name or time.strftime("posevel_%Y%m%d_%H%M%S")
     run_dir = os.path.join(args.logdir, run_name)
@@ -367,7 +373,7 @@ def main():
         log["sps"] = sps
         log["level"] = curriculum.level
         if ep_stats:
-            for k in ("return", "length", "success", "passed", "dropped", "pushed", "ever_grasped", "diverged",
+            for k in ("return", "length", "success", "passed", "dropped", "pushed", "ik_failed", "ever_grasped", "diverged",
                       "goal_fallback", "goal_recovery"):
                 log[f"ep/{k}"] = float(np.mean([e.get(k, 0.0) for e in ep_stats]))
             d_min = [e["d_min"] for e in ep_stats if np.isfinite(e["d_min"])]
@@ -396,7 +402,7 @@ def main():
         print(f"it {it:5d} step {global_step:10d} | sps {sps:7.0f} | lvl {curriculum.level:.2f} | "
               f"ret {g('ep/return'):8.2f} | succ {g('ep/success'):.3f} | pass {g('ep/passed'):.3f} | "
               f"eval succ {g('eval/success'):.3f} | "
-              f"drop {g('ep/dropped'):.3f} push {g('ep/pushed'):.3f} | kl {train_stats['final_kl']:.4f} ({train_stats['steps']} steps) "
+              f"drop {g('ep/dropped'):.3f} push {g('ep/pushed'):.3f} ik {g('ep/ik_failed'):.3f} | kl {train_stats['final_kl']:.4f} ({train_stats['steps']} steps) "
               f"clip {train_stats['clipfrac']:.3f} lr {train_stats['lr']:.1e} std {train_stats['std']:.3f}")
         if it % 10 == 0 and ep_stats:
             starts = " ".join(f"{s} {g(f'by_start/{s}/success'):.2f}"

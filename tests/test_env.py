@@ -333,3 +333,18 @@ def test_oracle_labels_have_no_jumps(cfg):
         env.reset()
     assert worst < 0.3, worst
     env.close()
+
+
+def test_ik_failure_ends_episode(cfg):
+    from env import PoseVelocityEnv
+
+    env = PoseVelocityEnv(cfg)
+    env.reset(seed=0)
+    _, _, term, _, info = env.step(np.zeros(env.action_space.shape))
+    assert env.ik_error < 1e-6 and not info["ik_failed"]  # a zero twist is always reachable
+    # Any shortfall at all (damping alone leaves some) counts as a failure at a tiny tolerance.
+    env.cfg.ik_fail_tol = 1e-9
+    _, _, term, trunc, info = env.step(np.ones(env.action_space.shape))
+    assert info["ik_failed"] and term and not trunc
+    assert info["episode"]["ik_failed"] == 1.0 and info["episode"]["success"] == 0.0
+    env.close()

@@ -260,3 +260,197 @@ def test_hammer_is_held_like_a_hammer(cfg, task):
         assert mu.angle_between(face, fingers - (fingers @ Rt[:, 2]) * Rt[:, 2]) < np.deg2rad(tc.grasp_roll_jitter_deg + 1)
         env.reset()
     env.close()
+
+
+# ---------------------------------------------------------------------------------------------------------- slice
+def _slice_env(cfg, seed=0):
+    from tasks import TaskEnv
+
+    env = TaskEnv("slice", cfg)
+    env.reset(seed=seed)
+    return env
+
+
+def _shift_trace(env, fn):
+    """Restarts the episode's trace with fn(k, p, quat) -> (p, quat) applied to every sample from the lowering onto
+    the loaf on (the approach is left alone)."""
+    import copy
+
+    from traces import PHASE
+
+    tr = copy.deepcopy(env.trace)
+    k0 = int(np.argmax(tr.phase == PHASE["lower"]))
+    for k in range(k0, len(tr)):
+        tr.p[k], tr.quat[k] = fn(k, tr.p[k], tr.quat[k])
+    env.start_trace(tr)
+
+
+def test_slice_trace_cuts_through(cfg):
+    """Following the trace saws through every kerf column on the line, without crushing or jamming, and the halves
+    fall open."""
+    env = _slice_env(cfg)
+    for _ in range(2):
+        tr = env.trace
+        assert len(tr.keypoints) >= 8
+        assert all(kp.speed >= cfg.goal.speed_min for kp in tr.keypoints)
+        m = _run(env)
+        assert m["success"], m
+        assert m["cut_frac"] > 0.999 and not (m["crushed"] or m["jammed"] or m["off_line"] or m["board_hit"])
+        assert m["line_offset"] < 0.5 * env.task_cfg.line_tol
+        assert m["bind_deg_max"] < 0.5 * env.task_cfg.bind_deg
+        assert m["slice_ratio_mean"] > 2 * env.task_cfg.slice_ratio_min
+        assert np.all(env.data.qpos[env.task.hinge_qadr] > 0.2)  # the halves have opened
+        env.reset()
+    env.close()
+
+
+def test_slice_push_without_slicing_crushes(cfg):
+    """Pressing the edge straight down into the loaf (no motion along the blade) crushes it."""
+    from traces import PHASE
+
+    env = _slice_env(cfg)
+
+    def push():
+        if env.trace.phase[min(env.task_t, len(env.trace) - 1)] == PHASE["saw"]:
+            a = np.zeros(6, np.float32)
+            a[2] = -0.1 / cfg.head_v_max
+            return a
+        return env.trace_action()
+
+    m = _run(env, push)
+    assert m["crushed"] and m["fail_reason"] == "crushed" and not m["success"]
+    assert env.model.geom_size[env.task.half_gids[0], 2] < 0.5 * env.task.half_size0[0, 2]  # squashed
+    env.close()
+
+
+def test_slice_twisted_blade_jams(cfg):
+    """A blade turned 20 deg from the cut plane binds in the loaf: the knife jams and the arm stops."""
+    env = _slice_env(cfg)
+    twist = mu.axis_angle_quat([0, 0, 1], np.deg2rad(20.0))
+    _shift_trace(env, lambda k, p, q: (p, mu.quat_mul(twist, q)))
+    m = _run(env)
+    assert m["jammed"] and m["fail_reason"] == "jammed" and not m["success"]
+    head0 = env._head_state()[0]
+    for _ in range(5):  # the knife stays stuck whatever the policy asks
+        env.step(np.array([0, 0, 1.0, 0, 0, 0], np.float32))
+    assert np.linalg.norm(env._head_state()[0] - head0) < 0.01
+    env.close()
+
+
+def test_slice_off_the_line(cfg):
+    """A clean cut 1 cm beside the marked line goes through but fails: the halves stay shut."""
+    env = _slice_env(cfg)
+    n = env.task.n
+    _shift_trace(env, lambda k, p, q: (p + 0.01 * n, q))
+    m = _run(env)
+    assert m["off_line"] and m["fail_reason"] == "off_line" and not m["success"]
+    assert m["line_offset"] > env.task_cfg.line_tol and m["cut_frac"] > 0.99
+    assert np.all(env.data.qpos[env.task.hinge_qadr] < 0.05)
+    env.close()
+
+
+def test_slice_obs_matches_training_env(cfg):
+    """Pose + velocity and pose-only checkpoints both fit the slice env's observation."""
+    import copy
+
+    from env import PoseVelocityEnv
+    from tasks import TaskEnv
+
+    for goal_velocity in (True, False):
+        c = copy.deepcopy(cfg)
+        c.goal_velocity = goal_velocity
+        e, t = PoseVelocityEnv(c), TaskEnv("slice", c)
+        e.reset(seed=0)
+        assert t.observation_space.shape == e.observation_space.shape
+        e.close()
+        t.close()
+
+
+def test_slice_too_deep_hits_the_board(cfg):
+    """Sawing 1.5 cm too deep chops into the cutting board: a failure even though the loaf is cut through."""
+    from traces import PHASE
+
+    env = _slice_env(cfg, seed=1)
+    _shift_trace(env, lambda k, p, q: (p - (0.015 if env.trace.phase[k] == PHASE["saw"] else 0.0) * np.array(
+        [0, 0, 1.0]), q))
+    m = _run(env)
+    assert m["board_hit"] and m["fail_reason"] == "board" and not m["success"]
+    assert m["board_force"] > env.task_cfg.board_force_limit
+    env.close()
+
+
+# --------------------------------------------------------------------------------------------------- slice_tomato
+def _tomato_env(cfg, seed=0):
+    from tasks import TaskEnv
+
+    env = TaskEnv("slice_tomato", cfg)
+    env.reset(seed=seed)
+    return env
+
+
+def _saw_depth(env, fn):
+    """Restarts the trace with the head heights from the first stroke on changed by fn(z, z_start, z_min) -> z
+    (z_start, z_min: the heights at the start of the sawing and at its lowest), with velocities to match."""
+    import copy
+
+    from traces import PHASE
+
+    tr = copy.deepcopy(env.trace)
+    k0 = int(np.argmax(tr.phase == PHASE["saw"]))
+    z = tr.p[k0:, 2]
+    tr.p[k0:, 2] = fn(z, z[0], z.min())
+    tr.v[k0:, 2] = np.gradient(tr.p[k0 - 1:, 2], tr.dt)[1:]
+    env.start_trace(tr)
+
+
+def test_tomato_trace_cuts_within_the_force_window(cfg):
+    """Following the trace cuts the tomato through, pressing between the cut and the crush force, and it opens."""
+    env = _tomato_env(cfg)
+    tc = env.task_cfg
+    for _ in range(2):
+        m = _run(env)
+        assert m["success"], m
+        assert tc.tomato_cut_force < m["force_cut_mean"] < tc.tomato_crush_force
+        assert m["force_max"] < tc.tomato_crush_force - 0.5
+        assert np.all(env.data.qpos[env.task.hinge_qadr] > 0.2)
+        env.reset()
+    env.close()
+
+
+def test_tomato_too_little_force_doesnt_cut(cfg):
+    """An edge that only grazes the tomato (pressing under the cut force) leaves it whole; a trace that finishes a
+    few mm short of the board doesn't cut it through."""
+    env = _tomato_env(cfg)
+    tc = env.task_cfg
+    # The edge skims the top of the tomato (the follower dips a mm or so below its path, short of the cut force).
+    head_z = env.task.c[2] + 2 * tc.tomato_radius + 0.5 * tc.blade_height  # the edge is this far below the head
+    _saw_depth(env, lambda z, z0, zmin: np.maximum(z, head_z))
+    m = _run(env)
+    assert m["fail_reason"] == "not_through" and m["cut_frac"] == 0.0 and m["force_max"] < env.task_cfg.tomato_cut_force
+    env.reset()
+    _saw_depth(env, lambda z, z0, zmin: np.maximum(z, zmin + 0.005))
+    m = _run(env)
+    assert m["fail_reason"] == "not_through" and 0.5 < m["cut_frac"] < 1.0
+    env.close()
+
+
+def test_tomato_too_much_force_crushes(cfg):
+    """Descending twice as steeply as the sliding cuts drives the force up to the crush force: the tomato bursts."""
+    env = _tomato_env(cfg)
+    _saw_depth(env, lambda z, z0, zmin: np.maximum(z0 - 2.0 * (z0 - z), zmin))
+    m = _run(env)
+    assert m["fail_reason"] == "crushed" and m["force_max"] >= env.task_cfg.tomato_crush_force
+    assert env.model.geom_rgba[env.task.splat_gid, 3] == 1.0  # the splat shows, the halves are hidden
+    assert np.all(env.model.geom_rgba[env.task.half_gids, 3] == 0.0)
+    env.close()
+
+
+def test_tomato_tolerates_position_errors_the_loaf_doesnt(cfg):
+    """A cut 7 mm beside the middle still halves the tomato, though it is off the line for the loaf."""
+    env = _tomato_env(cfg)
+    n = env.task.n
+    _shift_trace(env, lambda k, p, q: (p + 0.007 * n, q))
+    m = _run(env)
+    assert m["success"], m
+    assert m["line_offset"] > env.task_cfg.line_tol  # the loaf's tolerance
+    env.close()

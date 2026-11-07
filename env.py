@@ -11,6 +11,8 @@ Episode rules (one episode = one goal = one attempt)
 * terminated: the head crosses the goal plane (through p_g, normal v_hat, going forward) within
   pass_radius of p_g: a "pass". It is a success if the crossing distance, the velocity error and the
   orientation error (full rotation angle to the goal orientation) are all within the curriculum tolerances. Physical grip also terminates on a drop.
+  Also terminated (as failures): a push on the table/pedestal/floor over table_force_limit, or (head_twist) an IK
+  failure: the arm can't follow the commanded head twist to within ik_fail_tol.
 * truncated: time limit (`max_steps`) or physics divergence.
 * Pose-only baseline (EnvCfg.goal_velocity False): the goal velocity is dropped from the observation and the
   reward. pose_success "touch": the first step within the keypoint tolerance succeeds and terminates. "hold"
@@ -476,7 +478,15 @@ class PoseVelocityEnv(gym.Env):
         lam2 = self.cfg.ik_damping ** 2
         dq = J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), twist)
         dq = np.clip(dq, -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
+        self._ik_J, self._ik_twist = J, twist  # for _ik_residual, after the targets are clipped to the joint limits
         return d.qpos[self.arm_qadr] + dq * self.arm_lead
+
+    def _ik_residual(self) -> float:
+        """How far the clipped arm targets fall short of the commanded head twist, in action units (the linear part
+        over head_v_max, the angular part over head_w_max): 0 when the arm can follow the command exactly."""
+        dq = (self.targets[:self.n_arm_act] - self.data.qpos[self.arm_qadr]) / self.arm_lead
+        scale = np.repeat([self.cfg.head_v_max, self.cfg.head_w_max], 3)
+        return float(np.linalg.norm((self._ik_J @ dq - self._ik_twist) / scale))
 
     # ------------------------------------------------------------------ goals / curriculum
     def set_curriculum(self, level: float) -> None:
@@ -725,6 +735,7 @@ class PoseVelocityEnv(gym.Env):
             self.targets[na:] = self.targets[na:] + a[na:] * self.act_scale[na:]
         self.targets = np.clip(self.targets, self.ctrl_lo, self.ctrl_hi)
         self.data.ctrl[self.act_ids] = self.targets
+        self.ik_error = self._ik_residual() if cfg.action_mode == "head_twist" else 0.0
         return a
 
     def _physics_step(self) -> None:
@@ -799,7 +810,9 @@ class PoseVelocityEnv(gym.Env):
 
         self.table_force = self._env_contact_force()
         pushed = bool(self.table_force > rc.table_force_limit)
-        terminated = passed or dropped or pushed
+        # The arm can't follow the commanded head twist (singularity or joint limits): a failure, like a push.
+        ik_failed = bool(cfg.ik_fail_tol > 0 and not passed and self.ik_error > cfg.ik_fail_tol)
+        terminated = passed or dropped or pushed or ik_failed
         truncated = (not terminated) and self.t >= cfg.max_steps
 
         # Keypoint progress counts only while holding (an empty hand moving the tool is no progress).
@@ -835,7 +848,7 @@ class PoseVelocityEnv(gym.Env):
         obs = self._get_obs()
         self._last_obs = obs
         info = {"priv": self._get_priv(), "success": success, "dropped": dropped, "passed": passed,
-                "holding": holding, "d_perp": d_perp, "d_kp": d_kp, "pushed": pushed}
+                "holding": holding, "d_perp": d_perp, "d_kp": d_kp, "pushed": pushed, "ik_failed": ik_failed}
         if terminated or truncated:
             self.goals_with_grip += 1
             if self.weld:
@@ -844,14 +857,15 @@ class PoseVelocityEnv(gym.Env):
                 kind = "respawn" if dropped else ("soft" if holding else "respawn")
             self._forced_reset_kind = kind
             info["episode"] = self._episode_info(success=success, dropped=dropped, passed=passed, kind=kind,
-                                                 pushed=pushed)
+                                                 pushed=pushed, ik_failed=ik_failed)
         if self.render_mode == "human":
             self.render()
         return obs, reward, terminated, truncated, info
 
-    def _episode_info(self, success: bool, dropped: bool, passed: bool, kind: str, pushed: bool = False) -> dict:
+    def _episode_info(self, success: bool, dropped: bool, passed: bool, kind: str, pushed: bool = False,
+                      ik_failed: bool = False) -> dict:
         return {"return": self.ep_return, "length": self.t, "success": float(success), "dropped": float(dropped),
-                "passed": float(passed), "pushed": float(pushed), "near_steps": self.near_steps,
+                "passed": float(passed), "pushed": float(pushed), "ik_failed": float(ik_failed), "near_steps": self.near_steps,
                 "d_kp_min": float(self.kp_best) if self.kp_best is not None else float("nan"), "d_min": float(self.d_best) if np.isfinite(self.d_best) else float("nan"),
                 "ever_grasped": float(self.ever_grasped), "diverged": float(self.diverged),
                 "goal_fallback": float(self.goal_fallback), "goal_recovery": float(self.goal_recovery),

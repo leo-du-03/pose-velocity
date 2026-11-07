@@ -19,7 +19,7 @@ import mathutils as mu
 from goals import Goal
 
 PHASES = ("approach", "hold", "accel", "strike", "contact", "retract", "lower", "stroke", "lift", "transfer", "windup",
-          "swing")
+          "swing", "saw")
 PHASE = {name: i for i, name in enumerate(PHASES)}
 
 

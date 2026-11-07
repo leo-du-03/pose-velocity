@@ -150,6 +150,10 @@ class EnvCfg:
     head_w_max: float = 2.5  # rad/s at action 1
     ik_damping: float = 0.05
     max_joint_speed: float = 3.0  # rad/s, per arm joint, head_twist only
+    # head_twist only: end the episode as a failure (like a table push) when the arm can't follow the commanded head
+    # twist: the shortfall after the damped least squares, joint speed and joint limit clipping, in action units
+    # (linear over head_v_max, angular over head_w_max), exceeds this. 0 disables.
+    ik_fail_tol: float = 0.5
     frame_skip: int = 10  # 0.002 s * 10 = 50 Hz control
     max_steps: int = 250  # 5 s per goal
     regrip_every: int = 8  # weld: new tool and grasp after this many goals
@@ -177,7 +181,8 @@ class EnvCfg:
 
 @dataclass
 class TaskCfg:
-    """Task evaluation (tasks.py, evaluate_tasks.py): hammer a plate, hammer a nail, sweep dirt off a board."""
+    """Task evaluation (tasks.py, evaluate_tasks.py): hammer a plate, hammer a nail, sweep dirt off a board, slice a
+    loaf or a cherry tomato."""
     # "in_dist": fixtures sit where training goals do (strikes no steeper than GoalCfg.min_dir_z, the sweep board
     # raised into the goal height range). "realistic": plate and nail flat on the table struck from above, the brush
     # sweeps the tabletop itself; out of distribution for the trained policies.
@@ -259,6 +264,66 @@ class TaskCfg:
     hover: float = 0.04  # lift between strokes
     waypoint_spacing: float = 0.04  # model keypoints along a stroke
     min_arm_margin: float = 0.08  # smallest head-Jacobian singular value allowed along the sweep (avoids singularities)
+    # --- slice task: saw a loaf in half with a knife
+    # Loaf (m): length across the cut (along the cut-plane normal), width along the cut (the sawing axis), height.
+    # It is split into two halves on the marked line in its middle, each hinged to the cutting board at its outer
+    # bottom edge, so a finished cut lets them fall open.
+    loaf_size: Tuple[float, float, float] = (0.12, 0.06, 0.05)
+    # Cutting board under the loaf (half sizes: across the cut, along it, thickness). Only a little longer than the
+    # loaf along the cut, so the hand, which hangs below the handle beyond the heel, stays clear of it.
+    board_half_size: Tuple[float, float, float] = (0.10, 0.042, 0.01)
+    # in_dist: height of the board top above the table, so the blade center stays in GoalCfg.height during the cut.
+    slice_height: Tuple[float, float] = (0.12, 0.2)
+    # Knife: blade half length (along the handle), blade height, half thickness, handle length. The handle runs along
+    # the blade's spine, so the edge is the full blade height below the handle axis.
+    blade_half_len: float = 0.10
+    blade_height: float = 0.04
+    blade_half_thick: float = 0.001
+    knife_handle_len: float = 0.12
+    knife_grasp_from_end: float = 0.05  # grip center this far from the handle's back end
+    heel_clear: float = 0.03  # the heel stays this far outside the loaf while the blade is in it (hand clearance)
+    # Trace: sawing strokes along the blade, descending all the while; the tangential speed is saw_ratio times the
+    # descent speed throughout each stroke (a slicing cut).
+    saw_speed: Tuple[float, float] = (0.32, 0.4)  # m/s along the blade (>= GoalCfg.speed_min for the keypoints)
+    saw_ratio: float = 3.0
+    saw_stroke_accel: float = 0.02  # m of each stroke spent speeding up (and slowing down) at the ends
+    saw_entry: float = 0.01  # m above the loaf top where the first stroke starts
+    slice_waypoint_spacing: float = 0.02  # model keypoints along the constant-speed part of each stroke
+    # Cutting rules, applied along the edge every physics substep. The edge cuts where it moves into the loaf while
+    # slicing: tangential speed >= cut_speed_min and >= slice_ratio_min x its speed into the material.
+    cut_speed_min: float = 0.12
+    slice_ratio_min: float = 1.5
+    kerf_cell: float = 0.0025  # m, width of a kerf column (along the cut)
+    crush_depth: float = 0.006  # m pressed into uncut loaf without slicing -> the loaf is crushed
+    bind_depth: float = 0.003  # m: the blade counts as inside the loaf (for binding) below this depth
+    bind_deg: float = 10.0  # blade face twisted/tilted this far from the cut plane inside the loaf -> jammed
+    bind_slack: float = 0.004  # m of sideways motion of the blade inside the kerf -> jammed
+    line_tol: float = 0.006  # m: cutting farther than this from the marked line is off the line
+    through_tol: float = 0.003  # m: a kerf column is through when cut to within this of the loaf bottom
+    # N of blade on the board -> chopped into the board. The follower presses ~0 N; driving the saw 5 mm (15 mm) too
+    # deep gives ~12 N (~35 N) on this soft board.
+    board_force_limit: float = 25.0
+    board_solref: Tuple[float, float] = (0.02, 1.0)  # cutting board contact softness (wood)
+    slice_end_delay: float = 0.6  # s the episode runs on after a success or a failure, so the consequence shows
+    # --- slice_tomato: a cherry tomato on the same board, cut with the same knife. Cutting is set by the pressing
+    # force: the tomato is a spring (tomato_stiffness) under the edge, so the force is how far the edge presses below
+    # the uncut surface. While the knife slides (cut_speed_min) with at least tomato_cut_force, the cut deepens with
+    # the distance slid, the faster the harder it presses (tomato_cut_rate per m slid at tomato_press_force, 0 at
+    # tomato_cut_force); with less, nothing is cut (the skin only dents); at tomato_crush_force the tomato bursts,
+    # whatever the knife is doing. The force settles where the cut keeps pace with the descent, so descending too
+    # steeply for the sliding (or not sliding) crushes it, and too shallow a finish never cuts through.
+    tomato_radius: float = 0.0125
+    tomato_stiffness: float = 500.0  # N/m
+    tomato_cut_force: float = 1.0  # N
+    tomato_crush_force: float = 4.0  # N
+    tomato_press_force: float = 2.5  # N the trace presses with (the middle of the window: 2 mm to 8 mm deep)
+    tomato_cut_rate: float = 0.15  # m of cut depth per m slid along the edge, at tomato_press_force
+    tomato_press_speed: float = 0.04  # m/s the trace's edge descends at most (pressing in at the start)
+    # The tomato is small and soft, so where the cut goes matters much less than with the loaf: anywhere through the
+    # middle two thirds splits it, and its flesh doesn't bind a blade that drifts or twists a little.
+    tomato_line_tol: float = 0.008
+    tomato_bind_deg: float = 30.0
+    tomato_bind_slack: float = 0.02
     # --- reference trace follower (traces.TraceFollower)
     k_pos: float = 8.0
     k_rot: float = 6.0

@@ -1,4 +1,4 @@
-"""Task evaluation envs: hammer a plate, hammer a nail, sweep dirt off a board.
+"""Task evaluation envs: hammer a plate, hammer a nail, sweep dirt off a board, slice a loaf or a cherry tomato in half.
 
 Each episode samples a task instance and builds a reference trace (traces.Trace) of head position, tool orientation
 and velocity that achieves the task exactly when followed exactly:
@@ -60,6 +60,19 @@ def brush_tool(tc: TaskCfg) -> ToolParams:
     return t
 
 
+def knife_tool(tc: TaskCfg) -> ToolParams:
+    """Kitchen knife: round handle with a thin box blade in line with it (head axis = handle axis, towards the tip).
+    The blade hangs below the handle: its spine is on the handle axis and its edge is blade_height below, along the
+    tool's -x (KNIFE_EDGE). The head center is the blade's center."""
+    b = 0.5 * tc.blade_height
+    return build_tool("cylinder", tc.knife_handle_len, 0.012, 1.0, "box", "inline", tc.blade_half_len, b,
+                      tc.blade_half_thick, jitter=(-b, 0.0), density=1500.0)
+
+
+KNIFE_EDGE = np.array([-1.0, 0.0, 0.0])  # tool frame: from the blade's center towards its edge
+KNIFE_NORMAL = np.array([0.0, 1.0, 0.0])  # tool frame: normal of the blade's faces
+
+
 def mat_quat(R) -> np.ndarray:
     q = np.empty(4)
     mujoco.mju_mat2Quat(q, np.asarray(R, dtype=np.float64).reshape(-1))
@@ -92,6 +105,45 @@ def arm_margin(env, q) -> float:
     mujoco.mj_jac(m, sd, jacp, jacr, sd.site_xpos[env.head_site], env.palm_id)
     J = np.vstack([jacp[:, env.arm_dadr], jacr[:, env.arm_dadr]])
     return float(np.linalg.svd(J, compute_uv=False)[-1])
+
+
+def person_grasp(env, center, axis, tool: ToolParams, front, from_end: float, tc: TaskCfg):
+    """Tool pose in the palm frame for a person's grip: the handle across the fingers, the hand from_end from the
+    end of the handle, the head beyond the index finger and thumb, and the tool-frame direction `front` (unit, across
+    the handle: a hammer's striking face, a knife's edge) pointing the way the knuckles do (the hand's
+    finger-extension direction, the flange axis), so a swing of the wrist and elbow drives it into the target.
+    Jittered slightly (grasp_slide_jitter, grasp_roll_jitter_deg)."""
+    t, d, rng = tool, env.data, env.np_random
+    R = d.xmat[env.palm_id].reshape(3, 3)
+    tips = d.xpos[env.tip_ids]  # index, middle, ring, thumb (thumb last)
+    across = R.T @ (tips[0] - tips[-2])  # ring -> index, in the palm frame
+    h = mu.normalize(axis if across @ axis >= 0 else -axis)  # handle direction, towards the head
+    sid = mujoco.mj_name2id(env.model, OBJ.mjOBJ_SITE, env.cfg.scene.arm_attach_site)
+    fingers = R.T @ d.site_xmat[sid].reshape(3, 3)[:, 2]  # flange axis: the way the fingers extend
+    f = mu.normalize(fingers - (fingers @ h) * h)
+    f = mu.rotate(mu.axis_angle_quat(h, np.deg2rad(rng.uniform(-1, 1) * tc.grasp_roll_jitter_deg)), f)
+    a = mu.normalize(np.asarray(front, np.float64))
+    tool_frame = np.column_stack([a, np.cross([0.0, 0, 1], a), [0.0, 0, 1]])
+    palm_frame = np.column_stack([f, np.cross(h, f), h])
+    quat = mat_quat(palm_frame @ tool_frame.T)
+    # Tool origin is the handle center; put the grip center from_end from the handle's far (non-head) end.
+    z_hand = -(0.5 * t.handle_len - from_end) + rng.uniform(-1, 1) * tc.grasp_slide_jitter
+    return np.asarray(center) - z_hand * h, quat
+
+
+def path_margin(env, points, quat, min_margin: float) -> float:
+    """Worst arm_margin along a path of head positions at a fixed tool orientation (chained IK from the current arm
+    configuration); 0 if any point is unreachable or the margin drops to min_margin."""
+    q = env.data.qpos[env.arm_qadr].copy()
+    worst = np.inf
+    for x in points:
+        q = env._ik_solve(q, x, quat, iters=100)
+        if q is None:
+            return 0.0
+        worst = min(worst, arm_margin(env, q))
+        if worst <= min_margin:
+            return 0.0
+    return worst
 
 
 # ====================================================================================================== env
@@ -211,6 +263,11 @@ class TaskEnv(PoseVelocityEnv):
         finally:
             self.render_mode = render_mode
             self.restore(snap)
+
+    def _camera(self) -> mujoco.MjvCamera:
+        cam = super()._camera()
+        self.task.camera(self, cam)
+        return cam
 
     def trace_action(self) -> np.ndarray:
         """The reference follower's action for this step."""
@@ -351,6 +408,9 @@ class Task:
     def restore(self, env: TaskEnv, snap) -> None:
         pass
 
+    def camera(self, env: TaskEnv, cam) -> None:
+        """Adjusts the render camera (default: the env's view of the whole table)."""
+
 
 def _fixture_geom(body, solref, **kw):
     return body.add_geom(solref=list(solref), **kw)
@@ -370,26 +430,10 @@ class HammerTask(Task):
         return self._tool
 
     def grasp(self, env, center, axis):
-        """A person's hammer grip: the handle across the fingers, the hand near the end of the handle
-        (grasp_from_end), the head beyond the index finger and thumb, and the striking face pointing the way the
-        knuckles do (the hand's finger-extension direction, the flange axis), so a swing of the wrist and elbow drives
-        the face into the target. Jittered slightly (grasp_slide_jitter, grasp_roll_jitter_deg)."""
-        tc, t, d, rng = self.tc, self.tool(), env.data, env.np_random
-        R = d.xmat[env.palm_id].reshape(3, 3)
-        tips = d.xpos[env.tip_ids]  # index, middle, ring, thumb (thumb last)
-        across = R.T @ (tips[0] - tips[-2])  # ring -> index, in the palm frame
-        h = mu.normalize(axis if across @ axis >= 0 else -axis)  # handle direction, towards the head
-        sid = mujoco.mj_name2id(env.model, OBJ.mjOBJ_SITE, env.cfg.scene.arm_attach_site)
-        fingers = R.T @ d.site_xmat[sid].reshape(3, 3)[:, 2]  # flange axis: the way the fingers extend
-        f = mu.normalize(fingers - (fingers @ h) * h)
-        f = mu.rotate(mu.axis_angle_quat(h, np.deg2rad(rng.uniform(-1, 1) * tc.grasp_roll_jitter_deg)), f)
-        a = mu.normalize(t.head_axis - t.head_axis[2] * np.array([0.0, 0, 1]))  # head axis, across the handle
-        tool_frame = np.column_stack([a, np.cross([0.0, 0, 1], a), [0.0, 0, 1]])
-        palm_frame = np.column_stack([f, np.cross(h, f), h])
-        quat = mat_quat(palm_frame @ tool_frame.T)
-        # Tool origin is the handle center; put the grip center grasp_from_end from the handle's far (non-head) end.
-        z_hand = -(0.5 * t.handle_len - tc.grasp_from_end) + rng.uniform(-1, 1) * tc.grasp_slide_jitter
-        return np.asarray(center) - z_hand * h, quat
+        """A person's hammer grip: the striking face points the way the knuckles do (see person_grasp)."""
+        t = self.tool()
+        front = mu.normalize(t.head_axis - t.head_axis[2] * np.array([0.0, 0, 1]))  # head axis, across the handle
+        return person_grasp(env, center, axis, t, front, self.tc.grasp_from_end, self.tc)
 
     def _add_post(self, spec, name: str) -> None:
         post = spec.worldbody.add_body(name=name, mocap=True, pos=list(_PARK))
@@ -1071,22 +1115,15 @@ class SweepTask(Task):
         return out
 
     def _path_margin(self, env, strokes, quat) -> float:
-        """Worst arm_margin along the strokes (chained IK every 3 cm, 5 mm above touch height so the pad doesn't
-        count as a collision, plus the hover points); 0 if any point is unreachable."""
-        q = env.data.qpos[env.arm_qadr].copy()
+        """Worst arm_margin along the strokes (every 3 cm, 5 mm above touch height so the pad doesn't count as a
+        collision, plus the hover points); 0 if any point is unreachable."""
         lift = self.tc.hover * _UP
-        worst = np.inf
+        pts = []
         for start, end, dirn in strokes:
             n = max(2, int(np.ceil(np.linalg.norm(end - start) / 0.03)) + 1)
-            pts = [start + lift] + [start + s * (end - start) + 0.005 * _UP for s in np.linspace(0, 1, n)] + [end + lift]
-            for x in pts:
-                q = env._ik_solve(q, x, quat, iters=100)
-                if q is None:
-                    return 0.0
-                worst = min(worst, arm_margin(env, q))
-                if worst <= self.tc.min_arm_margin:
-                    return 0.0
-        return worst
+            pts += [start + lift] + [start + s * (end - start) + 0.005 * _UP for s in np.linspace(0, 1, n)]
+            pts.append(end + lift)
+        return path_margin(env, pts, quat, self.tc.min_arm_margin)
 
     def _make_dirt(self, env, rng) -> None:
         tc = self.tc
@@ -1255,4 +1292,636 @@ class SweepTask(Task):
         return out
 
 
-TASKS = {"plate": PlateTask, "nail": NailTask, "sweep": SweepTask}
+class SliceTask(Task):
+    """Saw a loaf in half with a knife, along a line marked on its top.
+
+    The loaf sits on a cutting board, split into two halves on the line, each hinged to the board at its outer bottom
+    edge and held shut by its spring. Cutting is analytic (like sweep's dirt): the blade passes through the loaf, and
+    every physics substep the edge is checked column by column along the cut. Each kind of error has its own
+    consequence:
+      * velocity:    the edge pushes into uncut loaf without slicing (tangential speed under cut_speed_min, or under
+                     slice_ratio_min x its speed into the loaf) by more than crush_depth -> crushed (the loaf squashes)
+      * orientation: the blade face turns more than bind_deg from the cut plane inside the loaf -> jammed (the knife
+                     sticks: the arm is held where it is)
+      * position:    sideways motion inside the kerf over bind_slack -> jammed; cutting farther than line_tol from the
+                     line -> off the line (kerf drawn red, the halves stay shut); too deep -> the blade chops into the
+                     board (board_force_limit); too shallow -> not through
+    A clean cut through every column opens the halves.
+
+    The board, knife, instance sampling, binding and board checks are shared with TomatoSliceTask; the object (its
+    fixtures, cutting rule, trace and metrics) is what subclasses change.
+    """
+
+    name = "slice"
+    half_names = ("loaf_a", "loaf_b")
+    open_angle = 0.5  # rad the halves fall open to (their springs' rest angle once cut through)
+    _LOAF_RGBA = (0.82, 0.6, 0.33, 1.0)
+    _CRUSHED_RGBA = (0.45, 0.28, 0.14, 1.0)
+    _BOARD_RGBA = (0.72, 0.55, 0.36, 1.0)
+
+    def tool(self) -> ToolParams:
+        if self._tool is None:
+            self._tool = knife_tool(self.tc)
+        return self._tool
+
+    def grasp(self, env, center, axis):
+        """Held like a kitchen knife: the handle across the fingers, the blade beyond the index finger, the edge
+        pointing the way the knuckles do (down at home)."""
+        return person_grasp(env, center, axis, self.tool(), KNIFE_EDGE, self.tc.knife_grasp_from_end, self.tc)
+
+    # ---------------------------------------------------------------- object description (overridden per object)
+    def dims(self):
+        """Object extent on the board: across the cut, along it, height."""
+        return self.tc.loaf_size
+
+    def tolerances(self):
+        """(bind_deg, bind_slack, line_tol) for this object."""
+        tc = self.tc
+        return tc.bind_deg, tc.bind_slack, tc.line_tol
+
+    # ---------------------------------------------------------------- geometry
+    def _cols(self) -> np.ndarray:
+        """Kerf column centers along the cut (base frame y)."""
+        W, c = self.dims()[1], self.tc.kerf_cell
+        n = int(round(W / c))
+        return (np.arange(n) + 0.5) * W / n - 0.5 * W
+
+    def _edge_local(self) -> np.ndarray:
+        """Points along the edge in the tool frame, heel to tip."""
+        t = self.tool()
+        b = 0.5 * self.tc.blade_height
+        z = np.linspace(-t.head_long, t.head_long, 41)
+        return t.head_pos[None, :] + b * KNIFE_EDGE[None, :] + z[:, None] * np.array([0.0, 0, 1])
+
+    def add_fixtures(self, spec, env) -> None:
+        tc = self.tc
+        bh = tc.board_half_size
+        base = spec.worldbody.add_body(name="slice_base", mocap=True, pos=list(_PARK))  # frame: x cut normal, y along
+        _fixture_geom(base, tc.board_solref, name="slice_board", type=_GEOM.mjGEOM_BOX, size=list(bh),
+                      pos=[0, 0, -bh[2]], rgba=list(self._BOARD_RGBA))
+        self._add_object(spec, base)
+        for name in self.half_names:
+            spec.add_exclude(bodyname1="tool", bodyname2=name)  # the blade passes through; cutting is analytic
+        spec.add_exclude(bodyname1=self.half_names[0], bodyname2=self.half_names[1])
+        platform = spec.worldbody.add_body(name="slice_platform_body", mocap=True, pos=list(_PARK))
+        _fixture_geom(platform, tc.fixture_solref, name="slice_platform", type=_GEOM.mjGEOM_BOX,
+                      size=[bh[0], bh[1], _PLATFORM_HALF], pos=[0, 0, -_PLATFORM_HALF], rgba=[0.4, 0.4, 0.43, 1])
+
+    @staticmethod
+    def _add_half(base, name, sign, hinge_x, **geom):
+        """One half of the object: a body hinged to the board at hinge_x (outward of the cut, on side `sign`), so it
+        falls open outwards when its spring's rest angle is opened."""
+        half = base.add_body(name=name, pos=[sign * hinge_x, 0, 0], gravcomp=1.0)
+        half.add_joint(name=name + "_hinge", type=mujoco.mjtJoint.mjJNT_HINGE, axis=[0, sign, 0], range=[0.0, 1.3],
+                       limited=mujoco.mjtLimited.mjLIMITED_TRUE, stiffness=[0.5, 0.0, 0.0], damping=0.01)
+        half.add_geom(name=name, **geom)
+
+    def _add_object(self, spec, base) -> None:
+        tc = self.tc
+        Lx, W, H = self.dims()
+        nocol = dict(contype=0, conaffinity=0, group=2)
+        base.add_geom(name="slice_line", type=_GEOM.mjGEOM_BOX, size=[0.0012, 0.5 * W + 0.002, 0.0004],
+                      pos=[0, 0, H + 0.0004], rgba=[0.9, 0.1, 0.1, 1], **nocol)
+        for i, y in enumerate(self._cols()):
+            base.add_geom(name=f"kerf{i}", type=_GEOM.mjGEOM_BOX, size=[0.0015, 0.5 * tc.kerf_cell, 1e-4],
+                          pos=[0, y, H], rgba=[0.25, 0.15, 0.08, 0.0], **nocol)
+        for name, sign in zip(self.half_names, (-1.0, 1.0)):
+            self._add_half(base, name, sign, 0.5 * Lx, type=_GEOM.mjGEOM_BOX,
+                           size=[0.25 * Lx - 0.0005, 0.5 * W, 0.5 * H], pos=[-sign * 0.25 * Lx, 0, 0.5 * H],
+                           density=300.0, rgba=list(self._LOAF_RGBA))
+
+    def index(self, env) -> None:
+        m = env.model
+        name = lambda kind, n: mujoco.mj_name2id(m, kind, n)  # noqa: E731
+        self.base_mocap = int(m.body_mocapid[name(OBJ.mjOBJ_BODY, "slice_base")])
+        self.platform_mocap = int(m.body_mocapid[name(OBJ.mjOBJ_BODY, "slice_platform_body")])
+        self.board_gid = name(OBJ.mjOBJ_GEOM, "slice_board")
+        self.half_gids = np.array([name(OBJ.mjOBJ_GEOM, n) for n in self.half_names])
+        jids = [name(OBJ.mjOBJ_JOINT, n + "_hinge") for n in self.half_names]
+        self.hinge_qadr = np.array([int(m.jnt_qposadr[j]) for j in jids])
+        self.hinge_dadr = np.array([int(m.jnt_dofadr[j]) for j in jids])
+        self.half_size0 = m.geom_size[self.half_gids].copy()
+        self.half_pos0 = m.geom_pos[self.half_gids].copy()
+        self.half_rgba0 = m.geom_rgba[self.half_gids].copy()
+        self.edge_local = self._edge_local()
+        env.env_geoms = env.env_geoms | {self.board_gid, name(OBJ.mjOBJ_GEOM, "slice_platform")} | set(
+            self.half_gids.tolist())
+        self._index_object(env)
+        self.st = None
+
+    def _index_object(self, env) -> None:
+        m = env.model
+        self.line_gid = mujoco.mj_name2id(m, OBJ.mjOBJ_GEOM, "slice_line")
+        self.cols = self._cols()
+        self.kerf_gids = np.array([mujoco.mj_name2id(m, OBJ.mjOBJ_GEOM, f"kerf{i}") for i in range(len(self.cols))])
+
+    # ---------------------------------------------------------------- instance sampling
+    def _place(self, env, c, n) -> None:
+        env.set_mocap(self.base_mocap, c, frame_quat(_UP, n))
+        bottom = c - 2 * self.tc.board_half_size[2] * _UP
+        raised = bottom[2] > env.rinfo.table_top + 1e-3
+        env.set_mocap(self.platform_mocap, bottom if raised else _PARK, [1.0, 0, 0, 0])
+
+    def _tau_range(self):
+        """Range of the blade center along the sawing axis (towards the tip) while the blade is in the object: the
+        tip stays 1 cm past its far side, the heel heel_clear outside its near side."""
+        a, W = self.tool().head_long, self.dims()[1]
+        return 0.5 * W + 0.01 - a, a - 0.5 * W - self.tc.heel_clear
+
+    def _head_at(self, tau, z_edge):
+        """Head (blade center) position with the blade center tau along the tip direction and the edge z_edge above
+        the board top."""
+        return self.c + tau * self.sigma * self.e_s + (z_edge + 0.5 * self.tc.blade_height) * _UP
+
+    def sample(self, env) -> Optional[Trace]:
+        tc, rng, ri = self.tc, env.np_random, env.rinfo
+        H = self.dims()[2]
+        lo, hi = self._tau_range()
+        for _ in range(40):
+            u, w = rng.uniform(0.42, 0.6), rng.uniform(-0.15, 0.15)
+            h = rng.uniform(*tc.slice_height) if tc.layout == "in_dist" else 2 * tc.board_half_size[2]
+            c = ri.table_point(u, w, h)
+            best = (tc.min_arm_margin, None)
+            for phi in np.linspace(0.0, np.pi, 6, endpoint=False) + rng.uniform(0, np.pi / 6):
+                e_s = np.array([np.cos(phi), np.sin(phi), 0.0])
+                n = np.cross(e_s, _UP)
+                self.c, self.e_s, self.n = c, e_s, n
+                self._place(env, c, n)
+                for sigma in (1.0, -1.0):
+                    self.sigma = sigma
+                    quat = frame_quat(sigma * e_s, _UP)  # tip along +-e_s, tool x up (edge down)
+                    pts = [self._head_at(hi, H + 0.04)]
+                    for z in np.linspace(H + tc.saw_entry, 0.005, 4):
+                        pts += [self._head_at(t, z) for t in np.linspace(hi, lo, 4)]
+                    margin = path_margin(env, pts, quat, tc.min_arm_margin)
+                    if margin > best[0]:
+                        best = (margin, (e_s, n, sigma, quat))
+            if best[1] is None:
+                continue
+            self.e_s, self.n, self.sigma, self.quat = best[1]
+            self._place(env, c, self.n)
+            self.speed = float(rng.uniform(*tc.saw_speed))
+            trace = self.build_trace(env)
+            r = env.rollout(trace)  # the trace is the reference: the follower must achieve it
+            if not r.get("success"):
+                continue
+            trace.meta.update({f"follower_{k}": v for k, v in r.items() if isinstance(v, float)})
+            return trace
+        return None
+
+    # ---------------------------------------------------------------- trace
+    def _stroke_profile(self, env):
+        """Arc length along the stroke and tangential speed at each step: smooth speed-up over saw_stroke_accel,
+        constant speed, smooth stop, over the whole stroke range. Returns (arc, speed, l_a, L_c): the constant-speed
+        part is [l_a, l_a + L_c]."""
+        tc, dt, v = self.tc, env.dt, self.speed
+        lo, hi = self._tau_range()
+        n_a = max(1, int(round(2 * tc.saw_stroke_accel / v / dt)))
+        l_a = 0.5 * v * n_a * dt
+        n_c = int(np.floor((hi - lo - 2 * l_a) / (v * dt)))
+        L_c = n_c * v * dt
+        tau_a = np.arange(1, n_a + 1) / n_a
+        sv, sx = smoothstep(tau_a)
+        arc = np.concatenate([v * n_a * dt * sx, l_a + v * dt * np.arange(1, n_c + 1),
+                              l_a + L_c + v * n_a * dt * (tau_a - sx)])
+        speed = np.concatenate([v * sv, np.full(n_c, v), v * (1.0 - sv)])
+        return arc, speed, l_a, L_c
+
+    def _start_trace(self, env) -> TraceBuilder:
+        """Approach above the object, lower to saw_entry above it at the start of the first stroke, and pause."""
+        tc = self.tc
+        p0, _, _, _ = env._head_state()
+        b = TraceBuilder(env.dt, p0, env._tool_quat(), env.tool.head_axis)
+        pre = self._head_at(self._tau_range()[1], self.dims()[2] + tc.saw_entry)
+        b.move_to(pre + 0.03 * _UP, self.quat, b.move_time(pre, self.quat, 0.4, 1.5, 1.0), "approach")
+        b.move_to(pre, self.quat, 0.4, "lower")
+        b.hold(0.1)
+        return b
+
+    def _stroke(self, b: TraceBuilder, k: int, tau, arc, speed, zs, vz, kps, l_a, L_c) -> float:
+        """Appends stroke k (draw first, towards the heel, then push) with edge heights zs and vertical velocities vz,
+        and its keypoints every slice_waypoint_spacing on the constant-speed part. Returns where the stroke ends."""
+        d = -1.0 if k % 2 == 0 else 1.0
+        taus = tau + d * arc
+        ps = np.array([self._head_at(t_, z_) for t_, z_ in zip(taus, zs)])
+        vs = (d * speed)[:, None] * (self.sigma * self.e_s)[None, :] + vz[:, None] * _UP[None, :]
+        k0 = b.index
+        b.path(ps, vs, "saw", 0.0)
+        for x in list(np.arange(l_a, l_a + L_c - 1e-9, self.tc.slice_waypoint_spacing)) + [l_a + L_c]:
+            kps.append(k0 + 1 + int(np.argmin(np.abs(arc - x))))
+        return float(taus[-1])
+
+    def _finish_trace(self, env, b: TraceBuilder, tau, kps, **meta) -> Trace:
+        b.hold(0.1)
+        b.move_to(self._head_at(tau, self.dims()[2] + 0.04), self.quat, 0.5, "lift")
+        tr = b.build(task=self.name, saw_speed=self.speed, plane_point=self.c, plane_normal=self.n,
+                     saw_axis=self.sigma * self.e_s, **meta)
+        for k in sorted(set(kps)):
+            tr.add_keypoint(k)
+        return tr
+
+    def build_trace(self, env) -> Trace:
+        """Approach above the loaf; then sawing strokes along the blade, alternating draw (towards the heel) and push,
+        that descend only on their constant-speed parts (ratio >= saw_ratio of tangential to descent speed) until the
+        edge reaches the board; then lift out. Keypoints every slice_waypoint_spacing on the constant-speed parts."""
+        tc = self.tc
+        b = self._start_trace(env)
+        arc, speed, l_a, L_c = self._stroke_profile(env)
+        z0 = self.dims()[2] + tc.saw_entry
+        n_k = int(np.ceil(z0 / (L_c / tc.saw_ratio)))
+        D_k = z0 / n_k
+        frac = np.clip((arc - l_a) / L_c, 0.0, 1.0)
+        vz = -np.where((arc > l_a) & (arc <= l_a + L_c + 1e-9), speed * D_k / L_c, 0.0)
+        kps = []
+        tau, z = self._tau_range()[1], z0
+        for k in range(n_k):
+            tau = self._stroke(b, k, tau, arc, speed, z - D_k * frac, vz, kps, l_a, L_c)
+            z -= D_k
+        return self._finish_trace(env, b, tau, kps, n_strokes=n_k, saw_ratio=L_c / D_k)
+
+    def camera(self, env, cam) -> None:
+        """Close up on the object, looking along the cut from the tip side, so the kerf, a crushed object and the
+        halves falling open are easy to see."""
+        if getattr(self, "st", None) is None:
+            return
+        H = self.dims()[2]
+        cam.lookat[:] = self.c + 0.5 * H * _UP
+        cam.distance = 0.75 if H > 0.03 else 0.5
+        ax = self.sigma * self.e_s + 0.6 * self.n
+        cam.azimuth = float(np.degrees(np.arctan2(-ax[1], -ax[0])))
+        cam.elevation = -30.0
+
+    # ---------------------------------------------------------------- state and its visuals
+    def begin(self, env) -> None:
+        self.st = {"crushed": False, "jammed": False, "board": False, "off_line": False, "through": False,
+                   "t_end": None, "t_kps": None, "fail": None, "q_jam": None, "n_entry": None,
+                   "bind_deg_max": 0.0, "bind_off_max": 0.0, "line_off_max": 0.0, "board_peak": 0.0}
+        self.st.update(self._object_state())
+        d = env.data
+        d.qpos[self.hinge_qadr] = 0.0
+        d.qvel[self.hinge_dadr] = 0.0
+        self._apply_visuals(env)
+        mujoco.mj_forward(env.model, d)
+
+    def _object_state(self) -> dict:
+        H = self.dims()[2]
+        return {"floor": np.full(len(self.cols), H), "cut_off": np.full(len(self.cols), np.nan),
+                "crush_max": 0.0, "ratio_sum": 0.0, "ratio_n": 0}
+
+    def snapshot(self, env):
+        return copy.deepcopy(self.st)
+
+    def restore(self, env, snap) -> None:
+        if snap is not None:
+            self.st = copy.deepcopy(snap)
+            self._apply_visuals(env)
+
+    def _apply_visuals(self, env) -> None:
+        """Model-side state (not in the physics state): board color, hinge springs, and the object's look."""
+        m, st = env.model, self.st
+        m.geom_rgba[self.board_gid] = (0.85, 0.2, 0.15, 1.0) if st["board"] else self._BOARD_RGBA
+        m.qpos_spring[self.hinge_qadr] = self.open_angle if self._opened() else 0.0
+        self._object_visuals(env)
+
+    def _opened(self) -> bool:
+        return bool(self.st["through"] and self.st["fail"] is None)
+
+    def _object_visuals(self, env) -> None:
+        """Loaf shape and color (squashed when crushed), cut line, kerf."""
+        m, st = env.model, self.st
+        squash = 0.3 if st["crushed"] else 1.0
+        m.geom_size[self.half_gids] = self.half_size0
+        m.geom_size[self.half_gids, 2] = self.half_size0[:, 2] * squash
+        m.geom_pos[self.half_gids] = self.half_pos0
+        m.geom_pos[self.half_gids, 2] = self.half_pos0[:, 2] * squash
+        m.geom_rgba[self.half_gids] = self._CRUSHED_RGBA if st["crushed"] else self._LOAF_RGBA
+        m.geom_rgba[self.line_gid, 3] = 0.0 if (self._opened() or st["crushed"]) else 1.0
+        self._paint_kerf(env)
+
+    def _paint_kerf(self, env) -> None:
+        m, st, H = env.model, self.st, self.dims()[2]
+        depth = H - st["floor"]
+        m.geom_size[self.kerf_gids, 2] = np.maximum(0.5 * depth, 1e-4)
+        m.geom_pos[self.kerf_gids, 0] = np.nan_to_num(st["cut_off"])
+        m.geom_pos[self.kerf_gids, 2] = H - 0.5 * depth + 0.0005
+        hide = st["crushed"] or self._opened()
+        alpha = np.where((depth > 5e-4) & (not hide), 1.0, 0.0)
+        m.geom_rgba[self.kerf_gids] = (0.85, 0.1, 0.1, 1.0) if st["off_line"] else (0.25, 0.15, 0.08, 1.0)
+        m.geom_rgba[self.kerf_gids, 3] = alpha
+
+    def _fail(self, env, reason: str) -> None:
+        st = self.st
+        if st["fail"] is None:
+            st["fail"] = reason
+            st["t_end"] = float(env.data.time)
+
+    def _crush(self, env) -> None:
+        self.st["crushed"] = True
+        self._fail(env, "crushed")
+        self._apply_visuals(env)
+
+    def _cut_through(self, env) -> None:
+        """Every part of the cut is through: a success if it was on the line (the halves open), else off the line."""
+        st = self.st
+        st["through"] = True
+        if st["off_line"]:
+            self._fail(env, "off_line")
+        else:
+            st["t_end"] = float(env.data.time)
+        self._apply_visuals(env)
+
+    # ---------------------------------------------------------------- measurement
+    def measure(self, env) -> None:
+        tc, st, m, d = self.tc, self.st, env.model, env.data
+        if st is None:
+            return
+        if st["jammed"]:  # the knife is stuck in the object: the arm servos are held where it jammed
+            d.ctrl[env.act_ids[:env.n_arm_act]] = st["q_jam"]
+            return
+        if st["crushed"] or st["board"]:
+            return
+        Lx, W, H = self.dims()
+        # Blade on the board (also after the cut is through: too deep a finish chops into the board).
+        f6, f_board = np.zeros(6), 0.0
+        for i in range(d.ncon):
+            g1, g2 = int(d.contact.geom1[i]), int(d.contact.geom2[i])
+            if self.board_gid in (g1, g2) and env.tool_id in (int(m.geom_bodyid[g1]), int(m.geom_bodyid[g2])):
+                mujoco.mj_contactForce(m, d, i, f6)
+                f_board += abs(f6[0])
+        st["board_peak"] = max(st["board_peak"], f_board)
+        if f_board > tc.board_force_limit:
+            st["board"] = True
+            st["t_end"] = None  # a success that ends in the board is a failure, timed from here
+            self._fail(env, "board")
+            self._release(env)
+            self._apply_visuals(env)
+            return
+        if st["through"] or st["fail"] is not None:  # cut through, or already failed: nothing left to cut
+            self._release(env)
+            return
+        # The edge, in the object frame (x: off the cut plane, y: along the cut, z: above the board).
+        R, p = d.xmat[env.tool_id].reshape(3, 3), d.xpos[env.tool_id]
+        vel = np.zeros(6)
+        mujoco.mj_objectVelocity(m, d, OBJ.mjOBJ_BODY, env.tool_id, vel, 0)
+        pw = p + self.edge_local @ R.T
+        vw = vel[3:] + np.cross(vel[:3], pw - p)
+        rel = pw - self.c
+        ln, ls, lz = rel @ self.n, rel @ self.e_s, rel @ _UP
+        v_t = vw @ (R @ np.array([0.0, 0, 1]))  # along the edge
+        v_n = vw @ (R @ KNIFE_EDGE)  # edge first, into the material
+        inside = (np.abs(ln) < 0.5 * Lx) & (np.abs(ls) < 0.5 * W) & (lz < H)
+        if not inside.any():
+            st["n_entry"] = None
+            self._release(env)
+            return
+        # Binding: the blade face turned against the cut plane, or the blade moving sideways in its kerf.
+        bind_deg, bind_slack, _ = self.tolerances()
+        depth = H - float(lz[inside].min())
+        if depth > tc.bind_depth:
+            ang = float(np.degrees(np.arccos(np.clip(abs((R @ KNIFE_NORMAL) @ self.n), 0.0, 1.0))))
+            n_now = float(ln[inside].mean())
+            if st["n_entry"] is None:
+                st["n_entry"] = n_now
+            drift = abs(n_now - st["n_entry"])
+            st["bind_deg_max"] = max(st["bind_deg_max"], ang)
+            st["bind_off_max"] = max(st["bind_off_max"], drift)
+            if ang > bind_deg or drift > bind_slack:
+                st["jammed"] = True
+                st["q_jam"] = d.qpos[env.arm_qadr].copy()
+                self._fail(env, "jammed")
+                self._release(env)
+                return
+        self._cut(env, ln, ls, lz, v_t, v_n)
+
+    def _release(self, env) -> None:
+        """Removes any force the object puts on the knife (none for the loaf)."""
+
+    def _cut(self, env, ln, ls, lz, v_t, v_n) -> None:
+        """Loaf: column by column, the edge's height, offset and speeds where it crosses each column."""
+        tc, st = self.tc, self.st
+        Lx = self.dims()[0]
+        order = np.argsort(ls)
+        xs = ls[order]
+        if xs[-1] - xs[0] < 0.01:  # the edge is across the cut, not along it
+            return
+        cols = (self.cols >= xs[0]) & (self.cols <= xs[-1])
+        interp = lambda a: np.interp(self.cols, xs, a[order])  # noqa: E731
+        z_e, n_e, vt, vn = interp(lz), interp(ln), np.abs(interp(v_t)), interp(v_n)
+        into = cols & (z_e < st["floor"]) & (np.abs(n_e) < 0.5 * Lx)
+        if not into.any():
+            return
+        slicing = (vt >= tc.cut_speed_min) & (vt >= tc.slice_ratio_min * np.maximum(vn, 0.0))
+        cut = into & slicing
+        push = into & ~slicing
+        if push.any():
+            pen = float((st["floor"][push] - z_e[push]).max())
+            st["crush_max"] = max(st["crush_max"], pen)
+            if pen > tc.crush_depth:
+                self._crush(env)
+                return
+        if cut.any():
+            st["floor"][cut] = z_e[cut]
+            st["cut_off"][cut] = n_e[cut]
+            st["ratio_sum"] += float(np.minimum(vt[cut] / np.maximum(vn[cut], 1e-3), 20.0).mean())
+            st["ratio_n"] += 1
+            off = float(np.abs(n_e[cut]).max())
+            st["line_off_max"] = max(st["line_off_max"], off)
+            if off > self.tolerances()[2]:
+                st["off_line"] = True
+            if np.all(st["floor"] <= tc.through_tol):
+                self._cut_through(env)
+            else:
+                self._paint_kerf(env)
+
+    def done(self, env) -> bool:
+        st, t = self.st, float(env.data.time)
+        if st["t_end"] is not None:
+            return t - st["t_end"] >= self.tc.slice_end_delay
+        if env.kp_index >= len(env.trace.keypoints):  # all keypoints passed: a moment to finish the cut / lift out
+            st["t_kps"] = t if st["t_kps"] is None else st["t_kps"]
+            return t - st["t_kps"] >= 1.0
+        return False
+
+    def metrics(self, env) -> dict:
+        st = self.st
+        success = self._opened()
+        reason = st["fail"] or (None if success else "not_through")
+        out = {"success": success, "cut_frac": self._cut_frac(), "through": bool(st["through"]),
+               "crushed": bool(st["crushed"]), "jammed": bool(st["jammed"]), "board_hit": bool(st["board"]),
+               "off_line": bool(st["off_line"]), "fail_reason": reason or "-",
+               "bind_deg_max": st["bind_deg_max"], "bind_offset_max": st["bind_off_max"],
+               "line_offset": st["line_off_max"], "board_force": st["board_peak"],
+               "trace_speed": float(env.trace.meta.get("saw_speed", float("nan")))}
+        out.update(self._object_metrics())
+        return out
+
+    def _cut_frac(self) -> float:
+        H, tol = self.dims()[2], self.tc.through_tol
+        return float(np.mean(np.clip((H - self.st["floor"]) / max(H - tol, 1e-9), 0.0, 1.0)))
+
+    def _object_metrics(self) -> dict:
+        st = self.st
+        return {"crush_depth_max": st["crush_max"],
+                "slice_ratio_mean": st["ratio_sum"] / st["ratio_n"] if st["ratio_n"] else float("nan")}
+
+
+def _hemisphere_verts(r: float, n: int = 10) -> list:
+    """Vertices of a hemisphere of radius r, flat face on x = 0, dome towards +x (a mesh's convex hull)."""
+    pts = [[0.0, 0.0, 0.0]]
+    for th in np.linspace(0.0, 0.5 * np.pi, n):  # angle from +x
+        for ph in np.linspace(0.0, 2 * np.pi, 2 * n, endpoint=False):
+            pts.append([r * np.cos(th), r * np.sin(th) * np.cos(ph), r * np.sin(th) * np.sin(ph)])
+    return [float(x) for p in pts for x in p]
+
+
+class TomatoSliceTask(SliceTask):
+    """Slice a cherry tomato in half on the same board, with the same knife and strokes.
+
+    The cut is set by force. The tomato is a spring under the edge (tomato_stiffness): the pressing force is how far
+    the edge is below the uncut surface (the sphere, or the floor of the cut so far). The force isn't applied to the
+    knife: the arm's velocity servos give way under a few newtons, so a knife the tomato pushed back on could never
+    press hard enough to crush it, whatever the policy did.
+      * not enough force (under tomato_cut_force): nothing is cut, the skin only dents -> not through
+      * enough force while the knife slides (cut_speed_min): the cut deepens with the distance slid, faster the
+        harder it presses (cut_rate: tomato_cut_rate at the trace's tomato_press_force). So the force settles where the
+        cut keeps up with the knife's descent: descending steeply for the sliding drives it up
+      * too much force (tomato_crush_force), however it comes (pressing too deep, or descending faster than the
+        sliding cuts, or not sliding at all): the tomato bursts -> crushed
+    Position and orientation matter much less than for the loaf (tomato_line_tol, tomato_bind_deg,
+    tomato_bind_slack), and the strokes reach far past it on both sides.
+    """
+
+    name = "slice_tomato"
+    half_names = ("tomato_a", "tomato_b")
+    open_angle = 1.2  # the halves roll over onto their backs
+    _TOMATO_RGBA = (0.86, 0.12, 0.08, 1.0)
+
+    def dims(self):
+        r = self.tc.tomato_radius
+        return (2 * r, 2 * r, 2 * r)
+
+    def tolerances(self):
+        tc = self.tc
+        return tc.tomato_bind_deg, tc.tomato_bind_slack, tc.tomato_line_tol
+
+    def _add_object(self, spec, base) -> None:
+        r = self.tc.tomato_radius
+        spec.add_mesh(name="tomato_half_mesh", uservert=_hemisphere_verts(r))
+        for name, sign in zip(self.half_names, (-1.0, 1.0)):
+            # Dome outwards; the flat face on the cut plane (a hair off it so the halves don't touch).
+            quat = [1.0, 0, 0, 0] if sign > 0 else [0.0, 0, 0, 1.0]
+            self._add_half(base, name, sign, 0.6 * r, type=_GEOM.mjGEOM_MESH, meshname="tomato_half_mesh",
+                           pos=[-sign * (0.6 * r - 0.0003), 0, r], quat=quat, density=1000.0,
+                           rgba=list(self._TOMATO_RGBA))
+        nocol = dict(contype=0, conaffinity=0, group=2)
+        base.add_geom(name="tomato_stem", type=_GEOM.mjGEOM_CYLINDER, size=[0.003, 0.0015, 0],
+                      pos=[0, 0, 2 * r + 0.001], rgba=[0.2, 0.55, 0.15, 1], **nocol)
+        base.add_geom(name="tomato_splat", type=_GEOM.mjGEOM_ELLIPSOID, size=[1.7 * r, 1.5 * r, 0.3 * r],
+                      pos=[0, 0, 0.25 * r], rgba=[0.6, 0.05, 0.03, 0.0], **nocol)
+
+    def _index_object(self, env) -> None:
+        m = env.model
+        self.stem_gid = mujoco.mj_name2id(m, OBJ.mjOBJ_GEOM, "tomato_stem")
+        self.splat_gid = mujoco.mj_name2id(m, OBJ.mjOBJ_GEOM, "tomato_splat")
+        self.cols = np.zeros(1)
+
+    def _object_state(self) -> dict:
+        return {"floor": 2 * self.tc.tomato_radius, "force": 0.0, "force_max": 0.0, "force_sum": 0.0,
+                "force_n": 0}
+
+    def _object_visuals(self, env) -> None:
+        """Burst when crushed: the halves vanish into a flat red splat."""
+        m, st = env.model, self.st
+        m.geom_rgba[self.half_gids] = self.half_rgba0
+        m.geom_rgba[self.half_gids, 3] = 0.0 if st["crushed"] else 1.0
+        m.geom_rgba[self.splat_gid, 3] = 1.0 if st["crushed"] else 0.0
+        m.geom_rgba[self.stem_gid, 3] = 0.0 if (st["crushed"] or self._opened()) else 1.0
+
+    def _through_level(self) -> float:
+        """The cut is through once its floor is this close to the board: the last of the skin under the cutting
+        pressure splits too."""
+        tc = self.tc
+        return tc.tomato_cut_force / tc.tomato_stiffness + tc.through_tol
+
+    def cut_rate(self, force: float) -> float:
+        """Cut depth per distance slid at this pressing force: tomato_cut_rate at the trace's tomato_press_force,
+        rising linearly from 0 at tomato_cut_force (pressing harder cuts faster, like Preston's law)."""
+        tc = self.tc
+        above = max(force - tc.tomato_cut_force, 0.0)
+        return tc.tomato_cut_rate * above / (tc.tomato_press_force - tc.tomato_cut_force)
+
+    def _release(self, env) -> None:
+        self.st["force"] = 0.0
+
+    def _cut(self, env, ln, ls, lz, v_t, v_n) -> None:
+        tc, st, d = self.tc, self.st, env.data
+        r = tc.tomato_radius
+        h2 = ln ** 2 + ls ** 2
+        over = h2 < r ** 2
+        if not over.any():
+            self._release(env)
+            return
+        surface = np.minimum(st["floor"], r + np.sqrt(np.maximum(r ** 2 - h2, 0.0)))
+        press = np.where(over, surface - lz, -np.inf)
+        i = int(np.argmax(press))
+        if press[i] <= 0.0:
+            self._release(env)
+            return
+        f = tc.tomato_stiffness * float(press[i])
+        st["force"] = f
+        st["force_max"] = max(st["force_max"], f)
+        if f >= tc.tomato_crush_force:
+            self._crush(env)
+            self._release(env)
+            return
+        vt = abs(float(v_t[i]))
+        if f >= tc.tomato_cut_force and vt >= tc.cut_speed_min:
+            st["floor"] = max(st["floor"] - self.cut_rate(f) * vt * env.model.opt.timestep, float(lz[i]))
+            st["force_sum"] += f
+            st["force_n"] += 1
+            st["line_off_max"] = max(st["line_off_max"], abs(float(ln[i])))
+            if abs(float(ln[i])) > self.tolerances()[2]:
+                st["off_line"] = True
+            if st["floor"] <= self._through_level():
+                self._cut_through(env)
+                self._release(env)
+
+    END_ABOVE_BOARD = 0.0015  # m: the trace's edge stops this far above the board (the cut is through by then)
+
+    def build_trace(self, env) -> Trace:
+        """The loaf's strokes, but the edge rides tomato_press_force deep below the floor of the cut, which the trace
+        predicts with the same cutting rule; strokes continue until the cut is through."""
+        tc, dt = self.tc, env.dt
+        k_t, r = tc.tomato_stiffness, tc.tomato_radius
+        press = tc.tomato_press_force / k_t
+        b = self._start_trace(env)
+        arc, speed, l_a, L_c = self._stroke_profile(env)
+        floor, z = 2 * r, 2 * r + tc.saw_entry
+        kps, tau, k = [], self._tau_range()[1], 0
+        while floor > self._through_level() and k < 12:
+            zs = np.empty(len(arc))
+            z_prev = z
+            for j, v in enumerate(speed):
+                z = max(floor - press, z - tc.tomato_press_speed * dt, self.END_ABOVE_BOARD)
+                zs[j] = z
+                f = k_t * (floor - z)
+                if f >= tc.tomato_cut_force and v >= tc.cut_speed_min:
+                    floor = max(floor - self.cut_rate(f) * v * dt, z)
+            vz = np.gradient(np.concatenate([[z_prev], zs]), dt)[1:]
+            tau = self._stroke(b, k, tau, arc, speed, zs, vz, kps, l_a, L_c)
+            k += 1
+        return self._finish_trace(env, b, tau, kps, n_strokes=k, press_force=tc.tomato_press_force)
+
+    def _cut_frac(self) -> float:
+        top, bottom = 2 * self.tc.tomato_radius, self._through_level()
+        return float(np.clip((top - self.st["floor"]) / (top - bottom), 0.0, 1.0))
+
+    def _object_metrics(self) -> dict:
+        st, tc = self.st, self.tc
+        return {"force_max": st["force_max"],
+                "force_cut_mean": st["force_sum"] / st["force_n"] if st["force_n"] else float("nan"),
+                "force_target": tc.tomato_press_force}
+
+
+TASKS = {"plate": PlateTask, "nail": NailTask, "sweep": SweepTask, "slice": SliceTask,
+         "slice_tomato": TomatoSliceTask}

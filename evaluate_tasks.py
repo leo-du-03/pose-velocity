@@ -1,10 +1,13 @@
-"""Evaluate a policy on the tasks in tasks.py: hammer a plate, hammer a nail, sweep dirt off a board.
+"""Evaluate a policy on the tasks in tasks.py: hammer a plate, hammer a nail, sweep dirt off a board, slice a loaf or a
+cherry tomato.
 
 Examples:
   python evaluate_tasks.py --task plate --policy trace --episodes 20     # reference follower: the trace's own accuracy
   python evaluate_tasks.py --task sweep --policy trace --episodes 2 --video sweep.mp4
   python evaluate_tasks.py --task nail --ckpt runs/<name>/ckpt_best.pt --episodes 50
   python evaluate_tasks.py --task plate --ckpt runs/<name>/ckpt_best.pt --layout realistic   # out of distribution
+  python evaluate_tasks.py --task slice --ckpt runs/<name>/ckpt_best.pt --episodes 20 --video slice.mp4
+  python evaluate_tasks.py --task slice_tomato --ckpt runs/<name>/ckpt_best.pt --episodes 20
 """
 from __future__ import annotations
 
@@ -31,13 +34,39 @@ COLUMNS = {
               ("cleaned_l2", "medium", "{:5.1%}", 1), ("cleaned_l3", "heavy", "{:5.1%}", 1),
               ("force_deficit", "deficit", "{:5.1%}", 1), ("untouched_cells", "untouched", "{}", None),
               ("unscrubbed_cells", "unscrubbed", "{}", None)],
+    "slice": [("cut_frac", "cut", "{:5.1%}", 1), ("line_offset", "off-line", "{:4.1f}mm", 1000),
+              ("bind_deg_max", "twist", "{:4.1f}deg", 1), ("bind_offset_max", "drift", "{:4.1f}mm", 1000),
+              ("crush_depth_max", "pressed", "{:4.1f}mm", 1000), ("slice_ratio_mean", "slice ratio", "{:4.1f}", 1),
+              ("board_force", "board", "{:5.1f}N", 1), ("fail_reason", "fail", "{}", None)],
+    "slice_tomato": [("cut_frac", "cut", "{:5.1%}", 1), ("force_cut_mean", "force", "{:4.1f}N", 1),
+                     ("force_max", "peak", "{:4.1f}N", 1), ("line_offset", "off-center", "{:4.1f}mm", 1000),
+                     ("bind_deg_max", "twist", "{:4.1f}deg", 1), ("board_force", "board", "{:5.1f}N", 1),
+                     ("fail_reason", "fail", "{}", None)],
+}
+# Slice failure modes, in the order the summary lists them (metrics fail_reason).
+SLICE_FAILS = {
+    "slice": (("crushed", "crushed (pushed without slicing: velocity)"),
+              ("jammed", "jammed (blade twisted or moved sideways in the cut: orientation / position)"),
+              ("off_line", "off the line (cut too far from the mark: position)"),
+              ("board", "chopped into the board (too deep: position)"),
+              ("not_through", "not through (too shallow, or ran out of time)")),
+    "slice_tomato": (("crushed", "crushed (too much force: pressed down too steeply for the sliding, or not sliding)"),
+                     ("not_through", "not through (too little force: the edge didn't press deep enough)"),
+                     ("jammed", "jammed (blade twisted or moved sideways in the cut: orientation / position)"),
+                     ("off_line", "off center (cut too far from the middle: position)"),
+                     ("board", "chopped into the board (too deep: position)")),
 }
 SUMMARY = {"plate": ["force_err", "contact_err", "contact_speed"], "nail": ["force_err", "speed_err", "contact_err", "nail_driven"],
-           "sweep": ["cleaned", "cleaned_l1", "cleaned_l2", "cleaned_l3", "force_deficit"]}
+           "sweep": ["cleaned", "cleaned_l1", "cleaned_l2", "cleaned_l3", "force_deficit"],
+           "slice": ["cut_frac", "line_offset", "bind_deg_max", "bind_offset_max", "crush_depth_max",
+                     "slice_ratio_mean", "board_force"],
+           "slice_tomato": ["cut_frac", "force_cut_mean", "force_max", "line_offset", "bind_deg_max", "board_force"]}
 
 
 def _fmt(m: dict, key: str, fmt: str, scale) -> str:
     v = m.get(key)
+    if isinstance(v, str):
+        return v
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return "-"
     return fmt.format(v * scale if scale is not None else v)
@@ -69,6 +98,16 @@ def main():
                    help="sweep, scrub rule: sliding distance (m) needed at the adhesion force (TaskCfg.scrub_len)")
     p.add_argument("--dirt-forces", type=float, nargs="+", default=None, metavar="N",
                    help="sweep: adhesion force (N) of each dirt level, e.g. --dirt-forces 3 8 14 (TaskCfg.dirt_forces)")
+    p.add_argument("--saw-speed", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                   help="slice: range of the sawing speed along the blade, m/s (TaskCfg.saw_speed)")
+    p.add_argument("--crush-depth", type=float, default=None, metavar="M",
+                   help="slice: how far (m) the edge may press into uncut loaf without slicing (TaskCfg.crush_depth)")
+    p.add_argument("--bind-deg", type=float, default=None, metavar="DEG",
+                   help="slice: blade twist from the cut plane inside the loaf that jams it (TaskCfg.bind_deg)")
+    p.add_argument("--bind-slack", type=float, default=None, metavar="M",
+                   help="slice: sideways motion (m) of the blade inside the cut that jams it (TaskCfg.bind_slack)")
+    p.add_argument("--line-tol", type=float, default=None, metavar="M",
+                   help="slice: how far (m) from the marked line the cut may stray (TaskCfg.line_tol)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
@@ -103,6 +142,16 @@ def main():
         task_cfg.scrub_len = args.scrub_len
     if args.dirt_forces is not None:
         task_cfg.dirt_forces = tuple(args.dirt_forces)
+    if args.saw_speed is not None:
+        task_cfg.saw_speed = tuple(args.saw_speed)
+    if args.crush_depth is not None:
+        task_cfg.crush_depth = args.crush_depth
+    if args.bind_deg is not None:
+        task_cfg.bind_deg = args.bind_deg
+    if args.bind_slack is not None:
+        task_cfg.bind_slack = args.bind_slack
+    if args.line_tol is not None:
+        task_cfg.line_tol = args.line_tol
     env = TaskEnv(args.task, cfg, task_cfg, render_mode=render_mode)
     env.set_curriculum(level)
     if agent is not None and env.observation_space.shape[0] != ck["obs_dim"]:
@@ -144,7 +193,7 @@ def main():
         results.append(m)
         cols = "  ".join(f"{label} {_fmt(m, key, fmt, scale)}" for key, label, fmt, scale in COLUMNS[args.task])
         end = "timeout" if m.get("timeout") else ("diverged" if m.get("diverged") else "done")
-        if args.task == "sweep":
+        if args.task in ("sweep", "slice", "slice_tomato"):
             kps = f"keypoints {m['keypoints_passed']}/{m['keypoints']}  "
         else:  # the hit itself rarely counts as a goal-plane crossing (the target stops the head)
             kps = f"windup goals {m['windup_passed']}/{m['windup_keypoints']}  "
@@ -171,6 +220,13 @@ def main():
             force = env.task_cfg.dirt_forces[lv - 1]
             print(f"    {name:6s} ({force:4.1f} N)  mean {dirt.mean():5.1f} cells ({dirt.mean() * cell_cm2:5.0f} cm^2)  "
                   f"std {dirt.std():5.1f}  removed {done}")
+    if args.task in SLICE_FAILS:
+        print("  failures:")
+        for reason, label in SLICE_FAILS[args.task]:
+            n = sum(r["fail_reason"] == reason for r in results)
+            print(f"    {n:3d}  {label}")
+        kp = np.array([r["keypoints_passed"] / max(r["keypoints"], 1) for r in results])
+        print(f"  keypoints passed: mean {kp.mean():.1%}")
     if args.task in ("plate", "nail"):
         ff = np.array([r.get("follower_force_err", np.nan) for r in results], dtype=np.float64)
         print(f"  trace accuracy (reference follower force error): |mean| {np.nanmean(np.abs(ff)):.4f}")

@@ -150,23 +150,27 @@ Run every command from the project root.
    # same with --pose-only touch / bc_pose_touch / strike_bc_pose_touch
    ```
 
-9. **Task evaluation**: hammer a plate, hammer a nail, sweep a dirty board.
+9. **Task evaluation**: hammer a plate, hammer a nail, sweep a dirty board, slice a loaf or a cherry tomato in half.
    ```bash
    python evaluate_tasks.py --task plate --policy trace --episodes 20                   # the trace's own accuracy, ~100%
    python evaluate_tasks.py --task nail --ckpt runs/strike_bc/ckpt_best.pt --episodes 50
    python evaluate_tasks.py --task sweep --ckpt runs/strike_bc/ckpt_best.pt --episodes 20 --video sweep.mp4
+   python evaluate_tasks.py --task slice --ckpt runs/strike_bc/ckpt_best.pt --episodes 20 --video slice.mp4
+   python evaluate_tasks.py --task slice_tomato --ckpt runs/strike_bc/ckpt_best.pt --episodes 20
    ```
    See [Task evaluation](#task-evaluation) below.
 
 ## Task evaluation
 
-`tasks.py` builds three task envs on top of `PoseVelocityEnv`, each with a fixed tool and fixtures:
+`tasks.py` builds five task envs on top of `PoseVelocityEnv`, each with a fixed tool and fixtures:
 
 | task | tool | goal | success |
 |---|---|---|---|
 | `plate` | hammer (round handle, box head) | hit a plate with a target peak force | peak force within `force_tol` (15%) of the target |
 | `nail` | hammer | hit a vertical nail head, straight down, with a target peak force | the face hits the nail head first, within `nail_tol` (1.2 cm) of its axis, and the force is within 15% |
 | `sweep` | brush with a spring-loaded bristle pad | sweep a dirty patch; heavier dirt needs more force | at least 95% of the dirt (weighted by level) removed |
+| `slice` | kitchen knife (thin blade below an inline handle) | saw a loaf in half along a line marked on its top | cut through every kerf column, on the line, without crushing the loaf, jamming the knife or chopping into the board |
+| `slice_tomato` | the same knife | slice a cherry tomato in half, pressing with the right force | cut through, with the pressing force between the cut and the crush force, roughly through the middle |
 
 Each episode samples an instance and builds a **trace**: head position, tool orientation, velocity and angular velocity at every control step (`traces.Trace`). If the trace is followed exactly, the task is achieved exactly:
 
@@ -202,12 +206,39 @@ Each episode samples an instance and builds a **trace**: head position, tool ori
   - `sweep_rule = "force"` is the original rule: a cell is removed as soon as the pad pushes on it with its adhesion force, even standing still.
   - Along each stroke, the trace presses for the strongest dirt under the brush plus a 15% margin, smoothed so the requirement is never undercut.
   - Strokes run back and forth across the patch. Each starts with a `lead_in`-long run-up and ends with lift, transfer and lower moves to the next.
+- **Slice:**
+  - The loaf (12 × 6 × 5 cm) sits on a cutting board. It is made as two halves, split on the marked line, each hinged to the board at its outer bottom edge and held shut by a spring. When the cut goes through, the springs open and the halves fall apart.
+  - The trace lowers the knife over the loaf (edge down, blade in the cut plane), then saws: strokes along the blade at `saw_speed` (0.32–0.4 m/s), alternating draw and push, that descend only on their constant-speed parts. The tangential speed is at least `saw_ratio` (3) times the descent speed. The strokes keep the heel `heel_clear` outside the loaf so the hand stays clear, and the last one ends with the edge on the board. Then it lifts out.
+  - Cutting is analytic, like the dirt: the blade passes through the loaf, and every physics substep the edge is checked column by column along the cut (`kerf_cell`, 2.5 mm). The kerf is drawn as it deepens. Each kind of error has its own consequence:
+
+    | error | rule | what you see |
+    |---|---|---|
+    | velocity | the edge presses more than `crush_depth` (6 mm) into uncut loaf without slicing, i.e. with tangential speed under `cut_speed_min` (0.12 m/s) or under `slice_ratio_min` (1.5) × its speed into the loaf | **crushed**: the loaf squashes flat and turns dark |
+    | orientation | inside the loaf, the blade face turns more than `bind_deg` (10°) from the cut plane | **jammed**: the knife sticks and the arm is held where it is |
+    | position, sideways | inside the loaf, the blade moves more than `bind_slack` (4 mm) sideways in its kerf | **jammed** |
+    | position, on the line | the edge cuts more than `line_tol` (6 mm) from the marked line | **off the line**: the kerf is drawn red, and the halves stay shut |
+    | position, too deep | the blade presses more than `board_force_limit` (25 N) on the board (the follower presses ~0 N; 1.5 cm too deep gives ~35 N) | **chopped into the board**: it turns red |
+    | position, too shallow | some column isn't cut to within `through_tol` (3 mm) of the bottom | **not through**: the halves stay shut |
+
+  - Each instance is checked by running the reference follower on it, and resampled if the follower doesn't succeed.
+- **Slice tomato** (`slice_tomato`): a cherry tomato (2.5 cm) on the same board, cut with the same knife and strokes.
+  - Cutting is set by the pressing force. The tomato is a spring under the edge (`tomato_stiffness`, 500 N/m): the force is how far the edge is below the uncut surface (the skin, or the floor of the cut so far).
+    - **Too little force** (under `tomato_cut_force`, 1 N): nothing is cut; the skin only dents. A knife that rides too high, or finishes short of the board, leaves it whole or not cut through.
+    - **Enough force, sliding** (at least `cut_speed_min`): the cut deepens with the distance slid, faster the harder it presses (`tomato_cut_rate`, 0.15 m per m slid at the trace's `tomato_press_force` of 2.5 N, and 0 at the cut force).
+    - **Too much force** (`tomato_crush_force`, 4 N): the tomato bursts into a red splat, whatever the knife is doing.
+  - So the force settles where the cut keeps pace with the knife's descent. Descending too steeply for the sliding (twice the trace's slope is enough), or pressing without sliding, crushes it.
+  - The trace plans its depth with the same rule: the edge rides 5 mm (2.5 N) below the predicted floor of the cut. The reference follower cuts at about 2.1 N and peaks at about 3 N.
+  - The force isn't applied back to the knife. The arm's velocity servos give way under a few newtons, so a knife the tomato pushed back on could never press hard enough to crush it, whatever the policy did.
+  - Position matters much less than for the loaf. Any cut within `tomato_line_tol` (8 mm) of the middle halves it, and the blade only jams past `tomato_bind_deg` (30°) or `tomato_bind_slack` (2 cm), since the soft flesh doesn't bind it. The strokes reach far past the tomato on both sides, so where along the blade it is cut doesn't matter.
+  - On success the halves roll open onto their backs.
+  - The knife is held like a kitchen knife (`person_grasp`, shared with the hammer): the handle across the fingers, the blade beyond the index finger, and the edge pointing the way the knuckles do.
 - **"Followed exactly"** is defined by `traces.TraceFollower` (`--policy trace`). It tracks the trace with feedforward plus feedback, and inverts the action EMA so the smoothed command equals what it asks for. On the in-distribution layout it hits the target force to within about 1% and clears all of the dirt under the `force` rule (about 91% of episodes clear ≥95% under `scrub`, where it sometimes falls short of the force on a stroke), with about 2 mm of path error.
 
 **How a trained policy sees a trace:**
 - Policies only know single goals, so the env gives them the trace's **keypoints** one at a time, as ordinary goals in the training observation format:
   - for hammering, the head at the moment of contact, at the impact velocity;
-  - for sweeping, waypoints every 4 cm through the dirt, at the sweep speed, plus one goal in the middle of each transfer.
+  - for sweeping, waypoints every 4 cm through the dirt, at the sweep speed, plus one goal in the middle of each transfer;
+  - for slicing, waypoints every 2 cm along the constant-speed part of each stroke (12–16 per episode for the loaf, about 18 for the tomato), at the sawing velocity: along ± the blade (the head axis), tilted slightly down.
 - The env advances to the next keypoint when the head crosses the current one's goal plane. It resets the per-goal clock each time, so the time-remaining input looks like training.
 - An episode ends when the task is done, after 20 s, or when a keypoint isn't reached within `EnvCfg.max_steps`.
 
@@ -216,7 +247,8 @@ Each episode samples an instance and builds a **trace**: head position, tool ori
   - Plate instances are built from the tool pose at a random arm configuration near the current one, like weld goal sampling, so the strike is reachable and within `GoalCfg.min_dir_z`. The plate is placed so the hammer face meets it there.
   - The nail always stands vertical, like a standard nailing task. Its block sits on a platform that puts the hammer head at a training goal height at contact (`TaskCfg.nail_height`, 15–28 cm above the table, so the top of the windup is still reachable and inside the goal heights). The strike is straight down. Training covers that since `GoalCfg.min_dir_z` became −1 with `down_frac` (checkpoints trained with the old −0.5 never saw it).
   - The sweep board is raised 12 cm.
-- `realistic` lays the plate flat on the table and puts the nail block directly on the table, both struck straight down, and sweeps a mat on the tabletop. This is out of distribution for the current policies.
+  - The slice board stands on a platform 12–20 cm above the table (`slice_height`), so the blade center stays inside the goal heights.
+- `realistic` lays the plate flat on the table and puts the nail block directly on the table, both struck straight down, sweeps a mat on the tabletop, and puts the cutting board on the table. This is out of distribution for the current policies.
 
 Every task episode starts from home with a new grasp (`TaskCfg.rehome_each_episode`). Settings are in `TaskCfg` in `config.py`.
 
@@ -232,6 +264,15 @@ Every task episode starts from home with a new grasp (`TaskCfg.rehome_each_episo
   - the fraction cleaned, overall and per dirt level;
   - the mean force shortfall on cells that were touched but never pressed hard enough;
   - `unscrubbed`: cells pressed hard enough but not slid across far enough (scrub rule only).
+- **Slice:**
+  - `cut`: the fraction of the cut depth reached, over the columns;
+  - `off-line`: the farthest the edge cut from the marked line;
+  - `twist` and `drift`: the largest blade angle to the cut plane, and the largest sideways motion, inside the loaf;
+  - `pressed`: the deepest the edge pressed into uncut loaf without slicing;
+  - `slice ratio`: the mean ratio of tangential speed to speed into the loaf while cutting;
+  - `board`: the peak force of the blade on the board;
+  - `fail`: what ended the attempt. The summary counts each failure mode.
+- **Slice tomato:** `cut`, `force` (the mean pressing force while cutting), `peak` (the largest pressing force), `off-center`, `twist`, `board` and `fail`.
 - **Path:** the mean distance from the head to the trace's path, ignoring timing. It includes the approach, where a policy takes its own route.
 
 ## Command-line flags
@@ -317,7 +358,7 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 
 | flag | default | description |
 |---|---|---|
-| `--task {plate,nail,sweep}` | required | Which task |
+| `--task {plate,nail,sweep,slice,slice_tomato}` | required | Which task |
 | `--ckpt CKPT` | none | Checkpoint to load (weld grip and `head_twist` only); the env config and curriculum level are taken from it |
 | `--policy {ckpt,trace,zero}` | `ckpt` if `--ckpt` is given, else `trace` | `trace` is the reference trace follower |
 | `--episodes N` | `10` | Number of episodes |
@@ -331,6 +372,11 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 | `--sweep-rule {scrub,force}` | from config | How sweep dirt comes off (`TaskCfg.sweep_rule`) |
 | `--scrub-len M` | from config | Scrub rule: sliding distance needed at the adhesion force (`TaskCfg.scrub_len`) |
 | `--dirt-forces N [N ...]` | from config | Adhesion force of each dirt level (`TaskCfg.dirt_forces`) |
+| `--saw-speed LO HI` | from config | Slice: range of the sawing speed along the blade, m/s (`TaskCfg.saw_speed`) |
+| `--crush-depth M` | from config | Slice: how far the edge may press into uncut loaf without slicing (`TaskCfg.crush_depth`) |
+| `--bind-deg DEG` | from config | Slice: blade angle to the cut plane, inside the loaf, that jams the knife (`TaskCfg.bind_deg`) |
+| `--bind-slack M` | from config | Slice: sideways motion inside the cut that jams the knife (`TaskCfg.bind_slack`) |
+| `--line-tol M` | from config | Slice: how far from the marked line the cut may stray (`TaskCfg.line_tol`) |
 | `--seed N` | `0` | Seed |
 | `--device DEVICE` | `cpu` | Torch device for the policy |
 
@@ -359,7 +405,7 @@ Weld grip and `head_twist` actions only (the oracle needs both). It writes `runs
 | `oracle.py` | The scripted `Oracle` strike (privileged), used by `evaluate.py --policy oracle` and as the `bc.py` expert |
 | `bc.py` | DAgger behavior cloning of the oracle into the actor, as an initialization for `train.py --init-from` |
 | `traces.py` | Reference traces (head pose and velocity over time), their segment builders, and the `TraceFollower` |
-| `tasks.py` | `TaskEnv` and the plate, nail and sweep tasks: fixtures, instance sampling, trace calibration, metrics |
+| `tasks.py` | `TaskEnv` and the plate, nail, sweep, slice and slice_tomato tasks: fixtures, instance sampling, trace calibration, metrics |
 | `evaluate_tasks.py` | Task evaluation: per-episode metrics and a summary, viewer, video, trace export |
 
 ## How an episode works
