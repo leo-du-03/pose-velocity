@@ -57,13 +57,18 @@ SLICE_FAILS = {
                      ("off_line", "off center (cut too far from the middle: position)"),
                      ("board", "chopped into the board (too deep: position)")),
 }
-SUMMARY = {"plate": ["force_err", "contact_err", "contact_speed"], "nail": ["force_err", "speed_err", "contact_err", "nail_driven"],
-           "sweep": ["cleaned", "cleaned_l1", "cleaned_l2", "cleaned_l3", "force_deficit"],
-           "slice": ["cut_frac", "line_offset", "bind_deg_max", "bind_offset_max", "crush_depth_max",
-                     "slice_ratio_mean", "board_force"],
-           "slice_tomato": ["cut_frac", "force_cut_mean", "force_max", "line_offset", "bind_deg_max", "board_force"]}
 # Metrics summarized over episodes, each with the unit to print it in (metrics are stored as fractions and meters)
-UNITS = {"%": 100, "cm": 100, "mm": 1000, "m/s": 1, "deg": 1, "N": 1}
+SUMMARY = {"plate": [("force_err", "%"), ("force_diff", "N"), ("speed_err", "%"), ("speed_diff", "m/s"),
+                     ("contact_speed", "m/s"), ("contact_err", "cm")],
+           "nail": [("force_err", "%"), ("force_diff", "N"), ("speed_err", "%"), ("speed_diff", "m/s"),
+                    ("contact_speed", "m/s"), ("contact_err", "cm"), ("nail_driven", "mm")],
+           "sweep": [("cleaned", "%"), ("cleaned_l1", "%"), ("cleaned_l2", "%"), ("cleaned_l3", "%"),
+                     ("force_deficit", "%")],
+           "slice": [("cut_frac", "%"), ("line_offset", "mm"), ("bind_deg_max", "deg"), ("bind_offset_max", "mm"),
+                     ("crush_depth_max", "mm"), ("slice_ratio_mean", ""), ("board_force", "N")],
+           "slice_tomato": [("cut_frac", "%"), ("force_cut_mean", "N"), ("force_max", "N"), ("line_offset", "mm"),
+                            ("bind_deg_max", "deg"), ("board_force", "N")]}
+UNITS = {"%": 100, "cm": 100, "mm": 1000, "m/s": 1, "deg": 1, "N": 1, "": 1}
 
 
 def _add_diffs(m: dict) -> None:
