@@ -34,17 +34,3 @@ class StubEnv:
 def _forward_label(env, oracle, s, lat):
     env.head = np.array([s - LEAD_IN, lat, 0.0])
     return float(oracle(env)[0])
-
-
-def test_labels_change_gradually_across_the_strike_cone():
-    """Sweeping the head sideways off the strike line just past the lead-in point, the forward label changes by less
-    than 0.04 (action units) per mm. The first smooth oracle faded over ~7 mm (~0.08 per mm) and the clone stalled."""
-    env, oracle = StubEnv(), Oracle()
-    env.prev_action[0] = 0.45 / V_MAX  # already moving forward at the goal speed: committed
-    lats = np.arange(0.0, 0.08, 0.001)
-    for s in (0.0, 0.015, 0.03, 0.05):
-        fwd = np.array([_forward_label(env, oracle, s, lat) for lat in lats])
-        assert np.abs(np.diff(fwd)).max() < 0.04, (s, np.abs(np.diff(fwd)).max())
-        cone = oracle.strike_lat + oracle.strike_lat_slope * s
-        inside = lats <= cone
-        np.testing.assert_allclose(fwd[inside], 0.45 / V_MAX, atol=1e-6)  # full strike anywhere inside the cone

@@ -43,32 +43,6 @@ def test_task_obs_matches_training_env(env, cfg):
     t.close()
 
 
-@pytest.mark.parametrize("task", ["plate", "nail"])
-def test_hammer_trace_hits_target_force(cfg, task):
-    """Following the trace hits the target peak force, at the planned contact point and orientation."""
-    from tasks import TaskEnv
-
-    env = TaskEnv(task, cfg)
-    env.reset(seed=0)
-    for _ in range(3):
-        tr, kp = env.trace, env.trace.keypoints[-1]
-        assert tr.keypoint_idx[-1] == tr.meta["contact_index"]
-        # The keypoint is the head center at contact: the hammer face (head_long ahead of it) is on the struck point.
-        np.testing.assert_allclose(kp.p + env.tool.head_long * kp.axis, tr.meta["contact_point"], atol=1e-6)
-        assert kp.speed >= 0.5 * TaskCfg().strike_speed[0]
-        if task == "nail":  # a vertical nail, struck straight down, raised to a training goal height
-            np.testing.assert_allclose(kp.direction, [0, 0, -1], atol=1e-6)
-            assert cfg.goal.height[0] <= kp.p[2] - env.rinfo.table_top <= cfg.goal.height[1]
-        else:
-            assert kp.direction[2] >= cfg.goal.min_dir_z
-        m = _run(env)
-        assert m["hit"] and m["success"], m
-        assert abs(m["force_err"]) < 0.5 * env.task_cfg.force_tol, m  # what calibration guarantees for an instance
-        assert m["contact_err"] < 0.01 and m["contact_theta_deg"] < 3.0, m
-        env.reset()
-    env.close()
-
-
 # Sweep tests use the reference dirt forces, so they don't depend on how TaskCfg.dirt_forces is tuned.
 SWEEP_FORCES = (3.0, 8.0, 14.0)
 

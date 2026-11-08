@@ -481,10 +481,13 @@ class PoseVelocityEnv(gym.Env):
         J = self._head_jacobian()
         twist = np.concatenate([a[:3] * self.cfg.head_v_max, a[3:6] * self.cfg.head_w_max])
         lam2 = self.cfg.ik_damping ** 2
-        dq = J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), twist)
-        dq = np.clip(dq, -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
         self._ik_J, self._ik_twist = J, twist  # for _ik_residual, after the targets are clipped to the joint limits
-        return d.qpos[self.arm_qadr] + dq * self.arm_lead
+        return J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), twist)
+
+    def _head_twist_targets(self, a: np.ndarray) -> np.ndarray:
+        """Arm targets that drive the head (as a point rigidly attached to the palm) at the commanded twist."""
+        dq = np.clip(self._twist_dq(a), -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
+        return self.data.qpos[self.arm_qadr] + dq * self.arm_lead
 
     def _ik_residual(self) -> float:
         """How far the clipped arm targets fall short of the commanded head twist, in action units (the linear part
@@ -740,7 +743,9 @@ class PoseVelocityEnv(gym.Env):
             self.targets[na:] = self.targets[na:] + a[na:] * self.act_scale[na:]
         self.targets = np.clip(self.targets, self.ctrl_lo, self.ctrl_hi)
         self.data.ctrl[self.act_ids] = self.targets
-        self.ik_error = self._ik_residual() if cfg.action_mode == "head_twist" else 0.0
+        # The arm joints when these targets were set: prev_twist reads the commanded joint velocity off them.
+        self._ctrl_ref = (self.targets[:na].copy(), self.data.qpos[self.arm_qadr].copy())
+        self.ik_error =self._ik_residual() if cfg.action_mode == "head_twist" else 0.0
         return a
 
     def _physics_step(self) -> None:
