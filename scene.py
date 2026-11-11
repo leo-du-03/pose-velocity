@@ -196,12 +196,14 @@ def build_base_spec(cfg: SceneCfg):
     offset = mu.rotate(user_quat, auto_pos) + np.asarray(cfg.hand_mount_pos, dtype=np.float64)
     mount_pos = site_pos + mu.rotate(site_quat, offset)
     frame = _find_body(arm, site_body).add_frame(pos=list(mount_pos), quat=list(mount_quat))
+    # Set the solver options on both specs before attaching: the LEAP MJCF sets its own
+    # cone/impratio, and attach() warns when parent and child options disagree.
+    for s in (arm, hand):
+        s.option.timestep = cfg.timestep
+        s.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+        s.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+        s.option.impratio = cfg.impratio
     arm.attach(hand, frame=frame, prefix=HAND_PREFIX)
-
-    arm.option.timestep = cfg.timestep
-    arm.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
-    arm.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
-    arm.option.impratio = cfg.impratio
     if cfg.gravcomp:
         for b in _all_bodies(arm):
             if b.name != "world":

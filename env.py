@@ -32,6 +32,7 @@ info["priv"] on every reset/step.
 from __future__ import annotations
 
 import functools
+import threading
 from typing import Optional
 
 import gymnasium as gym
@@ -78,6 +79,7 @@ class PoseVelocityEnv(gym.Env):
         self.data: Optional[mujoco.MjData] = None
         self._viewer = None
         self._viewer_model = None
+        self._viewer_thread: Optional[threading.Thread] = None
         self._renderer = None
         self._render_model = None
         self._forced_reset_kind: Optional[str] = "full"
@@ -1018,10 +1020,13 @@ class PoseVelocityEnv(gym.Env):
             from mujoco import viewer  # `import mujoco.viewer` here would shadow the module-level mujoco
 
             if self._viewer is not None and (self._viewer_model is not self.model or not self._viewer.is_running()):
-                self._viewer.close()
-                self._viewer = None
+                self._close_viewer()
             if self._viewer is None:
+                before = set(threading.enumerate())
                 self._viewer = viewer.launch_passive(self.model, self.data)
+                # launch_passive runs the GUI in an un-joined daemon thread; keep it so close() can wait for it.
+                new = [t for t in threading.enumerate() if t not in before]
+                self._viewer_thread = new[0] if new else None
                 self._viewer_model = self.model
                 cam = self._camera()
                 self._viewer.cam.lookat[:] = cam.lookat
@@ -1040,10 +1045,18 @@ class PoseVelocityEnv(gym.Env):
             return self._renderer.render()
         return None
 
-    def close(self):
+    def _close_viewer(self):
+        # Handle.close() only requests an exit. Wait for the render thread to finish tearing down its
+        # GL context, otherwise glfw.terminate() (an atexit hook) can run concurrently and segfault.
         if self._viewer is not None:
             self._viewer.close()
             self._viewer = None
+        if self._viewer_thread is not None:
+            self._viewer_thread.join(timeout=5.0)
+            self._viewer_thread = None
+
+    def close(self):
+        self._close_viewer()
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
