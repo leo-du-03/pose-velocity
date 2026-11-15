@@ -292,7 +292,10 @@ Defaults marked `PPOCfg` come from `config.py`.
 | `--epochs N` | `5` (`PPOCfg.epochs`) | PPO epochs per update |
 | `--eval-envs K` | `2` | Envs that act deterministically and stay out of the PPO batch. Their success drives the curriculum and `ckpt_best`; 0 uses the stochastic training episodes instead |
 | `--grip-mode {weld,physical}` | `weld` (`EnvCfg.grip_mode`) | Weld the tool to the palm (Stage A) or grasp it physically (Stage B). Also overrides a resumed checkpoint's config |
-| `--action-mode {head_twist,joint}` | `head_twist` (`EnvCfg.action_mode`) | Arm actions as a head velocity command, or as joint-target changes. Also overrides a resumed checkpoint's config |
+| `--action-mode {head_twist,joint,joint_vel}` | `head_twist` (`EnvCfg.action_mode`) | Arm actions as a head velocity command, as joint-target changes, or as joint velocities. Also overrides a resumed checkpoint's config |
+| `--joint-v-max V×6` | `2 2 2.5 3 3 3` (`EnvCfg.joint_v_max`) | `joint_vel`: rad/s per arm joint at action 1 |
+| `--no-kin-obs` | off | `joint_vel`: leave the Jacobian-projected goal errors out of the observation (`EnvCfg.kin_obs`) |
+| `--init-log-std L` | `PPOCfg.init_log_std` (`-2`; `-2.4` for `joint_vel`), or the checkpoint's | Set the actor's log std at the start of a new run (also after `--init-from`) |
 | `--seed N` | `0` | Seed for torch, numpy and the envs (env `i` gets `seed*1000 + i`) |
 | `--level L` | `0.0` | Initial curriculum level, from 0 to 1 |
 | `--fixed-level` | off | Disable the automatic curriculum and stay at `--level` |
@@ -318,8 +321,10 @@ Defaults marked `PPOCfg` come from `config.py`.
 | `--ckpt CKPT` | none | Checkpoint to load; the env config and curriculum level are taken from it |
 | `--policy {ckpt,random,zero,oracle}` | `ckpt` if `--ckpt` is given, else `random` | Which policy drives the robot. `oracle` is the scripted strike (weld grip; converted to joint actions in `joint` mode) |
 | `--grip-mode {weld,physical}` | from checkpoint, else `config.py` | Grip mode override |
-| `--action-mode {head_twist,joint}` | from checkpoint, else `config.py` | Action mode override |
+| `--action-mode {head_twist,joint,joint_vel}` | from checkpoint, else `config.py` | Action mode override |
 | `--arm-action-scale S` | from checkpoint, else `config.py` | Joint mode: rad per step at action 1 |
+| `--joint-v-max V×6` | `2 2 2.5 3 3 3` (`EnvCfg.joint_v_max`) | `joint_vel`: rad/s per arm joint at action 1 |
+| `--no-kin-obs` | off | `joint_vel`: leave the Jacobian-projected goal errors out of the observation (`EnvCfg.kin_obs`) |
 | `--episodes N` | `5` | Number of episodes |
 | `--render {none,human,rgb_array}` | `none` | Render mode; `human` opens the viewer |
 | `--video PATH` | none | Write an mp4 (implies `--render rgb_array`) |
@@ -332,7 +337,7 @@ Defaults marked `PPOCfg` come from `config.py`.
 
 ### `bc.py`
 
-Weld grip only (the oracle needs it). With `--action-mode joint` the oracle's head-twist labels are converted to joint actions (see "Joint actions" above). It writes `runs/<name>/bc_latest.pt` after every round.
+Weld grip only (the oracle needs it). With `--action-mode joint` or `joint_vel` the oracle's head-twist labels are converted to joint actions (see "Model inputs and outputs"). For a joint-space policy, `joint_vel` is the one that clones well. It writes `runs/<name>/bc_latest.pt` after every round.
 
 | flag | default | description |
 |---|---|---|
@@ -351,8 +356,10 @@ Weld grip only (the oracle needs it). With `--action-mode joint` the oracle's he
 | `--recent-rounds N` | `10` | The newest N rounds of data form the "recent" pool |
 | `--recent-frac F` | `0.5` | Fraction of each batch drawn from the recent pool; the rest comes from the whole dataset |
 | `--levels LO HI` | `0 1` | Curriculum levels the envs are spread over |
-| `--action-mode {head_twist,joint}` | `head_twist` (`EnvCfg.action_mode`) | Action space of the cloned policy |
+| `--action-mode {head_twist,joint,joint_vel}` | `head_twist` (`EnvCfg.action_mode`) | Action space of the cloned policy |
 | `--arm-action-scale S` | `0.03` (`EnvCfg.arm_action_scale`) | Joint mode: rad per step at action 1 (0.1 recommended) |
+| `--joint-v-max V×6` | `2 2 2.5 3 3 3` (`EnvCfg.joint_v_max`) | `joint_vel`: rad/s per arm joint at action 1 |
+| `--no-kin-obs` | off | `joint_vel`: leave the Jacobian-projected goal errors out of the observation (`EnvCfg.kin_obs`) |
 | `--seed N` | `0` | Seed |
 | `--serial` | off | Run envs in the main process |
 | `--logdir DIR`, `--name NAME` | `runs`, `bc_<timestamp>` | Output directory |
@@ -364,6 +371,7 @@ Weld grip only (the oracle needs it). With `--action-mode joint` the oracle's he
 | `--task {plate,nail,sweep,slice,slice_tomato}` | required | Which task |
 | `--ckpt CKPT` | none | Checkpoint to load (weld grip and `head_twist` only); the env config and curriculum level are taken from it |
 | `--policy {ckpt,trace,zero}` | `ckpt` if `--ckpt` is given, else `trace` | `trace` is the reference trace follower |
+| `--action-mode {head_twist,joint_vel}` | `config.py` | `trace` / `zero` only: the action space to run in (a checkpoint carries its own; both modes are supported). Calibration always runs the follower in `head_twist`, so the same `--seed` gives the same task instances in both modes |
 | `--episodes N` | `10` | Number of episodes |
 | `--layout {in_dist,realistic}` | `in_dist` | Fixture placement (see [Task evaluation](#task-evaluation)) |
 | `--level L` | from checkpoint, else `1` | Curriculum level; only sets the success tolerances in the observation |
@@ -442,6 +450,7 @@ An episode is one goal, which gets one attempt.
 - **Action (6 values in [-1, 1] with weld; 22 with physical grip):**
   - Arm, `head_twist` (default): the head's linear velocity (up to 0.8 m/s) and angular velocity (up to 2.5 rad/s). Damped least squares maps this to joint velocities `dq`. The servo target is set to `q + (kv/kp)·dq`, which turns the UR5e's PD position servos into velocity servos.
   - Arm, `joint`: changes to the joint-position targets, up to `arm_action_scale` (0.03 rad) per step.
+  - Arm, `joint_vel`: joint velocities, up to `joint_v_max` (2, 2, 2.5, 3, 3, 3 rad/s). The servo target is `q + (kv/kp)·dq`, the same velocity servo as `head_twist` but with no IK at runtime. The oracle's labels are its head twist mapped through the damped pseudo-inverse of the head Jacobian. They are smooth in the state: there is no EMA inversion and hardly any clipping, unlike `joint`, whose action is effectively a joint acceleration. Exploration starts at log std −2.4, which gives the same head-velocity noise as `head_twist` at −2.
   - Hand (physical grip only): changes to 16 joint targets, up to 0.08 rad per step.
   - Actions are smoothed with an EMA (`action_ema = 0.8`). The smoothed action is what goes into the observation.
   - Exploration noise starts at std 0.135 (`init_log_std = −2`). Together with the EMA, that's about 0.05 m/s of head-velocity noise per axis. At the earlier settings (std 0.37, EMA 0.5) the noise was about 0.15 m/s per axis, and even the scripted oracle succeeded only 5% of the time with it added.
@@ -453,6 +462,7 @@ An episode is one goal, which gets one attempt.
   - the current success tolerances, and time remaining.
   - Physical grip adds hand joints, fingertip positions, contact flags and grasp flags.
   - `joint` actions add the arm servo targets' lead over the joints (`targets − q`).
+  - `joint_vel` actions add the goal errors in joint space (`kin_obs`, 30 values): the damped pseudo-inverse of the head Jacobian, over `joint_v_max`, applied to the offset to the lead-in point, the goal velocity, the offset from the strike line, the velocity error, and the orientation error. The oracle's joint velocity is nearly a weighted sum of these, so the policy learns the weighting rather than the IK. All of them can be computed on a real robot from its kinematics and the grasp.
 - **Critic-only inputs** (`info["priv"]`): tool mass, center of mass and friction; contact forces; closest distance so far; curriculum level.
 - **Networks:**
   - Actor: MLP 512-256-128 (ELU) with a Gaussian output.

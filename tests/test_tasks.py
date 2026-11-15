@@ -428,3 +428,101 @@ def test_tomato_tolerates_position_errors_the_loaf_doesnt(cfg):
     assert m["success"], m
     assert m["line_offset"] > env.task_cfg.line_tol  # the loaf's tolerance
     env.close()
+
+
+def test_flick_egg_settles_in_cradle(cfg):
+    """The episode starts with the spatula (nearly) flat and the egg at rest in its cradle; holding still keeps it
+    there and never releases it."""
+    from tasks import SPATULA_UP, TaskEnv
+
+    env = TaskEnv("flick", cfg)
+    env.reset(seed=0)
+    task = env.task
+    up = mu.rotate(env._tool_quat(), SPATULA_UP)
+    assert np.degrees(np.arccos(up[2])) < env.task_cfg.flick_start_pitch_deg + 2.0
+    p, v = task._egg(env)
+    assert np.linalg.norm(task._egg_rel(env, p)) < 0.003 and np.linalg.norm(v) < 0.01
+    for _ in range(50):
+        env.step(np.zeros(env.action_space.shape))
+    p, v = task._egg(env)
+    assert np.linalg.norm(task._egg_rel(env, p)) < 0.005 and not task.st["released"] and task.st["fail"] is None
+    env.close()
+
+
+def test_flick_trace_lands_in_bowl(cfg):
+    """The reference follower flicks the egg into the bowl. The keypoints are dense and training-like (speed, height),
+    and the trace starts flat, pitches tip-up during the launch, and stays within the angular speed limit."""
+    from tasks import SPATULA_UP, TaskEnv
+
+    env = TaskEnv("flick", cfg)
+    env.set_curriculum(1.0)
+    env.reset(seed=1)
+    tc, gc = env.task_cfg, cfg.goal
+    for _ in range(3):
+        tr = env.trace
+        kp = np.array([g.p for g in tr.keypoints])
+        assert len(kp) >= 8
+        # Every flick_kp_every steps, except across the turn at the release (no goals while the velocity turns).
+        steps = np.diff(tr.keypoint_idx)
+        gaps = np.linalg.norm(np.diff(kp, axis=0), axis=1)
+        dense = steps <= tc.flick_kp_every
+        assert (~dense).sum() <= 1 and steps.max() <= tc.flick_drop_steps + 4
+        assert gaps[dense].max() < 0.025
+        for g in tr.keypoints:
+            assert gc.speed_min - 1e-6 <= g.speed <= cfg.curriculum.speed_max[1] + 1e-6
+            assert gc.height[0] <= g.p[2] - env.rinfo.table_top <= gc.height[1]
+        tilt = lambda q: np.degrees(np.arccos(mu.rotate(q, SPATULA_UP)[2]))  # noqa: E731
+        assert tilt(tr.quat[0]) < tc.flick_start_pitch_deg + 2.0
+        k_rel = tr.meta["release_index"]
+        assert tilt(tr.quat[k_rel]) - tilt(tr.quat[0]) == pytest.approx(tr.meta["pitch_deg"], abs=0.5)
+        assert np.linalg.norm(tr.w, axis=1).max() <= cfg.head_w_max
+        m = _run(env)
+        assert m["success"] and m["released"] and m["land_err"] < 0.02, m
+        assert m["keypoints_passed"] == m["keypoints"], m
+        assert m["bowl_dist"] > 0.05  # a throw, not a drop
+        env.reset()
+    env.close()
+
+
+def test_flick_zero_policy_doesnt_release(cfg):
+    from tasks import TaskEnv
+
+    env = TaskEnv("flick", cfg)
+    env.reset(seed=2)
+    m = _run(env, lambda: np.zeros(env.action_space.shape))
+    assert not m["success"] and m["fail_reason"] == "not_released", m
+    env.close()
+
+
+def test_flick_obs_matches_training_env(cfg):
+    from env import PoseVelocityEnv
+    from tasks import TaskEnv
+
+    t = TaskEnv("flick", cfg)
+    e = PoseVelocityEnv(cfg)
+    assert t.observation_space.shape == e.observation_space.shape
+    assert t.action_space.shape == e.action_space.shape
+    t.close()
+    e.close()
+
+
+def test_joint_vel_task_env_calibrates_like_head_twist(cfg):
+    """A joint_vel TaskEnv calibrates in head_twist (TaskEnv.rollout), so the same seed gives the same instance and
+    force target as in head_twist; afterwards the env is back in joint_vel with its own observation."""
+    import dataclasses
+
+    from tasks import TaskEnv
+
+    envs = {m: TaskEnv("plate", dataclasses.replace(cfg, action_mode=m), TaskCfg()) for m in ("head_twist", "joint_vel")}
+    for e in envs.values():
+        e.set_curriculum(1.0)
+        e.reset(seed=3)
+    h, j = envs["head_twist"], envs["joint_vel"]
+    assert j.cfg.action_mode == "joint_vel"
+    assert j.trace.meta["force_target"] == pytest.approx(h.trace.meta["force_target"], rel=1e-9)
+    np.testing.assert_allclose(j.trace.p, h.trace.p, atol=1e-12)
+    obs, *_ = j.step(j.trace_action())
+    assert obs.shape == j.observation_space.shape
+    assert j.observation_space.shape[0] == h.observation_space.shape[0] + 30  # kin_obs
+    for e in envs.values():
+        e.close()

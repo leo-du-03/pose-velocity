@@ -136,8 +136,16 @@ class EnvCfg:
     # controlled (Stage A: learn the strike). "physical": the tool must be grasped and held by the hand.
     grip_mode: str = "weld"
     # "head_twist": arm actions are the tool head's linear + angular velocity, mapped to joints by damped
-    # least squares. "joint": arm actions are changes to the joint-position targets.
+    # least squares. "joint": arm actions are changes to the joint-position targets. "joint_vel": arm actions are
+    # joint velocities (a * joint_v_max), the servo targets set to q + lead * dq (the velocity servo head_twist uses,
+    # without the IK).
     action_mode: str = "head_twist"
+    # joint_vel: rad/s per arm joint at action 1. About the oracle's 99.5th percentile per joint, capped at
+    # max_joint_speed (head_twist clips there too).
+    joint_v_max: Tuple[float, ...] = (2.0, 2.0, 2.5, 3.0, 3.0, 3.0)
+    # joint_vel only (older joint / head_twist observations stay unchanged): add the goal errors mapped into joint space by the damped pseudo-inverse of the head
+    # Jacobian (PoseVelocityEnv._kin_features), so the policy doesn't have to learn the IK itself.
+    kin_obs: bool = True
     # False: pose-only baseline. Goals are sampled as usual but their velocity is neither observed nor scored.
     # Kept in EnvCfg (not RewardCfg) so it travels with checkpoints through train.py --init-from.
     goal_velocity: bool = True
@@ -324,6 +332,70 @@ class TaskCfg:
     tomato_line_tol: float = 0.008
     tomato_bind_deg: float = 30.0
     tomato_bind_slack: float = 0.02
+    # --- flick: toss an egg off a spatula into a bowl
+    # Spatula: round handle, thin flat blade in line with it (half sizes: along the handle, across it, thickness).
+    spatula_handle_len: float = 0.22
+    spatula_blade_half: Tuple[float, float, float] = (0.055, 0.04, 0.002)
+    spatula_grasp_from_end: float = 0.05
+    spatula_friction: float = 0.1
+    # Cradle on the blade's top face: a horseshoe of capsules (a ring with the cradle_open_deg towards the tip left
+    # out), cradle_offset towards the tip from the blade center. Its radius lets the egg rest on the blade with the
+    # capsules as stops behind and beside it (cradle_clearance beyond touching them); the egg leaves over the open front.
+    cradle_offset: float = 0.04
+    cradle_tube: float = 0.003
+    cradle_segments: int = 8
+    cradle_open_deg: float = 200.0  # only the three capsules behind the egg remain (sideways loads are small)
+    cradle_clearance: float = 0.001
+    # The egg: a free sphere. condim 6 (rolling friction) so it stops rolling in the bowl.
+    egg_radius: float = 0.02
+    egg_mass: float = 0.05
+    # Slick on the spatula (the pair's friction is the larger of the two geoms', and the spatula's is spatula_friction),
+    # so the egg slides off at the release rather than rolling (a rolling ball would lose 2/7 of the blade's
+    # deceleration); the bowl's own friction (1) and the rolling friction stop it in the bowl.
+    egg_friction: Tuple[float, float, float] = (0.1, 0.005, 0.0005)
+    egg_solref: Tuple[float, float] = (0.005, 1.0)
+    flick_start_pitch_deg: float = 3.0  # the start pose's tip is this far above flat (against the arm's sag)
+    egg_settle: float = 0.5  # s the egg settles in the cradle (spatula flat, arm held) before the trace starts
+    # Bowl on the table: inner radius, wall height, wall half thickness, floor thickness, number of wall segments.
+    bowl_radius: float = 0.07
+    bowl_height: float = 0.045
+    bowl_wall: float = 0.004
+    bowl_floor: float = 0.012  # thickness
+    bowl_segments: int = 16
+    bowl_region: Tuple[Tuple[float, float], Tuple[float, float]] = ((0.5, 0.72), (-0.22, 0.22))  # table (u, w)
+    # Throw: the spatula launches from rest along its blade (towards the tip and the bowl) at flick_speed
+    # (<= CurriculumCfg.speed_max so the keypoints are training-like), released with the head at flick_release_height
+    # above the table (in GoalCfg.height). While launching it pitches tip-up by flick_pitch_deg (a wrist flick;
+    # min-jerk, back to zero angular speed at the release, peak <= flick_w_max), and the launch runs along the blade's
+    # direction at the release, so the egg leaves the tip at about that elevation.
+    flick_speed: Tuple[float, float] = (0.45, 0.55)
+    flick_release_height: Tuple[float, float] = (0.22, 0.34)
+    flick_pitch_deg: Tuple[float, float] = (6.0, 12.0)
+    flick_w_max: float = 2.0
+    flick_accel_len: float = 0.06  # m spent accelerating
+    flick_const_len: float = 0.05  # m at constant speed before the release
+    # Release: in flick_drop_steps control steps the spatula's velocity goes from the launch velocity to
+    # flick_back_speed back along the handle plus flick_drop_speed back along its own normal. The egg keeps going: it
+    # rolls forward out of the cradle's open front and off the tip at about the launch velocity (the drop unloads the
+    # blade, so little of that is lost to the rolling). The spatula keeps that velocity for flick_retract_time, then
+    # stops over flick_stop_time.
+    flick_drop_speed: float = 0.3
+    flick_back_speed: float = 0.5
+    flick_drop_steps: int = 3
+    flick_retract_time: float = 0.08
+    flick_stop_time: float = 0.25
+    flick_unpitch_time: float = 0.5  # s back to flat after the stop
+    # Control steps between keypoints (on every sample at or above GoalCfg.speed_min). 1 would put them a step's travel
+    # apart: a lagging head then crosses two goal planes in one step, and TaskEnv only checks the current one.
+    flick_kp_every: int = 2
+    flick_heading_deg: float = 30.0  # throw heading within this of the direction from the robot base to the bowl
+    # Calibration: follower rollouts; the path is shifted by the landing error until within flick_aim_tol.
+    flick_calib_iters: int = 4
+    flick_aim_tol: float = 0.015
+    egg_release_time: float = 0.02  # s out of contact with the spatula -> released (its velocity: at the last contact)
+    egg_rest_speed: float = 0.05  # m/s: the egg counts as at rest below this
+    egg_rest_time: float = 0.2  # s at rest inside the bowl -> success
+    flick_timeout: float = 2.0  # s after the throw (or the last keypoint) before the episode ends undecided
     # --- reference trace follower (traces.TraceFollower)
     k_pos: float = 8.0
     k_rot: float = 6.0
@@ -355,5 +427,8 @@ class PPOCfg:
     # exp(-2) = 0.135. With head_twist actions (0.8 m/s at action 1) and action_ema 0.8 this is ~0.05 m/s of
     # velocity noise per axis; at -1.0 it was ~0.15 m/s, which kept even a perfect policy under 5% success.
     init_log_std: float = -2.0
+    # joint_vel actions (EnvCfg.joint_v_max at action 1): the same ~0.019 m/s of one-step head-velocity noise as
+    # head_twist at -2.0 (-2.0 here is 1.7x that, and the noisy oracle falls from ~90% to ~45%).
+    init_log_std_joint_vel: float = -2.4
     scale_rewards: bool = True
     save_every: int = 50  # iterations

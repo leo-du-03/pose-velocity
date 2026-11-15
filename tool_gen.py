@@ -60,6 +60,7 @@ class ToolParams:
     # Box heads only: a crowned striking face. A massless ellipsoid cap over the head's +x face, as wide as the face,
     # bulging face_crown (m) beyond it at the center; 0: the flat box face.
     face_crown: float = 0.0
+    cradle: Optional["CradleParams"] = None  # spatulas only: a ring of capsules on the blade that seats a ball (tasks.py)
 
     def features(self) -> np.ndarray:
         f = np.concatenate([
@@ -119,6 +120,20 @@ class PadParams:
     damping: float  # N s/m
     travel: float  # m of compression before the joint limit
     friction: float
+
+
+@dataclass
+class CradleParams:
+    """A ring of capsules lying on a flat face of the head: a cradle that seats a ball (spatula + egg in tasks.py).
+    The ring's capsules are the edges of a regular n-gon whose edges are tangent to a circle of radius ring_radius;
+    the edges within open_deg / 2 of open_dir are left out (a horseshoe, open that way)."""
+    center: np.ndarray  # ring center in the tool frame, on the face
+    normal: np.ndarray  # face normal in the tool frame (unit), pointing out of the head
+    ring_radius: float  # m, from the center to each capsule's axis
+    tube_radius: float  # m, capsule radius
+    n: int = 8
+    open_dir: Optional[np.ndarray] = None  # tool frame, in the face's plane; edge 0 is centered on it
+    open_deg: float = 0.0
 
 
 def sample_tool(rng: np.random.Generator, cfg: ToolCfg) -> ToolParams:
@@ -200,6 +215,22 @@ def add_tool(spec: mujoco.MjSpec, p: ToolParams, park_pos=(0.0, 0.0, 3.0)) -> No
                       size=[p.face_crown, p.head_size[1], p.head_size[2]],
                       pos=list(p.head_pos + p.head_long * p.head_axis), quat=list(p.head_quat), density=0.0,
                       friction=common["friction"], condim=common["condim"], rgba=[0.7, 0.72, 0.78, 1.0])
+    if p.cradle is not None:
+        c = p.cradle
+        nrm = mu.normalize(c.normal)
+        u = mu.normalize(c.open_dir - (c.open_dir @ nrm) * nrm) if c.open_dir is not None else mu.any_perpendicular(nrm)
+        w = np.cross(nrm, u)
+        half = c.ring_radius * np.tan(np.pi / c.n)
+        for i in range(c.n):
+            ang = 2 * np.pi * i / c.n
+            if c.open_dir is not None and np.degrees(min(ang, 2 * np.pi - ang)) < 0.5 * c.open_deg:
+                continue
+            radial = np.cos(ang) * u + np.sin(ang) * w
+            tangent = np.cross(nrm, radial)
+            pos = np.asarray(c.center) + c.ring_radius * radial + c.tube_radius * nrm
+            body.add_geom(name=f"tool_cradle{i}", type=_GEOM["capsule"], size=[c.tube_radius, half, 0.0],
+                          pos=list(pos), quat=list(mu.quat_from_two_vectors([0.0, 0, 1], tangent)), density=0.0,
+                          friction=common["friction"], condim=common["condim"], rgba=[0.5, 0.52, 0.58, 1.0])
     body.add_site(name="tool_head_center", pos=list(p.head_pos), size=[0.008, 0, 0], rgba=[1, 0.2, 0.2, 1])
     body.add_site(name="tool_handle_center", pos=[0, 0, 0], size=[0.006, 0, 0], rgba=[0.2, 0.2, 1, 1])
     if p.pad is not None:

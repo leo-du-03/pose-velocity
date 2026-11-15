@@ -1,5 +1,5 @@
 """Evaluate a policy on the tasks in tasks.py: hammer a plate, hammer a nail, sweep dirt off a board, slice a loaf or a
-cherry tomato.
+cherry tomato, flick an egg off a spatula into a bowl.
 
 Examples:
   python evaluate_tasks.py --task plate --policy trace --episodes 20     # reference follower: the trace's own accuracy
@@ -8,6 +8,12 @@ Examples:
   python evaluate_tasks.py --task plate --ckpt runs/<name>/ckpt_best.pt --layout realistic   # out of distribution
   python evaluate_tasks.py --task slice --ckpt runs/<name>/ckpt_best.pt --episodes 20 --video slice.mp4
   python evaluate_tasks.py --task slice_tomato --ckpt runs/<name>/ckpt_best.pt --episodes 20
+  python evaluate_tasks.py --task flick --policy trace --episodes 20 --video flick.mp4
+  python evaluate_tasks.py --task plate --ckpt runs/strike_jv_kpvel_1cm/ckpt_best.pt --episodes 50   # joint_vel policy
+  python evaluate_tasks.py --task plate --policy trace --action-mode joint_vel   # the follower in joint velocities
+
+Checkpoints in action modes head_twist and joint_vel work (the mode comes from the checkpoint). Task calibration runs
+the reference follower in head_twist either way, so the same --seed gives the same task instances in both modes.
 """
 from __future__ import annotations
 
@@ -43,9 +49,13 @@ COLUMNS = {
                      ("force_max", "peak", "{:4.1f}N", 1), ("line_offset", "off-center", "{:4.1f}mm", 1000),
                      ("bind_deg_max", "twist", "{:4.1f}deg", 1), ("board_force", "board", "{:5.1f}N", 1),
                      ("fail_reason", "fail", "{}", None)],
+    "flick": [("land_err", "miss", "{:4.1f}cm", 100), ("land_along", "long", "{:+5.1f}cm", 100),
+              ("land_across", "side", "{:+5.1f}cm", 100), ("release_speed", "v rel", "{:4.2f}m/s", 1),
+              ("release_speed_err", "v err", "{:+6.1%}", 1), ("bowl_dist", "bowl", "{:4.1f}cm", 100),
+              ("flight_time", "flight", "{:4.2f}s", 1), ("fail_reason", "fail", "{}", None)],
 }
-# Slice failure modes, in the order the summary lists them (metrics fail_reason).
-SLICE_FAILS = {
+# Failure modes, in the order the summary lists them (metrics fail_reason).
+FAILS = {
     "slice": (("crushed", "crushed (pushed without slicing: velocity)"),
               ("jammed", "jammed (blade twisted or moved sideways in the cut: orientation / position)"),
               ("off_line", "off the line (cut too far from the mark: position)"),
@@ -56,6 +66,11 @@ SLICE_FAILS = {
                      ("jammed", "jammed (blade twisted or moved sideways in the cut: orientation / position)"),
                      ("off_line", "off center (cut too far from the middle: position)"),
                      ("board", "chopped into the board (too deep: position)")),
+    "flick": (("dropped", "dropped (the egg left the cradle before the launch)"),
+              ("not_released", "not released (the egg stayed on the spatula: too slow a launch or stop)"),
+              ("missed", "missed the bowl (release velocity or position)"),
+              ("bounced_out", "bounced out of the bowl"),
+              ("on_spatula", "landed back on the spatula")),
 }
 # Metrics summarized over episodes, each with the unit to print it in (metrics are stored as fractions and meters)
 SUMMARY = {"plate": [("force_err", "%"), ("force_diff", "N"), ("speed_err", "%"), ("speed_diff", "m/s"),
@@ -67,7 +82,9 @@ SUMMARY = {"plate": [("force_err", "%"), ("force_diff", "N"), ("speed_err", "%")
            "slice": [("cut_frac", "%"), ("line_offset", "mm"), ("bind_deg_max", "deg"), ("bind_offset_max", "mm"),
                      ("crush_depth_max", "mm"), ("slice_ratio_mean", ""), ("board_force", "N")],
            "slice_tomato": [("cut_frac", "%"), ("force_cut_mean", "N"), ("force_max", "N"), ("line_offset", "mm"),
-                            ("bind_deg_max", "deg"), ("board_force", "N")]}
+                            ("bind_deg_max", "deg"), ("board_force", "N")],
+           "flick": [("land_err", "cm"), ("land_along", "cm"), ("land_across", "cm"), ("release_speed_err", "%"),
+                     ("release_speed", "m/s"), ("bowl_dist", "cm")]}
 UNITS = {"%": 100, "cm": 100, "mm": 1000, "m/s": 1, "deg": 1, "N": 1, "": 1}
 
 
@@ -95,6 +112,9 @@ def main():
     p.add_argument("--ckpt", default=None)
     p.add_argument("--policy", default=None, choices=["ckpt", "trace", "zero"],
                    help="defaults to ckpt if --ckpt is given, else trace (the reference follower)")
+    p.add_argument("--action-mode", default=None, choices=["head_twist", "joint_vel"],
+                   help="trace / zero policies: the action space to run in (default: config.py); a checkpoint "
+                        "carries its own")
     p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--layout", default="in_dist", choices=["in_dist", "realistic"])
     p.add_argument("--level", type=float, default=None,
@@ -125,6 +145,8 @@ def main():
                    help="slice: sideways motion (m) of the blade inside the cut that jams it (TaskCfg.bind_slack)")
     p.add_argument("--line-tol", type=float, default=None, metavar="M",
                    help="slice: how far (m) from the marked line the cut may stray (TaskCfg.line_tol)")
+    p.add_argument("--flick-speed", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                   help="flick: range of the launch speed, m/s (TaskCfg.flick_speed)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
@@ -146,6 +168,12 @@ def main():
         agent.eval()
     if args.level is not None:
         level = args.level
+    if args.action_mode is not None:
+        if policy == "ckpt":
+            p.error("--action-mode is taken from the checkpoint; drop it with --ckpt")
+        cfg.action_mode = args.action_mode
+    if cfg.action_mode not in ("head_twist", "joint_vel"):
+        raise SystemExit(f"task evaluation supports action modes head_twist and joint_vel, not {cfg.action_mode!r}")
 
     render_mode = "rgb_array" if args.video else (None if args.render == "none" else args.render)
     task_cfg = TaskCfg(layout=args.layout)
@@ -169,6 +197,8 @@ def main():
         task_cfg.bind_slack = args.bind_slack
     if args.line_tol is not None:
         task_cfg.line_tol = args.line_tol
+    if args.flick_speed is not None:
+        task_cfg.flick_speed = tuple(args.flick_speed)
     env = TaskEnv(args.task, cfg, task_cfg, render_mode=render_mode)
     env.set_curriculum(level)
     if agent is not None and env.observation_space.shape[0] != ck["obs_dim"]:
@@ -211,7 +241,7 @@ def main():
         results.append(m)
         cols = "  ".join(f"{label} {_fmt(m, key, fmt, scale)}" for key, label, fmt, scale in COLUMNS[args.task])
         end = "timeout" if m.get("timeout") else ("diverged" if m.get("diverged") else "done")
-        if args.task in ("sweep", "slice", "slice_tomato"):
+        if args.task in ("sweep", "slice", "slice_tomato", "flick"):
             kps = f"keypoints {m['keypoints_passed']}/{m['keypoints']}  "
         else:  # the hit itself rarely counts as a goal-plane crossing (the target stops the head)
             kps = f"windup goals {m['windup_passed']}/{m['windup_keypoints']}  "
@@ -241,9 +271,9 @@ def main():
             force = env.task_cfg.dirt_forces[lv - 1]
             print(f"    {name:6s} ({force:4.1f} N)  mean {dirt.mean():5.1f} cells ({dirt.mean() * cell_cm2:5.0f} cm^2)  "
                   f"std {dirt.std():5.1f}  removed {done}")
-    if args.task in SLICE_FAILS:
+    if args.task in FAILS:
         print("  failures:")
-        for reason, label in SLICE_FAILS[args.task]:
+        for reason, label in FAILS[args.task]:
             n = sum(r["fail_reason"] == reason for r in results)
             print(f"    {n:3d}  {label}")
         kp = np.array([r["keypoints_passed"] / max(r["keypoints"], 1) for r in results])

@@ -19,7 +19,7 @@ import mathutils as mu
 from goals import Goal
 
 PHASES = ("approach", "hold", "accel", "strike", "contact", "retract", "lower", "stroke", "lift", "transfer", "windup",
-          "swing", "saw")
+          "swing", "saw", "launch", "release")
 PHASE = {name: i for i, name in enumerate(PHASES)}
 
 
@@ -173,7 +173,8 @@ class TraceBuilder:
 
 
 class TraceFollower:
-    """Reference tracker for head_twist actions: the meaning of "follows the trace".
+    """Reference tracker for head_twist actions (joint_vel: their joint velocities): the meaning of "follows the
+    trace".
 
     At env step k it commands v = v_ff + k_pos (p[k] - head) and w = w_ff + k_rot * rot_err(quat[k], tool), with the
     feedforward averaged over the step (samples k and k+1). The env smooths actions with an EMA, so the follower
@@ -192,5 +193,16 @@ class TraceFollower:
         w = 0.5 * (tr.w[k] + tr.w[k1]) + self.k_rot * mu.quat_error(tr.quat[k], env._tool_quat())
         cmd = np.concatenate([v / cfg.head_v_max, w / cfg.head_w_max])
         ema = cfg.action_ema
-        a = (cmd - ema * env._a_filt[:6]) / (1.0 - ema) if ema > 0 else cmd
+        if cfg.action_mode == "joint_vel":
+            # The smoothed joint velocity head_twist would command for cmd (smoothed twist clipped to +-1, DLS, joint
+            # speed clip), in action units; the EMA is inverted on it as below.
+            na = env.n_arm_act
+            dq = np.clip(env._twist_dq(np.clip(cmd, -1.0, 1.0)), -cfg.max_joint_speed, cfg.max_joint_speed)
+            cmd, prev = dq / env._joint_v_max(), env._a_filt[:na]
+            a = (cmd - ema * prev) / (1.0 - ema) if ema > 0 else cmd
+            # Scaled, not clipped per joint: at the start of a swing the joints have to speed up faster than the EMA
+            # lets them in one step, and clipping each joint separately would turn the head off the trace.
+            return (a / max(1.0, float(np.abs(a).max()))).astype(np.float32)
+        prev = env._a_filt[:6]
+        a = (cmd - ema * prev) / (1.0 - ema) if ema > 0 else cmd
         return np.clip(a, -1.0, 1.0).astype(np.float32)

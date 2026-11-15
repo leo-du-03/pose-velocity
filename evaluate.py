@@ -24,10 +24,14 @@ def main():
                    help="defaults to ckpt if --ckpt is given, else random")
     p.add_argument("--grip-mode", default=None, choices=["weld", "physical"],
                    help="override the grip mode (default: from checkpoint, else config.py)")
-    p.add_argument("--action-mode", default=None, choices=["head_twist", "joint"],
+    p.add_argument("--action-mode", default=None, choices=["head_twist", "joint", "joint_vel"],
                    help="override the action mode (default: from checkpoint, else config.py)")
     p.add_argument("--arm-action-scale", type=float, default=None,
                    help="override EnvCfg.arm_action_scale (rad per step at action 1, joint mode)")
+    p.add_argument("--joint-v-max", type=float, nargs=6, default=None, metavar="V",
+                   help="override EnvCfg.joint_v_max (rad/s per arm joint at action 1, joint_vel mode)")
+    p.add_argument("--no-kin-obs", action="store_true",
+                   help="joint_vel: leave the Jacobian-projected goal errors out of the observation (EnvCfg.kin_obs)")
     p.add_argument("--pose-only", default=None, choices=["hold", "touch"],
                    help="without --ckpt: pose-only baseline (no goal velocity) with this success rule "
                         "(a checkpoint carries its own setting)")
@@ -65,6 +69,10 @@ def main():
         cfg.action_mode = args.action_mode
     if args.arm_action_scale is not None:
         cfg.arm_action_scale = args.arm_action_scale
+    if args.joint_v_max is not None:
+        cfg.joint_v_max = tuple(args.joint_v_max)
+    if args.no_kin_obs:
+        cfg.kin_obs = False
     if args.table_start:
         if cfg.grip_mode != "physical":
             p.error("--table-start needs --grip-mode physical")

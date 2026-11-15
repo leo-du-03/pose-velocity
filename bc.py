@@ -14,6 +14,11 @@ runs its own oracle (PoseVelocityEnv.oracle_action). Weld grip only.
 each head-twist label to the joint action that sets the servo targets head_twist mode would
 (PoseVelocityEnv.joint_action_for_twist). The setting travels with the checkpoint, like --pose-only.
 
+--action-mode joint_vel clones it into a policy that outputs arm joint velocities (EnvCfg.joint_v_max at action 1):
+the labels are the oracle's head twists mapped through the damped pseudo-inverse of the head Jacobian
+(PoseVelocityEnv.joint_vel_action_for_twist), with no EMA inversion, so they are smooth in the state. Its observation
+adds the goal errors mapped into joint space the same way (EnvCfg.kin_obs; --no-kin-obs leaves them out).
+
 --pose-only {hold,touch} clones the pose-only baseline instead (EnvCfg.goal_velocity False, oracle.PoseOracle); the
 setting is saved in the checkpoint's env_cfg, so train.py --init-from fine-tunes the same task.
 
@@ -73,10 +78,14 @@ def parse_args():
     p.add_argument("--pose-only", default=None, choices=["hold", "touch"],
                    help="pose-only baseline (no goal velocity) with this success rule: 'hold' = SimToolReal's "
                         "success_steps steps within tolerance, 'touch' = the first step within tolerance")
-    p.add_argument("--action-mode", default=None, choices=["head_twist", "joint"],
+    p.add_argument("--action-mode", default=None, choices=["head_twist", "joint", "joint_vel"],
                    help="override EnvCfg.action_mode; joint labels are converted from the oracle's head twists")
     p.add_argument("--arm-action-scale", type=float, default=None,
                    help="override EnvCfg.arm_action_scale (rad per step at action 1, joint mode)")
+    p.add_argument("--joint-v-max", type=float, nargs=6, default=None, metavar="V",
+                   help="override EnvCfg.joint_v_max (rad/s per arm joint at action 1, joint_vel mode)")
+    p.add_argument("--no-kin-obs", action="store_true",
+                   help="joint_vel: leave the Jacobian-projected goal errors out of the observation (EnvCfg.kin_obs)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--serial", action="store_true", help="run envs in the main process (debugging)")
     p.add_argument("--logdir", default="runs")
@@ -104,12 +113,18 @@ def main():
         env_cfg.action_mode = args.action_mode
     if args.arm_action_scale is not None:
         env_cfg.arm_action_scale = args.arm_action_scale
+    if args.joint_v_max is not None:
+        env_cfg.joint_v_max = tuple(args.joint_v_max)
+    if args.no_kin_obs:
+        env_cfg.kin_obs = False
     if env_cfg.grip_mode != "weld":
         raise SystemExit("the oracle needs grip_mode 'weld'")
     K, N, T = args.eval_envs, args.num_envs, args.rollout_steps
     if not 0 <= K < N:
         raise SystemExit(f"--eval-envs must be in [0, num_envs), got {K}")
     n_train = N - K
+    if env_cfg.action_mode == "joint_vel":
+        ppo_cfg.init_log_std = ppo_cfg.init_log_std_joint_vel  # saved as the actor's log_std
     noise_std = args.noise_std if args.noise_std is not None else float(np.exp(ppo_cfg.init_log_std))
 
     run_name = args.name or time.strftime("bc_%Y%m%d_%H%M%S")
@@ -206,18 +221,25 @@ def main():
 
         mean = lambda stats, k: float(np.mean([e[k] for e in stats])) if stats else float("nan")  # noqa: E731
         side = [e["pass"]["v_side_frac"] for e in eval_stats if e.get("pass")]
+        # Which tolerance the clone misses: errors at the eval envs' attempts.
+        pass_mean = lambda k: float(np.mean([e["pass"][k] for e in eval_stats if e.get("pass")])) if side else float("nan")  # noqa: E731
+        clip_frac = float(np.mean(np.abs(new_act) >= 0.999))
         log = {"bc/loss": float(np.mean(losses)), "bc/loss_new": loss_new, "bc/loss_new_eval": loss_new_eval,
                "bc/lr": lr, "bc/beta": beta, "bc/dataset": size,
                "ep/success": mean(ep_stats, "success"),
                "eval/success": mean(eval_stats, "success"), "eval/passed": mean(eval_stats, "passed"),
-               "eval/pass/v_side_frac": float(np.mean(side)) if side else float("nan")}
+               "eval/pass/v_side_frac": float(np.mean(side)) if side else float("nan"),
+               "eval/pass/dv_frac": pass_mean("dv_frac"), "eval/pass/theta_deg": pass_mean("theta_deg"),
+               "eval/pass/dp": pass_mean("dp"), "bc/label_clip_frac": clip_frac}
         if writer is not None:
             for k, v in log.items():
                 writer.add_scalar(k, v, rnd)
         print(f"round {rnd:3d} | beta {beta:.3f} | data {size:8d} | loss {log['bc/loss']:.5f} new {loss_new:.5f} | "
               f"mix succ {log['ep/success']:.3f} | eval succ {log['eval/success']:.3f} "
               f"pass {log['eval/passed']:.3f} "
-              f"side {log['eval/pass/v_side_frac']:.2f} (last {len(eval_stats)}) | {time.time() - t_round:.0f}s")
+              f"side {log['eval/pass/v_side_frac']:.2f} dv {log['eval/pass/dv_frac']:.2f} "
+              f"th {log['eval/pass/theta_deg']:.1f} dp {100 * log['eval/pass/dp']:.1f}cm (last {len(eval_stats)}) | "
+              f"clip {clip_frac:.3f} | {time.time() - t_round:.0f}s")
 
         # Same keys train.py and evaluate.py read from a PPO checkpoint (no optimizer: --init-from starts fresh).
         torch.save({"format": CKPT_FORMAT, "agent": agent.state_dict(), "env_cfg": env_cfg, "ppo_cfg": ppo_cfg,

@@ -1,4 +1,5 @@
-"""Task evaluation envs: hammer a plate, hammer a nail, sweep dirt off a board, slice a loaf or a cherry tomato in half.
+"""Task evaluation envs: hammer a plate, hammer a nail, sweep dirt off a board, slice a loaf or a cherry tomato in half,
+flick an egg off a spatula into a bowl.
 
 Each episode samples a task instance and builds a reference trace (traces.Trace) of head position, tool orientation
 and velocity that achieves the task exactly when followed exactly:
@@ -12,6 +13,8 @@ and velocity that achieves the task exactly when followed exactly:
                 Each dirt cell needs a minimum force (by dirt level); the trace's pressing depth along each stroke
                 gives that force plus a margin over the cells under the brush, via a static depth -> force
                 calibration of the pad on the board.
+* flick         The bowl is placed first and the release point solved from the ballistics; then follower rollouts
+                shift the whole throw by the measured landing error until the egg lands at the bowl's center.
 
 Trained policies only know single goals, so TaskEnv gives them the trace's keypoints one at a time (the impact for
 hammering; waypoints along the strokes and the transfers between them for sweeping). It advances to the next keypoint
@@ -31,7 +34,7 @@ import mathutils as mu
 from config import EnvCfg, TaskCfg
 from env import PoseVelocityEnv
 from goals import plane_crossing
-from tool_gen import PadParams, ToolParams, build_tool
+from tool_gen import CradleParams, PadParams, ToolParams, build_tool
 from traces import Trace, TraceBuilder, TraceFollower, min_jerk, smoothstep
 
 OBJ = mujoco.mjtObj
@@ -132,12 +135,14 @@ def person_grasp(env, center, axis, tool: ToolParams, front, from_end: float, tc
 
 
 def path_margin(env, points, quat, min_margin: float) -> float:
-    """Worst arm_margin along a path of head positions at a fixed tool orientation (chained IK from the current arm
-    configuration); 0 if any point is unreachable or the margin drops to min_margin."""
+    """Worst arm_margin along a path of head positions at a fixed tool orientation, or one orientation per point
+    (chained IK from the current arm configuration); 0 if any point is unreachable or the margin drops to
+    min_margin."""
     q = env.data.qpos[env.arm_qadr].copy()
+    quats = [quat] * len(points) if np.ndim(quat) == 1 else quat
     worst = np.inf
-    for x in points:
-        q = env._ik_solve(q, x, quat, iters=100)
+    for x, qt in zip(points, quats):
+        q = env._ik_solve(q, x, qt, iters=100)
         if q is None:
             return 0.0
         worst = min(worst, arm_margin(env, q))
@@ -150,7 +155,9 @@ def path_margin(env, points, quat, min_margin: float) -> float:
 class TaskEnv(PoseVelocityEnv):
     """PoseVelocityEnv with a fixed tool, task fixtures, and one task instance (with its trace) per episode.
 
-    Weld grip and head_twist actions only. The reward is always 0; results are in info["task"] at the episode end.
+    Weld grip, head_twist or joint_vel actions. The reward is always 0; results are in info["task"] at the episode end.
+    Calibration rollouts (rollout with the reference follower) always run in head_twist, so a joint_vel policy is
+    scored on the same calibrated task instances as a head_twist one.
     """
 
     _SNAP_ATTRS = ("targets", "_a_filt", "prev_action", "_prev_head", "t", "task_t", "goal", "kp_index", "kp_log",
@@ -163,8 +170,8 @@ class TaskEnv(PoseVelocityEnv):
             raise ValueError(f"layout must be 'in_dist' or 'realistic', got {self.task_cfg.layout!r}")
         self.task = TASKS[task](self.task_cfg) if isinstance(task, str) else task
         cfg = copy.deepcopy(cfg or EnvCfg())
-        if cfg.grip_mode != "weld" or cfg.action_mode != "head_twist":
-            raise ValueError("task envs need grip_mode 'weld' and action_mode 'head_twist'")
+        if cfg.grip_mode != "weld" or cfg.action_mode not in ("head_twist", "joint_vel"):
+            raise ValueError("task envs need grip_mode 'weld' and action_mode 'head_twist' or 'joint_vel'")
         cfg.regrip_every = 1 if self.task_cfg.rehome_each_episode else 10**9
         cfg.regrip_rehome = True
         self.trace: Optional[Trace] = None
@@ -251,7 +258,10 @@ class TaskEnv(PoseVelocityEnv):
         metrics; the env is restored afterwards. Used for calibration."""
         snap = self.snapshot()
         render_mode, self.render_mode = self.render_mode, None
+        mode = self.cfg.action_mode
         try:
+            if policy is None and mode != "head_twist":
+                self._switch_to_head_twist()
             self.start_trace(trace)
             policy = policy or self.follower
             info = {}
@@ -261,8 +271,20 @@ class TaskEnv(PoseVelocityEnv):
                     break
             return info.get("task") or self.task.metrics(self)
         finally:
+            self.cfg.action_mode = mode
             self.render_mode = render_mode
             self.restore(snap)
+
+    def _switch_to_head_twist(self) -> None:
+        """Puts the env in head_twist mode with the same smoothed command (the restore in rollout undoes it): the
+        EMA state becomes the head twist of the smoothed joint-velocity command."""
+        na = self.n_arm_act
+        dq = np.clip(self._a_filt[:na] * self._joint_v_max(), -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
+        twist = self._head_jacobian() @ dq
+        scale = np.repeat([self.cfg.head_v_max, self.cfg.head_w_max], 3)
+        self._a_filt = np.clip(twist / scale, -1.0, 1.0)
+        self.prev_action = self._a_filt.copy()
+        self.cfg.action_mode = "head_twist"
 
     def _camera(self) -> mujoco.MjvCamera:
         cam = super()._camera()
@@ -1923,5 +1945,428 @@ class TomatoSliceTask(SliceTask):
                 "force_target": tc.tomato_press_force}
 
 
+SPATULA_UP = np.array([0.0, 1.0, 0.0])  # tool frame: normal of the spatula blade's top face (the cradle side)
+SPATULA_TIP = np.array([0.0, 0.0, 1.0])  # tool frame: along the blade, towards its tip
+
+
+def spatula_tool(tc: TaskCfg) -> ToolParams:
+    """Spatula: round handle with a thin flat blade in line with it (head axis = handle axis, towards the tip). The
+    blade's faces are normal to the tool's y (SPATULA_UP); a horseshoe of capsules on its top face, cradle_offset
+    towards the tip from the blade center and open towards the tip, seats the egg. It is just wide enough that the egg
+    rests on the blade with the capsules behind and beside it as stops: the launch presses the egg back into it, and
+    at the release the egg leaves over the open front."""
+    a, b, c = tc.spatula_blade_half
+    t = build_tool("cylinder", tc.spatula_handle_len, 0.012, 1.0, "box", "inline", a, b, c, density=1200.0,
+                   friction=tc.spatula_friction)
+    R, r = tc.egg_radius, tc.cradle_tube
+    t.cradle = CradleParams(center=t.head_pos + c * SPATULA_UP + tc.cradle_offset * SPATULA_TIP,
+                            normal=SPATULA_UP.copy(), ring_radius=2.0 * np.sqrt(R * r) + tc.cradle_clearance,
+                            tube_radius=r, n=tc.cradle_segments, open_dir=SPATULA_TIP.copy(),
+                            open_deg=tc.cradle_open_deg)
+    return t
+
+
+def teleport_arm(env, q) -> None:
+    """Puts the arm at joints q at rest, the welded tool with it (like PoseVelocityEnv._rehome_weld)."""
+    d = env.data
+    d.qpos[env.arm_qadr] = q
+    d.qvel[:] = 0.0
+    env.targets = np.clip(d.qpos[env.act_qadr], env.ctrl_lo, env.ctrl_hi)
+    d.ctrl[env.act_ids] = env.targets
+    mujoco.mj_kinematics(env.model, d)
+    palm_p, palm_q = d.xpos[env.palm_id].copy(), d.xquat[env.palm_id].copy()
+    env._set_tool_pose(palm_p + mu.rotate(palm_q, env.grasp_pos), mu.quat_mul(palm_q, env.grasp_quat))
+    mujoco.mj_forward(env.model, d)
+    env.prev_action[:] = 0.0
+    env._a_filt[:] = 0.0
+    env._prev_head = d.site_xpos[env.head_site].copy()
+
+
+def _integrate(p0, v0, vels, dt):
+    """Positions after each velocity sample (trapezoid rule from p0 at velocity v0)."""
+    ps, p, v_prev = [], np.asarray(p0, np.float64).copy(), np.asarray(v0, np.float64)
+    for v in vels:
+        p = p + 0.5 * (v_prev + v) * dt
+        ps.append(p)
+        v_prev = v
+    return ps
+
+
+class FlickTask(Task):
+    """Flick an egg off a spatula into a bowl.
+
+    The episode starts with the spatula held flat, tip towards the bowl, the egg (a free sphere) settled in the cradle
+    on its blade. The trace launches the spatula from rest along a direction above the horizontal, pitching it tip-up a
+    little on the way (a wrist flick), then pulls it away from the egg along its own normal faster than gravity, so the
+    egg flies free at the launch velocity, and finally pulls it back along the handle (so the egg passes the tip before
+    it could fall back onto the blade) and stops. Success: the egg comes to rest in the bowl.
+
+    Each instance is calibrated by reference-follower rollouts: the bowl is placed first, the release point comes from
+    the ballistics, and the whole throw is shifted by the follower's landing error until it lands within
+    flick_aim_tol of the bowl's center (and the egg settles in the bowl).
+    """
+
+    name = "flick"
+    FAILS = ("dropped", "not_released", "missed", "bounced_out", "on_spatula")
+    _BOWL_RGBA = (0.35, 0.55, 0.75, 1.0)
+
+    def tool(self) -> ToolParams:
+        if self._tool is None:
+            self._tool = spatula_tool(self.tc)
+        return self._tool
+
+    def grasp(self, env, center, axis):
+        """Held like a spatula: the handle across the fingers, the blade beyond the index finger, its top face away
+        from the knuckles (up at home, where the fingers point down)."""
+        return person_grasp(env, center, axis, self.tool(), -SPATULA_UP, self.tc.spatula_grasp_from_end, self.tc)
+
+    def egg_local(self) -> np.ndarray:
+        """Egg center at rest in the cradle, in the tool frame."""
+        return self.tool().cradle.center + self.tc.egg_radius * SPATULA_UP
+
+    # ---------------------------------------------------------------- fixtures
+    def add_fixtures(self, spec, env) -> None:
+        tc = self.tc
+        R = tc.egg_radius
+        ri = getattr(env, "rinfo", None)
+        # The egg waits on the floor behind the robot until an instance puts it in the cradle.
+        park = (-1.0 * ri.table_dir + np.array([0.0, 0.0, ri.floor_z + R])) if ri is not None else [-1.0, 0, -0.7]
+        egg = spec.worldbody.add_body(name="egg", pos=[float(x) for x in park])
+        try:
+            joint = egg.add_freejoint()
+        except AttributeError:
+            joint = egg.add_joint(type=mujoco.mjtJoint.mjJNT_FREE)
+        joint.name = "egg_free"
+        egg.add_geom(name="egg", type=_GEOM.mjGEOM_SPHERE, size=[R, 0, 0], mass=tc.egg_mass,
+                     friction=list(tc.egg_friction), condim=6, solref=list(tc.egg_solref), rgba=[0.97, 0.92, 0.78, 1])
+        bowl = spec.worldbody.add_body(name="bowl_body", mocap=True, pos=list(_PARK))
+        r_in, w, H, n = tc.bowl_radius, tc.bowl_wall, tc.bowl_height, tc.bowl_segments
+        f = 0.5 * tc.bowl_floor  # thick enough that the landing egg doesn't press through to the table
+        _fixture_geom(bowl, tc.fixture_solref, name="bowl_floor", type=_GEOM.mjGEOM_CYLINDER,
+                      size=[r_in + 2 * w, f, 0], pos=[0, 0, f], rgba=list(self._BOWL_RGBA))
+        half = (r_in + 2 * w) * np.tan(np.pi / n) + 0.5 * w
+        for i in range(n):
+            ang = 2 * np.pi * i / n
+            _fixture_geom(bowl, tc.fixture_solref, name=f"bowl_wall{i}", type=_GEOM.mjGEOM_BOX,
+                          size=[w, half, 0.5 * H], pos=[(r_in + w) * np.cos(ang), (r_in + w) * np.sin(ang), 0.5 * H],
+                          quat=list(mu.yaw_quat(ang)), rgba=list(self._BOWL_RGBA))
+
+    def index(self, env) -> None:
+        m = env.model
+        nid = lambda kind, n: mujoco.mj_name2id(m, kind, n)  # noqa: E731
+        j = nid(OBJ.mjOBJ_JOINT, "egg_free")
+        self.egg_qadr, self.egg_dadr = int(m.jnt_qposadr[j]), int(m.jnt_dofadr[j])
+        self.egg_gid = nid(OBJ.mjOBJ_GEOM, "egg")
+        self.bowl_mocap = int(m.body_mocapid[nid(OBJ.mjOBJ_BODY, "bowl_body")])
+        self.bowl_gids = {nid(OBJ.mjOBJ_GEOM, "bowl_floor")} | {
+            nid(OBJ.mjOBJ_GEOM, f"bowl_wall{i}") for i in range(self.tc.bowl_segments)}
+        self.ground_gids = {env.table_gid, env.floor_gid}
+        env.env_geoms = env.env_geoms | self.bowl_gids  # the planner keeps the arm and the spatula off the bowl
+        self.st = None
+        self.plan = None
+
+    # ---------------------------------------------------------------- egg helpers
+    def _egg(self, env):
+        d = env.data
+        return d.qpos[self.egg_qadr:self.egg_qadr + 3].copy(), d.qvel[self.egg_dadr:self.egg_dadr + 3].copy()
+
+    def _egg_rel(self, env, p) -> np.ndarray:
+        """Egg center p relative to its rest point in the cradle, in the tool frame."""
+        d = env.data
+        R = d.xmat[env.tool_id].reshape(3, 3)
+        return R.T @ (p - d.xpos[env.tool_id]) - self.egg_local()
+
+    def _place_egg(self, env) -> None:
+        d = env.data
+        R = d.xmat[env.tool_id].reshape(3, 3)
+        a, b = self.egg_qadr, self.egg_dadr
+        d.qpos[a:a + 3] = d.xpos[env.tool_id] + R @ (self.egg_local() + 0.0005 * SPATULA_UP)
+        d.qpos[a + 3:a + 7] = [1.0, 0, 0, 0]
+        d.qvel[b:b + 6] = 0.0
+        mujoco.mj_forward(env.model, d)
+
+    # ---------------------------------------------------------------- instance sampling
+    def sample(self, env) -> Optional[Trace]:
+        tc, rng, ri = self.tc, env.np_random, env.rinfo
+        for _ in range(40):
+            bowl = ri.table_point(rng.uniform(*tc.bowl_region[0]), rng.uniform(*tc.bowl_region[1]), 0.0)
+            az = np.arctan2(bowl[1], bowl[0]) + np.deg2rad(rng.uniform(-1.0, 1.0) * tc.flick_heading_deg)
+            plan = self._plan(env, bowl, np.array([np.cos(az), np.sin(az), 0.0]), rng.uniform(*tc.flick_speed),
+                              np.deg2rad(rng.uniform(*tc.flick_pitch_deg)), rng.uniform(*tc.flick_release_height))
+            if plan is None:
+                continue
+            trace = self._calibrate(env, plan)
+            if trace is not None:
+                return trace
+        return None
+
+    def _plan(self, env, bowl, e, v, phi, h) -> Optional[dict]:
+        """Throw geometry: the flat start orientation, the pitch axis, the launch direction (along the blade at the
+        release, i.e. phi above the start's) and profile, and the head position the launch starts from so the egg's
+        ballistic path from the tip crosses the bowl's rim height at its center."""
+        tc, dt = self.tc, env.dt
+        axis = mu.normalize(np.cross(e, _UP))  # rotating about it by +phi raises the tip
+        # Tip along e, blade face up, the tip raised a hair so the egg settles against the back of the cradle.
+        q_flat = mu.quat_mul(mu.axis_angle_quat(axis, np.deg2rad(tc.flick_start_pitch_deg)),
+                             frame_quat(e, np.cross(_UP, e)))
+        n_a = max(1, int(round(2 * tc.flick_accel_len / (v * dt))))
+        n_c = max(1, int(round(tc.flick_const_len / (v * dt))))
+        phi = min(phi, tc.flick_w_max * (n_a + n_c) * dt / 1.875)  # min-jerk peak angular speed
+        q_rel = mu.quat_mul(mu.axis_angle_quat(axis, phi), q_flat)
+        d = mu.rotate(q_rel, SPATULA_TIP)
+        g = -float(env.model.opt.gravity[2])
+        z_aim = env.rinfo.table_top + tc.bowl_height + tc.egg_radius
+        # head -> egg as it leaves the tip
+        off = mu.rotate(q_rel, self.egg_local() + (self.tool().head_long - tc.cradle_offset) * SPATULA_TIP
+                        - self.tool().head_pos)
+        z_egg = env.rinfo.table_top + h + off[2]
+        vz, vh = v * d[2], v * np.linalg.norm(d[:2])
+        t_fl = (vz + np.sqrt(vz ** 2 + 2 * g * (z_egg - z_aim))) / g
+        egg_rel = bowl - vh * t_fl * e
+        egg_rel[2] = z_egg
+        head_rel = egg_rel - off
+        L = 0.5 * v * n_a * dt + v * n_c * dt
+        return dict(bowl=bowl, e=e, v=v, phi=phi, h=h, q_flat=q_flat, axis=axis, d=d, n_a=n_a, n_c=n_c,
+                    z_aim=z_aim, start=head_rel - L * d, egg_release=egg_rel, flight_time=t_fl)
+
+    def _setup(self, env, plan, shift) -> bool:
+        """Places the bowl, puts the arm at the start pose (spatula flat, shifted by `shift`) and lets the egg settle
+        in the cradle. False if the pose is unreachable or the egg doesn't stay in the cradle."""
+        tc = self.tc
+        self.plan = plan
+        env.set_mocap(self.bowl_mocap, plan["bowl"], [1.0, 0, 0, 0])
+        target = plan["start"] + shift
+        q = None
+        for q0 in (env.data.qpos[env.arm_qadr].copy(), np.asarray(env.cfg.scene.arm_home[: env.n_arm_act])):
+            q = env._ik_solve(q0, target, plan["q_flat"], iters=150)
+            if q is not None and arm_margin(env, q) >= tc.min_arm_margin:
+                break
+            q = None
+        if q is None:
+            return False
+        teleport_arm(env, q)
+        self._place_egg(env)
+        env._settle(tc.egg_settle)
+        env._hold_robot_pose()
+        env._prev_head = env.data.site_xpos[env.head_site].copy()
+        p, v = self._egg(env)
+        return bool(np.linalg.norm(self._egg_rel(env, p)) < 0.005 and np.linalg.norm(v) < 0.02)
+
+    def _path_ok(self, env, tr: Trace) -> bool:
+        """The whole trace is reachable, well-conditioned and collision-free (bowl included), from the start pose."""
+        k0 = int(tr.meta["launch_index"])
+        ks = list(range(k0, len(tr) - int(round(self.tc.flick_timeout / tr.dt)), 3))
+        return path_margin(env, tr.p[ks], list(tr.quat[ks]), self.tc.min_arm_margin) > 0.0
+
+    def _calibrate(self, env, plan) -> Optional[Trace]:
+        tc = self.tc
+        e, e_perp = plan["e"], np.cross(_UP, plan["e"])
+        shift = np.zeros(3)
+        errs = []
+        for it in range(tc.flick_calib_iters):
+            if not self._setup(env, plan, shift):
+                return None
+            trace = self.build_trace(env, plan)
+            if trace is None or (it == 0 and not self._path_ok(env, trace)):
+                return None
+            r = env.rollout(trace)
+            if not r.get("released") or not np.isfinite(r.get("land_err", np.nan)):
+                return None
+            errs.append(float(r["land_err"]))
+            if r["success"] and r["land_err"] < tc.flick_aim_tol:
+                trace.meta.update(follower_land_err=float(r["land_err"]), calib_land_errs=errs,
+                                  follower_release_speed=float(r["release_speed"]))
+                return trace
+            shift = shift - (r["land_along"] * e + r["land_across"] * e_perp)
+        return None
+
+    # ---------------------------------------------------------------- trace
+    def build_trace(self, env, plan) -> Optional[Trace]:
+        """Hold flat; launch (accelerate along d, the blade's direction at the release, while pitching tip-up); release
+        (pull back along the handle and a little down along the blade normal, so the egg rolls off over the open front
+        of the cradle and the tip, then stop); return to flat and hold while the egg flies. None if the egg would fall
+        back onto the blade."""
+        tc, dt, gc = self.tc, env.dt, env.cfg.goal
+        p0, _, _, _ = env._head_state()
+        q0 = env._tool_quat()
+        b = TraceBuilder(dt, p0, q0, env.tool.head_axis)
+        b.hold(0.1)
+        k_launch = b.index
+        v, d, axis, phi, n_a, n_c = plan["v"], plan["d"], plan["axis"], plan["phi"], plan["n_a"], plan["n_c"]
+        # Launch: smooth speed-up to v, then constant; the pitch is min-jerk over the whole launch.
+        sv, _ = smoothstep(np.arange(1, n_a + 1) / n_a)
+        vel = np.concatenate([v * sv, np.full(n_c, v)])[:, None] * d
+        N = n_a + n_c
+        s, ds = min_jerk(np.arange(1, N + 1) / N)
+        qs = [mu.quat_mul(mu.axis_angle_quat(axis, phi * x), q0) for x in s]
+        ws = (phi * ds / (N * dt))[:, None] * axis
+        ps = _integrate(p0, np.zeros(3), vel, dt)
+        b.samples(ps, qs, vel, ws, "launch")
+        k_rel = b.index
+        # Release, at the pitched orientation.
+        q_rel = qs[-1]
+        n, t = mu.rotate(q_rel, SPATULA_UP), mu.rotate(q_rel, SPATULA_TIP)
+        v0 = v * d
+        v1 = -tc.flick_drop_speed * n - tc.flick_back_speed * t
+        n_r = tc.flick_drop_steps
+        rv = [v0 + x * (v1 - v0) for x in smoothstep(np.arange(1, n_r + 1) / n_r)[0]]
+        rv += [v1] * int(round(tc.flick_retract_time / dt))
+        n_s = max(1, int(round(tc.flick_stop_time / dt)))
+        rv += [v1 * (1.0 - x) for x in smoothstep(np.arange(1, n_s + 1) / n_s)[0]]
+        pr = _integrate(ps[-1], v0, rv, dt)
+        # The egg (ballistic from the release) must not come back down onto the blade while it is still over it.
+        g = env.model.opt.gravity.copy()
+        off = mu.rotate(q_rel, self.egg_local() - env.tool.head_pos)
+        egg0 = ps[-1] + off
+        tip = self.tool().head_long + 0.5 * tc.egg_radius
+        for k, p in enumerate(pr, start=1):
+            egg = egg0 + v0 * (k * dt) + 0.5 * g * (k * dt) ** 2
+            rel = egg - p - off  # from the egg's rest point in the cradle
+            if (rel + off) @ t >= tip:
+                break
+            if k > n_r and rel @ n < 0.0:
+                return None
+        rest = float(off @ n)
+        b.samples(pr, [q_rel] * len(pr), rv, np.zeros((len(pr), 3)), "release")
+        k_end = b.index
+        b.move_to(b.end[0], q0, tc.flick_unpitch_time, "retract")
+        b.hold(tc.flick_timeout)
+        tr = b.build(task=self.name, bowl=plan["bowl"], heading=plan["e"], launch_speed=v, launch_dir=d,
+                     elev_deg=float(np.degrees(np.arcsin(np.clip(d[2], -1.0, 1.0)))), pitch_deg=float(np.degrees(phi)),
+                     launch_index=k_launch, release_index=k_rel, release_end_index=k_end, egg_release=egg0,
+                     z_aim=plan["z_aim"], egg_rest_height=rest)
+        # Keypoints: every flick_kp_every-th sample of the throw that is a training-like goal (speed and height),
+        # and always the release. None while the velocity turns round at the release and for 2 steps after: a goal
+        # there has the head arrive from beyond its plane, so it would never be crossed.
+        v_max = env.cfg.curriculum.speed_max[1] + 1e-6
+        z_lo, z_hi = (env.rinfo.table_top + x for x in gc.height)
+        turning = range(k_rel + 1, k_rel + n_r + 3)
+        ok = [k for k in range(k_launch + 1, k_end + 1) if k not in turning
+              and gc.speed_min <= np.linalg.norm(tr.v[k]) <= v_max and z_lo <= tr.p[k][2] <= z_hi]
+        for k in sorted(set(ok[::tc.flick_kp_every]) | ({k_rel} & set(ok))):
+            tr.add_keypoint(k)
+        return tr if tr.keypoints else None
+
+    # ---------------------------------------------------------------- measurement
+    def begin(self, env) -> None:
+        self.st = {"released": False, "t_release": None, "v_release": None, "t_free": None, "v_free": None,
+                   "land": None, "t_land": None,
+                   "first_touch": None, "touched_bowl": False, "rest": 0.0, "t_end": None, "fail": None,
+                   "success": False}
+
+    def snapshot(self, env):
+        return copy.deepcopy(self.st)
+
+    def restore(self, env, snap) -> None:
+        self.st = copy.deepcopy(snap)
+
+    def _fail(self, env, reason: str) -> None:
+        if self.st["t_end"] is None:
+            self.st["fail"] = reason
+            self.st["t_end"] = float(env.data.time)
+
+    def measure(self, env) -> None:
+        st, tc = self.st, self.tc
+        if st is None or st["t_end"] is not None:
+            return
+        m, d = env.model, env.data
+        p, v = self._egg(env)
+        touch_tool = touch_bowl = touch_ground = False
+        for i in range(d.ncon):
+            g1, g2 = int(d.contact.geom1[i]), int(d.contact.geom2[i])
+            if g1 == self.egg_gid:
+                other = g2
+            elif g2 == self.egg_gid:
+                other = g1
+            else:
+                continue
+            b = int(m.geom_bodyid[other])
+            if b == env.tool_id or b in env.robot_body_set:
+                touch_tool = True
+            elif other in self.bowl_gids:
+                touch_bowl = True
+            elif other in self.ground_gids:
+                touch_ground = True
+        t = float(d.time)
+        if not st["released"]:
+            # Released: out of contact with the spatula for egg_release_time once the launch has begun (the egg rolls
+            # off over the open front of the cradle, or flies off). Before that, leaving the cradle is a drop.
+            launched = env.task_t > env.trace.meta["launch_index"]
+            off_cradle = np.linalg.norm(self._egg_rel(env, p)) > 0.01
+            if touch_ground or touch_bowl or (not launched and off_cradle):
+                self._fail(env, "dropped")
+            elif touch_tool or not launched:
+                st["t_free"], st["v_free"] = None, None
+            else:
+                if st["t_free"] is None:
+                    st["t_free"], st["v_free"] = t, v.tolist()
+                if t - st["t_free"] >= tc.egg_release_time:
+                    st["released"], st["t_release"], st["v_release"] = True, st["t_free"], st["v_free"]
+            if not st["released"] and env.task_t > env.trace.meta["release_end_index"] + int(round(0.5 / env.dt)):
+                self._fail(env, "not_released")
+            if not st["released"]:
+                return
+        z_aim, bowl = env.trace.meta["z_aim"], np.asarray(env.trace.meta["bowl"])
+        if st["land"] is None and v[2] < 0 and p[2] <= z_aim:
+            st["land"], st["t_land"] = p[:2].tolist(), t
+        if st["first_touch"] is None and (touch_tool or touch_bowl or touch_ground):
+            st["first_touch"] = "tool" if touch_tool else ("bowl" if touch_bowl else "table")
+        st["touched_bowl"] |= touch_bowl
+        if touch_ground or p[2] < env.rinfo.table_top - 0.05:
+            self._fail(env, "bounced_out" if st["touched_bowl"] else "missed")
+            return
+        inside = np.linalg.norm(p[:2] - bowl[:2]) < tc.bowl_radius and p[2] < env.rinfo.table_top + tc.bowl_height
+        st["rest"] = st["rest"] + m.opt.timestep if (inside and np.linalg.norm(v) < tc.egg_rest_speed) else 0.0
+        if st["rest"] >= tc.egg_rest_time:
+            st["success"], st["t_end"] = True, t
+        elif t - st["t_release"] > tc.flick_timeout:
+            self._fail(env, "on_spatula" if touch_tool else "missed")
+
+    def done(self, env) -> bool:
+        st = self.st
+        if st["t_end"] is None:
+            return False
+        return float(env.data.time) - st["t_end"] >= (0.0 if st["success"] else 0.3)
+
+    def metrics(self, env) -> dict:
+        st, meta = self.st, env.trace.meta
+        nan = float("nan")
+        out = {"success": bool(st["success"]), "released": bool(st["released"]),
+               "fail_reason": st["fail"] or ("-" if st["success"] else ("missed" if st["released"] else "not_released")),
+               "first_touch": st["first_touch"] or "-", "follower_land_err": float(meta.get("follower_land_err", nan)),
+               "launch_speed": float(meta["launch_speed"])}
+        bowl, e = np.asarray(meta["bowl"]), np.asarray(meta["heading"])
+        out["bowl_dist"] = float(np.linalg.norm((bowl - np.asarray(meta["egg_release"]))[:2]))
+        out.update(release_speed=nan, release_speed_err=nan, release_elev_deg=nan, land_err=nan, land_along=nan,
+                   land_across=nan, flight_time=nan)
+        if st["released"]:
+            vr = np.asarray(st["v_release"])
+            out["release_speed"] = float(np.linalg.norm(vr))
+            # Against the reference follower's release (which landed the egg in the bowl's center), like the hammer
+            # tasks' speed_err; the egg leaves somewhat slower than the trace's launch speed.
+            v_ref = float(meta.get("follower_release_speed", out["launch_speed"]))
+            out["release_speed_err"] = out["release_speed"] / v_ref - 1.0
+            out["release_elev_deg"] = float(np.degrees(np.arctan2(vr[2], np.linalg.norm(vr[:2]))))
+        if st["land"] is not None:
+            dx = np.asarray(st["land"]) - bowl[:2]
+            out["land_err"] = float(np.linalg.norm(dx))
+            out["land_along"] = float(dx @ e[:2])
+            out["land_across"] = float(dx @ np.cross(_UP, e)[:2])
+            out["flight_time"] = float(st["t_land"] - st["t_release"])
+        return out
+
+    def camera(self, env, cam) -> None:
+        """From the side of the throw, framing the release point and the bowl."""
+        if env.trace is None or env.trace.meta.get("task") != self.name:
+            return
+        meta = env.trace.meta
+        c = 0.5 * (np.asarray(meta["egg_release"]) + np.asarray(meta["bowl"]))
+        cam.lookat[:] = c
+        cam.distance = 0.8
+        ax = np.cross(_UP, np.asarray(meta["heading"])) + 0.3 * np.asarray(meta["heading"])
+        cam.azimuth = float(np.degrees(np.arctan2(-ax[1], -ax[0])))
+        cam.elevation = -15.0
+
+
 TASKS = {"plate": PlateTask, "nail": NailTask, "sweep": SweepTask, "slice": SliceTask,
-         "slice_tomato": TomatoSliceTask}
+         "slice_tomato": TomatoSliceTask, "flick": FlickTask}

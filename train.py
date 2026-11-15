@@ -117,8 +117,15 @@ def parse_args():
                         "drives the curriculum and ckpt_best (0: use the stochastic training episodes)")
     p.add_argument("--grip-mode", default=None, choices=["weld", "physical"],
                    help="override EnvCfg.grip_mode (also on --resume)")
-    p.add_argument("--action-mode", default=None, choices=["head_twist", "joint"],
+    p.add_argument("--action-mode", default=None, choices=["head_twist", "joint", "joint_vel"],
                    help="override EnvCfg.action_mode (also on --resume)")
+    p.add_argument("--joint-v-max", type=float, nargs=6, default=None, metavar="V",
+                   help="override EnvCfg.joint_v_max (rad/s per arm joint at action 1, joint_vel mode)")
+    p.add_argument("--no-kin-obs", action="store_true",
+                   help="joint_vel: leave the Jacobian-projected goal errors out of the observation (EnvCfg.kin_obs)")
+    p.add_argument("--init-log-std", type=float, default=None,
+                   help="set the actor's log std after --init-from / at the start (default: PPOCfg.init_log_std, or "
+                        "the checkpoint's). The same std is a different head-velocity noise in each action mode")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--level", type=float, default=0.0, help="initial curriculum level")
     p.add_argument("--fixed-level", action="store_true", help="disable automatic curriculum")
@@ -213,6 +220,10 @@ def main():
         env_cfg.grip_mode = args.grip_mode
     if args.action_mode is not None:
         env_cfg.action_mode = args.action_mode
+    if args.joint_v_max is not None:
+        env_cfg.joint_v_max = tuple(args.joint_v_max)
+    if args.no_kin_obs:
+        env_cfg.kin_obs = False
     if args.eps_p is not None:
         env_cfg.curriculum.eps_p = tuple(args.eps_p)
     if args.eps_kp is not None:
@@ -257,6 +268,8 @@ def main():
     priv_dim = venv.priv_dim
     print(f"obs_dim={obs_dim} priv_dim={priv_dim} act_dim={act_dim}")
 
+    if env_cfg.action_mode == "joint_vel":
+        ppo_cfg.init_log_std = ppo_cfg.init_log_std_joint_vel
     agent = ActorCritic(obs_dim, priv_dim, act_dim, ppo_cfg).to(device)
     ppo = PPO(agent, ppo_cfg)
     scaler = ReturnScaler(args.num_envs, ppo_cfg.gamma)
@@ -280,6 +293,10 @@ def main():
         # Weights and observation normalizers only. bc.py leaves log_std at init_log_std.
         agent.load_state_dict(init["agent"])
         print(f"initialized weights from {args.init_from}")
+    if args.init_log_std is not None and ckpt is None:
+        with torch.no_grad():
+            agent.log_std.fill_(args.init_log_std)
+        print(f"log_std set to {args.init_log_std} (std {np.exp(args.init_log_std):.3f})")
     critic_warmup = args.critic_warmup if args.critic_warmup is not None else (20 if init is not None else 0)
     venv.call("set_curriculum", curriculum.level)
 

@@ -63,8 +63,8 @@ class PoseVelocityEnv(gym.Env):
         self.cfg = cfg or EnvCfg()
         if self.cfg.grip_mode not in ("weld", "physical"):
             raise ValueError(f"grip_mode must be 'weld' or 'physical', got {self.cfg.grip_mode!r}")
-        if self.cfg.action_mode not in ("head_twist", "joint"):
-            raise ValueError(f"action_mode must be 'head_twist' or 'joint', got {self.cfg.action_mode!r}")
+        if self.cfg.action_mode not in ("head_twist", "joint", "joint_vel"):
+            raise ValueError(f"action_mode must be 'head_twist', 'joint' or 'joint_vel', got {self.cfg.action_mode!r}")
         if self.cfg.pose_success not in ("hold", "touch"):
             raise ValueError(f"pose_success must be 'hold' or 'touch', got {self.cfg.pose_success!r}")
         self.weld = self.cfg.grip_mode == "weld"
@@ -739,6 +739,9 @@ class PoseVelocityEnv(gym.Env):
         na = self.n_arm_act
         if cfg.action_mode == "head_twist":
             self.targets[:na] = self._head_twist_targets(a[:na])
+        elif cfg.action_mode == "joint_vel":
+            dq = np.clip(a[:na] * self._joint_v_max(), -cfg.max_joint_speed, cfg.max_joint_speed)
+            self.targets[:na] = self.data.qpos[self.arm_qadr] + dq * self.arm_lead
         else:
             self.targets[:na] = self.targets[:na] + a[:na] * self.act_scale[:na]
         if not self.weld:
@@ -899,6 +902,8 @@ class PoseVelocityEnv(gym.Env):
         if self.cfg.action_mode == "joint":
             # Joint actions move the servo targets, which then lead the joints; the gap drives the arm.
             parts.append(self.targets[:self.n_arm_act] - d.qpos[self.arm_qadr])
+        if self.cfg.action_mode == "joint_vel" and self.cfg.kin_obs:
+            parts.append(self._kin_features(head, lin))
         parts += [palm, mu.rot6d(R_palm)]
         if not self.weld:
             parts += [(d.xpos[self.tip_ids] - palm).ravel(), self.tip_contact, [self.palm_contact]]
@@ -946,7 +951,44 @@ class PoseVelocityEnv(gym.Env):
         a = self._oracle(self)
         if self.cfg.action_mode == "joint":
             a = self.joint_action_for_twist(a)
+        elif self.cfg.action_mode == "joint_vel":
+            a = self.joint_vel_action_for_twist(a)
         return a.astype(np.float32)
+
+    def _joint_v_max(self) -> np.ndarray:
+        v = np.asarray(self.cfg.joint_v_max, dtype=np.float64)
+        if v.shape != (self.n_arm_act,):
+            raise ValueError(f"joint_v_max needs {self.n_arm_act} values, got {self.cfg.joint_v_max!r}")
+        return v
+
+    def _dls_pinv(self) -> np.ndarray:
+        """Damped pseudo-inverse of the head Jacobian (the map _twist_dq applies), n_arm x 6."""
+        J = self._head_jacobian()
+        return J.T @ np.linalg.inv(J @ J.T + self.cfg.ik_damping ** 2 * np.eye(6))
+
+    def _kin_features(self, head: np.ndarray, lin: np.ndarray) -> np.ndarray:
+        """Goal errors mapped into joint space (kin_obs, joint_vel): P([x; 0]) and P([0; w]) for the parts of
+        the oracle's twist, P = DLS pseudo-inverse of the head Jacobian over joint_v_max. P is linear, so the oracle's
+        joint velocity is close to a weighted sum of these, its gains, caps and strike blend as the weights; the policy
+        learns that weighting instead of the IK. Pose-only drops the goal-velocity terms. All of it is computable on a
+        real robot from its kinematics and the grasp."""
+        g = self.goal
+        P = self._dls_pinv() / self._joint_v_max()[:, None]
+        z = np.zeros(3)
+        lin_terms = [self.lead_point() - head if self.cfg.goal_velocity else g.p - head]
+        if self.cfg.goal_velocity:
+            rel = head - g.p
+            lin_terms += [g.v, rel - (rel @ g.direction) * g.direction, lin - g.v]
+        cols = [P[:, :3] @ x for x in lin_terms] + [P[:, 3:] @ self._rot_error()]
+        return np.concatenate(cols)
+
+    def joint_vel_action_for_twist(self, twist_action: np.ndarray) -> np.ndarray:
+        """joint_vel arm action for a head-twist action: the DLS joint velocity over joint_v_max (unsmoothed, so the
+        env's EMA smooths it as head_twist smooths the twist; they differ only by how much J changes in the EMA's
+        ~5-step window). No EMA inversion, so the label is a smooth function of the state."""
+        dq = self._twist_dq(np.clip(np.asarray(twist_action, dtype=np.float64)[:6], -1.0, 1.0))
+        dq = np.clip(dq, -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
+        return np.clip(dq / self._joint_v_max(), -1.0, 1.0)
 
     def _commanded_dq(self) -> np.ndarray:
         """The arm joint velocity the servo targets command (joint mode): (targets - q0) / lead.
@@ -969,7 +1011,12 @@ class PoseVelocityEnv(gym.Env):
         """
         if self.cfg.action_mode == "head_twist":
             return self.prev_action[:6].copy()
-        twist = self._head_jacobian() @ self._commanded_dq()
+        if self.cfg.action_mode == "joint_vel":
+            dq = np.clip(self.prev_action[:self.n_arm_act] * self._joint_v_max(),
+                         -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
+        else:
+            dq = self._commanded_dq()
+        twist = self._head_jacobian() @ dq
         return np.clip(np.concatenate([twist[:3] / self.cfg.head_v_max, twist[3:] / self.cfg.head_w_max]), -1.0, 1.0)
 
     def joint_action_for_twist(self, twist_action: np.ndarray) -> np.ndarray:
