@@ -127,3 +127,30 @@ class PoseOracle:
             v *= self.v_approach / n
         w = self.k_rot * env._rot_error()
         return np.clip(np.concatenate([v / env.cfg.head_v_max, w / env.cfg.head_w_max]), -1.0, 1.0)
+
+
+class ChainPoseOracle:
+    """Scripted expert for timed pose sub-goals (EnvCfg.pose_chain, pose-only "touch"). Uses only what the pose-only
+    observation shows: the current sub-goal pose and its clock.
+
+    Sub-goal 0 (the lead-in point, untimed) is a PoseOracle reach. After that it heads for the current sub-goal at
+    the speed that reaches it on time, (p_k - head) / (time left), with at least one step left and the speed
+    capped at head_v_max. Consecutive sub-goals are spacing / |v_g| apart in time, so the head moves at about v_g
+    through them, but only to the extent that the timing conveys it.
+    """
+
+    def __init__(self, k_rot: float = 4.0, **reach_kw):
+        self.reach = PoseOracle(k_rot=k_rot, **reach_kw)
+        self.k_rot = k_rot
+
+    def __call__(self, env) -> np.ndarray:
+        if env.sub_idx == 0:
+            return self.reach(env)
+        dt = env.model.opt.timestep * env.cfg.frame_skip
+        left = max(1.0, env.sub_budget[env.sub_idx] - env.t_sub) * dt
+        v = (env.goal.p - env._head_state()[0]) / left
+        n = np.linalg.norm(v)
+        if n > env.cfg.head_v_max:
+            v *= env.cfg.head_v_max / n
+        w = self.k_rot * env._rot_error()
+        return np.clip(np.concatenate([v / env.cfg.head_v_max, w / env.cfg.head_w_max]), -1.0, 1.0)

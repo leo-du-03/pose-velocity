@@ -30,14 +30,14 @@ def test_velocity_match_is_one_at_the_goal_velocity_and_1_over_e_at_its_scale():
 
 def test_step_terms_pay_progress_below_the_best_and_the_bonus_only_on_the_attempt():
     c = RewardCfg()
-    kw = dict(dv=0.0, speed=0.4, qvel_l1=0.0)
+    kw = dict(dv=0.0, speed=0.4, qvel_cost=0.0)
     t, _ = step_terms(c, d=0.10, d_star=0.12, attempt=False, **kw)
     assert np.isclose(t["keypoint"], c.keypoint_rew_scale * 0.02) and t["bonus"] == 0.0
     t, _ = step_terms(c, d=0.14, d_star=0.12, attempt=False, **kw)  # moving away (a wind-up) costs nothing
     assert t["keypoint"] == 0.0
     t, q_v = step_terms(c, d=0.02, d_star=0.02, attempt=True, **kw)
     assert np.isclose(t["bonus"], c.reach_goal_bonus) and np.isclose(q_v, 1.0)
-    t, _ = step_terms(c, d=0.02, d_star=0.02, attempt=True, dv=0.4, speed=0.4, qvel_l1=2.0)
+    t, _ = step_terms(c, d=0.02, d_star=0.02, attempt=True, dv=0.4, speed=0.4, qvel_cost=2.0)
     assert t["bonus"] < 0.02 * c.reach_goal_bonus
     assert np.isclose(t["smooth"], -c.arm_vel_penalty * 2.0)
 
@@ -45,7 +45,7 @@ def test_step_terms_pay_progress_below_the_best_and_the_bonus_only_on_the_attemp
 def test_step_terms_bonus_frac_overrides_the_velocity_match():
     """Pose-only: the env passes bonus_frac (1 for "touch", 1 / success_steps per near step for "hold")."""
     c = RewardCfg()
-    kw = dict(d=0.02, d_star=0.02, dv=0.4, speed=0.4, qvel_l1=0.0)  # wrong velocity: q_v would be ~0
+    kw = dict(d=0.02, d_star=0.02, dv=0.4, speed=0.4, qvel_cost=0.0)  # wrong velocity: q_v would be ~0
     t, _ = step_terms(c, attempt=True, bonus_frac=1.0, **kw)
     assert np.isclose(t["bonus"], c.reach_goal_bonus)
     t, _ = step_terms(c, attempt=False, bonus_frac=0.1, **kw)

@@ -16,7 +16,8 @@ from collections import defaultdict, deque
 
 import numpy as np
 
-from config import EnvCfg, PPOCfg, RewardCfg
+from config import (EnvCfg, PPOCfg, RewardCfg, add_goal_ablation_args, apply_goal_ablation_args, describe_goal,
+                    goal_obs_key)
 from env import make_env
 from vec_env import SerialVecEnv, SubprocVecEnv
 
@@ -154,6 +155,12 @@ def parse_args():
                         "e.g. --eps-v-frac 0.6 0.1")
     p.add_argument("--sigma-v-frac", type=float, default=None,
                    help="velocity scale (fraction of the goal speed) of the attempt bonus, e.g. 0.1")
+    add_goal_ablation_args(p)
+    p.add_argument("--arm-vel-penalty", type=float, default=None,
+                   help="weight of the smoothness term (RewardCfg.arm_vel_penalty, default 0.03); 0 removes it")
+    p.add_argument("--smooth-norm", default=None, choices=["l1", "l2", "l2sq"],
+                   help="norm of the arm joint velocities in the smoothness term (RewardCfg.smooth_norm): l1 sum |qdot| "
+                        "(default), l2 |qdot|_2, l2sq sum qdot^2")
     p.add_argument("--min-dir-z", type=float, default=None,
                    help="steepest allowed downward goal velocity (z of its direction); -1 allows straight-down strikes")
     p.add_argument("--grasp-slide", type=float, default=None,
@@ -234,16 +241,28 @@ def main():
         env_cfg.reward.sigma_v_frac = args.sigma_v_frac
     if args.min_dir_z is not None:
         env_cfg.goal.min_dir_z = args.min_dir_z
+    if args.arm_vel_penalty is not None:
+        env_cfg.reward.arm_vel_penalty = args.arm_vel_penalty
+    if args.smooth_norm is not None:
+        env_cfg.reward.smooth_norm = args.smooth_norm
+    # Goal-velocity ablations. Flags that change the actor observation can't be applied on top of a checkpoint
+    # trained with another one (its weights expect that layout); the reward and the velocity cone can.
+    loaded_key = goal_obs_key(env_cfg)
+    apply_goal_ablation_args(env_cfg, args)
+    if (args.resume or args.init_from) and goal_obs_key(env_cfg) != loaded_key:
+        raise SystemExit("--pose-only / --no-vel-obs / --pose-chain change the observation; set them in bc.py (or "
+                         "train from scratch) instead of on top of a checkpoint trained without them")
     if args.grasp_slide is not None:
         env_cfg.grasp_slide = args.grasp_slide
     if args.ik_fail_tol is not None:
         env_cfg.ik_fail_tol = args.ik_fail_tol
-    goal_txt = "pose+velocity" if env_cfg.goal_velocity else f"pose-only ({env_cfg.pose_success})"
+    goal_txt = describe_goal(env_cfg)
     print(f"goal={goal_txt}  grip={env_cfg.grip_mode} actions={env_cfg.action_mode}  "
           f"eps_kp (level 0 -> 1) = {env_cfg.curriculum.eps_kp}  "
           f"eps_v_frac = {env_cfg.curriculum.eps_v_frac}  sigma_v_frac = {env_cfg.reward.sigma_v_frac}  "
           f"min_dir_z = {env_cfg.goal.min_dir_z}  grasp_slide = {env_cfg.grasp_slide}  "
-          f"ik_fail_tol = {env_cfg.ik_fail_tol}")
+          f"ik_fail_tol = {env_cfg.ik_fail_tol}  smooth = {env_cfg.reward.arm_vel_penalty} x "
+          f"{getattr(env_cfg.reward, 'smooth_norm', 'l1')}")
 
     run_name = args.name or time.strftime("posevel_%Y%m%d_%H%M%S")
     run_dir = os.path.join(args.logdir, run_name)

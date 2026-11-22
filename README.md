@@ -160,6 +160,30 @@ Run every command from the project root.
    ```
    See [Task evaluation](#task-evaluation) below.
 
+## Goal-velocity ablations
+
+What does the goal velocity add over a pose-only goal? These settings take the pose + velocity goal apart. All of
+them are saved in the checkpoint, so `train.py --init-from` inherits them from `bc.py`.
+
+- `--no-vel-obs` (`velocity_obs`): the velocity goal and reward, but the actor sees the pose-only observation (the
+  critic gets `v_g`). The oracle still strikes at `v_g`, so the clone can only learn an average.
+- `--no-vel-reward` (`velocity_reward`): `v_g` is observed, but the attempt bonus is flat, so PPO gets no velocity
+  signal. Success still needs the velocity.
+- `--pose-chain N` (`pose_chain`, pose-only `touch`): the strongest pose-only baseline, a velocity spelled out as
+  timed poses. Each goal becomes a sub-goal at the lead-in point (untimed approach), then N more along the strike
+  line to `p_g`, in the goal orientation, each due `lead_in / N / |v_g|` after the last. The time input shows the
+  current sub-goal's clock; one more than `pose_chain_slack` (2×) late ends the episode. Intermediate sub-goals are
+  reached within `min(eps_kp, spacing / 2)`; the last one is the ordinary touch attempt. The expert is
+  `oracle.ChainPoseOracle`, which flies each segment in the time it is given.
+- `evaluate.py` scores every policy by one rule at the attempt, with the evaluated level's tolerances: pose
+  (`dp < eps_p`, rotation `< eps_theta`), velocity (`|v − v_g| < eps_v_frac·|v_g|`) and both (`joint_ok`). Pose-only
+  policies never see `v_g`, but it is still sampled, so their velocity at the attempt is what a pose goal gives for
+  free. `--dump` saves it per episode for `analyze_ablation.py`.
+
+Scripted experts at level 1 (100 episodes, default tolerances, `joint_ok`): velocity `Oracle` 0.79; `PoseOracle`
+0.00 (it settles at the pose: `dv` ≈ 1.0·|v_g|); `ChainPoseOracle` 0.41 / 0.66 / 0.80 at N = 2 / 4 / 8. A finely timed
+pose chain carries the velocity for an expert; whether a learned policy can follow one is what the chain runs test.
+
 ## Task evaluation
 
 `tasks.py` builds five task envs on top of `PoseVelocityEnv`, each with a fixed tool and fixtures:
@@ -214,9 +238,9 @@ Each episode samples an instance and builds a **trace**: head position, tool ori
     | error | rule | what you see |
     |---|---|---|
     | velocity | the edge presses more than `crush_depth` (6 mm) into uncut loaf without slicing, i.e. with tangential speed under `cut_speed_min` (0.12 m/s) or under `slice_ratio_min` (1.5) × its speed into the loaf | **crushed**: the loaf squashes flat and turns dark |
-    | orientation | inside the loaf, the blade face turns more than `bind_deg` (10°) from the cut plane | **jammed**: the knife sticks and the arm is held where it is |
-    | position, sideways | inside the loaf, the blade moves more than `bind_slack` (4 mm) sideways in its kerf | **jammed** |
-    | position, on the line | the edge cuts more than `line_tol` (6 mm) from the marked line | **off the line**: the kerf is drawn red, and the halves stay shut |
+    | orientation | inside the loaf, the blade face turns more than `bind_deg` (15°) from the cut plane | **jammed**: the knife sticks and the arm is held where it is |
+    | position, sideways | inside the loaf, the blade moves more than `bind_slack` (1 cm) sideways in its kerf | **jammed** |
+    | position, on the line | the edge cuts more than `line_tol` (2 cm) from the marked line | **off the line**: the kerf is drawn red, and the halves stay shut |
     | position, too deep | the blade presses more than `board_force_limit` (25 N) on the board (the follower presses ~0 N; 1.5 cm too deep gives ~35 N) | **chopped into the board**: it turns red |
     | position, too shallow | some column isn't cut to within `through_tol` (3 mm) of the bottom | **not through**: the halves stay shut |
 
@@ -229,7 +253,7 @@ Each episode samples an instance and builds a **trace**: head position, tool ori
   - So the force settles where the cut keeps pace with the knife's descent. Descending too steeply for the sliding (twice the trace's slope is enough), or pressing without sliding, crushes it.
   - The trace plans its depth with the same rule: the edge rides 5 mm (2.5 N) below the predicted floor of the cut. The reference follower cuts at about 2.1 N and peaks at about 3 N.
   - The force isn't applied back to the knife. The arm's velocity servos give way under a few newtons, so a knife the tomato pushed back on could never press hard enough to crush it, whatever the policy did.
-  - Position matters much less than for the loaf. Any cut within `tomato_line_tol` (8 mm) of the middle halves it, and the blade only jams past `tomato_bind_deg` (30°) or `tomato_bind_slack` (2 cm), since the soft flesh doesn't bind it. The strokes reach far past the tomato on both sides, so where along the blade it is cut doesn't matter.
+  - Any cut within `tomato_line_tol` (8 mm) of the middle halves it, and the blade only jams past `tomato_bind_deg` (30°) or `tomato_bind_slack` (2 cm), looser than the loaf's, since the soft flesh doesn't bind it. The strokes reach far past the tomato on both sides, so where along the blade it is cut doesn't matter.
   - On success the halves roll open onto their backs.
   - The knife is held like a kitchen knife (`person_grasp`, shared with the hammer): the handle across the fingers, the blade beyond the index finger, and the edge pointing the way the knuckles do.
 - **"Followed exactly"** is defined by `traces.TraceFollower` (`--policy trace`). It tracks the trace with feedforward plus feedback, and inverts the action EMA so the smoothed command equals what it asks for. On the in-distribution layout it hits the target force to within about 1% and clears all of the dirt under the `force` rule (about 91% of episodes clear ≥95% under `scrub`, where it sometimes falls short of the force on a stroke), with about 2 mm of path error.
@@ -312,6 +336,13 @@ Defaults marked `PPOCfg` come from `config.py`.
 | `--eps-v-frac LEVEL0 LEVEL1` | `0.6 0.25` | Success velocity tolerance as a fraction of the goal speed at curriculum level 0 and 1. Also overrides a resumed checkpoint's config. The scripted oracle meets 0.15 about 64% of the time and 0.1 only about 18%, so don't go below about 0.15 |
 | `--sigma-v-frac S` | `0.25` | Velocity scale (fraction of the goal speed) of the attempt bonus. Also overrides a resumed checkpoint's config |
 | `--min-dir-z Z` | `-0.5` | Steepest downward goal velocity (the z of its direction); `-1` allows straight-down strikes such as the vertical nail task. Also overrides a resumed checkpoint's config |
+| `--pose-only {hold,touch}` | off | Pose-only baseline from scratch. With `--init-from` it comes from the checkpoint; flags that change the observation (`--pose-only`, `--no-vel-obs`, `--pose-chain`) can't be put on top of one |
+| `--no-vel-obs` | off | Ablation: keep the velocity goal and reward, but give the actor the pose-only observation (`EnvCfg.velocity_obs`); `v_g` goes to the critic |
+| `--no-vel-reward` | off | Ablation: flat attempt bonus, not scaled by the velocity match (`EnvCfg.velocity_reward`); success still needs the velocity |
+| `--arm-vel-penalty W` | `0.03` | Weight of the smoothness term (`RewardCfg.arm_vel_penalty`); `0` removes it |
+| `--smooth-norm {l1,l2,l2sq}` | `l1` | Norm of the arm joint velocities in the smoothness term (`RewardCfg.smooth_norm`). The trained strike policy averages L1 3.85, L2 1.90 and L2² 4.26 per step, so the weight that matches L1 at 0.03 is 0.061 for `l2` and 0.027 for `l2sq` |
+| `--pose-chain N` | off | Pose-only `touch`: timed pose sub-goals along the strike line, the lead-in point and then N more (`EnvCfg.pose_chain`, see [Goal-velocity ablations](#goal-velocity-ablations)) |
+| `--vel-cone L0 L1` | `30 180` | Max angle (deg) between the goal velocity and the head axis at curriculum level 0 and 1 (`CurriculumCfg.vel_cone_deg`) |
 | `--grasp-slide F` | `0.3` | Weld grasps slide up to this fraction of the handle's half length from its center; `0.7` reaches grips near the end of the handle, like the task hammer grip. Also overrides a resumed checkpoint's config |
 
 ### `evaluate.py`
@@ -333,6 +364,10 @@ Defaults marked `PPOCfg` come from `config.py`.
 | `--realtime` | off | Slow down to real time in the viewer |
 | `--seed N` | `0` | Seed for the env and the random policy |
 | `--device DEVICE` | `cpu` | Torch device for the policy |
+| `--pose-chain N` | from checkpoint | Pose-only `touch`: timed pose sub-goals (also on a checkpoint; the observation layout is the same) |
+| `--vel-cone L0 L1` | from checkpoint | Override the velocity cone, e.g. `30 180` to test a strikes-only checkpoint on swipes |
+| `--score-eps-v-frac L0 L1` | from checkpoint | Velocity tolerance used only for `vel_ok` / `joint_ok` in the summary and dump (the env and observation keep the checkpoint's), so runs trained with different tolerances are scored alike |
+| `--dump PATH` | none | Write every episode's outcome and attempt diagnostics to JSON, for `analyze_ablation.py` |
 | `--table-start` | off | Physical grip only: every episode starts with a new tool on the table (no in-hand starts, no soft resets); the arm still stays where the previous episode left it |
 
 ### `bc.py`
@@ -356,6 +391,12 @@ Weld grip only (the oracle needs it). With `--action-mode joint` or `joint_vel` 
 | `--recent-rounds N` | `10` | The newest N rounds of data form the "recent" pool |
 | `--recent-frac F` | `0.5` | Fraction of each batch drawn from the recent pool; the rest comes from the whole dataset |
 | `--levels LO HI` | `0 1` | Curriculum levels the envs are spread over |
+| `--pose-only {hold,touch}` | off | Clone the pose-only baseline (`PoseOracle`) |
+| `--no-vel-obs` | off | Ablation: keep the velocity goal and reward, but give the actor the pose-only observation (`EnvCfg.velocity_obs`); `v_g` goes to the critic |
+| `--no-vel-reward` | off | Ablation: flat attempt bonus, not scaled by the velocity match (`EnvCfg.velocity_reward`); success still needs the velocity |
+| `--pose-chain N` | off | Pose-only `touch`: timed pose sub-goals along the strike line, the lead-in point and then N more (`EnvCfg.pose_chain`, see [Goal-velocity ablations](#goal-velocity-ablations)) |
+| `--vel-cone L0 L1` | `30 180` | Max angle (deg) between the goal velocity and the head axis at curriculum level 0 and 1 (`CurriculumCfg.vel_cone_deg`) |
+| `--eps-v-frac L0 L1`, `--sigma-v-frac S` | from config | Velocity tolerance and bonus scale, saved in the checkpoint |
 | `--action-mode {head_twist,joint,joint_vel}` | `head_twist` (`EnvCfg.action_mode`) | Action space of the cloned policy |
 | `--arm-action-scale S` | `0.03` (`EnvCfg.arm_action_scale`) | Joint mode: rad per step at action 1 (0.1 recommended) |
 | `--joint-v-max V×6` | `2 2 2.5 3 3 3` (`EnvCfg.joint_v_max`) | `joint_vel`: rad/s per arm joint at action 1 |
@@ -417,6 +458,7 @@ Weld grip only (the oracle needs it). With `--action-mode joint` or `joint_vel` 
 | `bc.py` | DAgger behavior cloning of the oracle into the actor, as an initialization for `train.py --init-from` |
 | `traces.py` | Reference traces (head pose and velocity over time), their segment builders, and the `TraceFollower` |
 | `tasks.py` | `TaskEnv` and the plate, nail, sweep, slice and slice_tomato tasks: fixtures, instance sampling, trace calibration, metrics |
+| `analyze_ablation.py` | Tables over `evaluate.py --dump` files: conditions `<name>_s<seed>` as mean ± std over seeds, optionally binned by swipe angle, speed and downward strikes |
 | `evaluate_tasks.py` | Task evaluation: per-episode metrics and a summary, viewer, video, trace export |
 
 ## How an episode works

@@ -44,7 +44,7 @@ from gymnasium.utils import seeding
 import mathutils as mu
 from config import EnvCfg
 from goals import Goal, GoalSampler, ReachMap, plane_crossing
-from rewards import grasp_potential, keypoint_distance, keypoint_offsets, step_terms
+from rewards import arm_vel_cost, grasp_potential, keypoint_distance, keypoint_offsets, step_terms
 from scene import SceneBuilder
 from tool_gen import ToolParams, sample_tool
 
@@ -70,6 +70,18 @@ class PoseVelocityEnv(gym.Env):
         self.weld = self.cfg.grip_mode == "weld"
         # Pose-only baseline (goal_velocity False): "hold" counts near steps (SimToolReal), "touch" ends on the first.
         self.pose_hold = (not self.cfg.goal_velocity) and self.cfg.pose_success == "hold"
+        # Goal-velocity ablations (EnvCfg.velocity_obs / velocity_reward / pose_chain; getattr for older configs).
+        self.vel_obs = self.cfg.goal_velocity and getattr(self.cfg, "velocity_obs", True)
+        self.vel_reward = self.cfg.goal_velocity and getattr(self.cfg, "velocity_reward", True)
+        self.chain_n = int(getattr(self.cfg, "pose_chain", 0))
+        arm_vel_cost(np.zeros(1), getattr(self.cfg.reward, "smooth_norm", "l1"))  # ValueError on an unknown norm
+        if self.chain_n < 0:
+            raise ValueError(f"pose_chain must be >= 0, got {self.chain_n}")
+        if self.chain_n and (self.cfg.goal_velocity or self.cfg.pose_success != "touch"):
+            raise ValueError("pose_chain needs the pose-only baseline with pose_success 'touch'")
+        self.sub_goals: list = []  # pose_chain: the current goal's sub-goals (self.goal is sub_goals[sub_idx])
+        self.sub_idx, self.t_sub, self.sub_budget = 0, 0, [float(self.cfg.max_steps)]
+        self.goal_full: Optional[Goal] = None  # the sampled goal (self.goal is its current sub-goal with pose_chain)
         self.render_mode = render_mode
         self._np_random, _ = seeding.np_random(self.cfg.seed)
         self.builder = SceneBuilder(self.cfg.scene)
@@ -637,7 +649,31 @@ class PoseVelocityEnv(gym.Env):
         if goal is None:
             goal = self.goal_sampler.sample(self.np_random, speed_max, vel_cone, self.tool.head_axis)
         self.goal: Goal = goal
+        self.goal_full = goal
+        if self.chain_n:
+            self._build_chain(goal)
         self._update_goal_markers()
+
+    def _build_chain(self, goal: Goal) -> None:
+        """pose_chain: sub-goal 0 at the lead-in point (untimed approach), then chain_n more along the strike line, the
+        last at p_g, all in the goal orientation and carrying v_g (pose-only never observes it; diagnostics use it).
+        Sub-goal k > 0 is due spacing / |v_g| after the previous one; sub-goal 0 gets the rest of max_steps."""
+        n, lead = self.chain_n, self.cfg.goal.lead_in
+        d = goal.direction
+        start = goal.p - lead * d
+        self.sub_goals = [Goal(p=start + (k * lead / n) * d, v=goal.v.copy(), quat=goal.quat, axis=goal.axis,
+                               q_ref=goal.q_ref if k == n else None) for k in range(n + 1)]
+        dt = self.model.opt.timestep * self.cfg.frame_skip
+        due = max(1.0, lead / n / max(goal.speed, 1e-6) / dt)
+        first = max(1.0, self.cfg.max_steps - n * self.cfg.pose_chain_slack * due)
+        self.sub_budget = [first] + [due] * n
+        self.sub_idx, self.t_sub = 0, 0
+        self.goal = self.sub_goals[0]
+
+    def chain_tol(self) -> float:
+        """pose_chain: keypoint distance that reaches an intermediate sub-goal; at most half their spacing, so
+        consecutive sub-goals stay distinct at loose curriculum tolerances. The last one uses eps_kp."""
+        return min(self.eps_kp(), 0.5 * self.cfg.goal.lead_in / self.chain_n)
 
     def lead_point(self) -> np.ndarray:
         return self.goal.p - self.cfg.goal.lead_in * self.goal.direction
@@ -671,6 +707,8 @@ class PoseVelocityEnv(gym.Env):
         self.table_force = 0.0
         self.ep_return = 0.0
         self.ep_terms: dict = {}
+        self.ep_motion = {"qvel_l1": 0.0, "qvel_l2": 0.0, "qvel_l2sq": 0.0, "qvel_peak": 0.0, "qacc": 0.0, "da": 0.0}
+        self._prev_qvel = None
         self.diverged = False
         self._prev_head = self.data.site_xpos[self.head_site].copy()
         # Phi is continuous across a soft reset (same physical state), so shaping telescopes across episodes.
@@ -798,17 +836,30 @@ class PoseVelocityEnv(gym.Env):
         near = bool(held_ok and d_kp <= self.eps_kp())
         first_near = near and not self.pass_info
         bonus_frac = None  # pose + velocity: q_v on the attempt (rewards.step_terms)
+        advanced = False  # pose_chain: reached an intermediate sub-goal this step
+        if self.chain_n:
+            self.t_sub += 1
+            if self.sub_idx < self.chain_n:
+                near = bool(held_ok and d_kp <= self.chain_tol())
+                first_near = False
         if cfg.goal_velocity:
             # The attempt: the first step within the keypoint tolerance (position and orientation). The episode ends
             # there; it is a success if the head also moves at the goal velocity.
             attempt = near
             success = bool(attempt and dv_norm < eps_v)
+            if not self.vel_reward:  # ablation: flat bonus, velocity still decides success
+                bonus_frac = 1.0 if attempt else 0.0
         elif self.pose_hold:
             # SimToolReal: success after success_steps near steps (not necessarily consecutive), bonus per near step.
             self.near_steps += int(near)
             attempt = first_near  # diagnostics only
             success = self.near_steps >= cfg.success_steps
             bonus_frac = 1.0 / cfg.success_steps if near else 0.0
+        elif self.chain_n and self.sub_idx < self.chain_n:
+            # pose_chain: an intermediate sub-goal; reaching it moves on to the next (no bonus, no termination).
+            attempt = success = False
+            bonus_frac = 0.0
+            advanced = near
         else:  # pose-only "touch": the first near step succeeds and ends the episode
             attempt = success = near
             bonus_frac = 1.0 if near else 0.0
@@ -828,7 +879,9 @@ class PoseVelocityEnv(gym.Env):
         # The arm can't follow the commanded head twist (singularity or joint limits): a failure, like a push.
         ik_failed = bool(cfg.ik_fail_tol > 0 and not passed and self.ik_error > cfg.ik_fail_tol)
         terminated = passed or dropped or pushed or ik_failed
-        truncated = (not terminated) and self.t >= cfg.max_steps
+        late = bool(self.chain_n and self.sub_idx > 0 and not advanced
+                    and self.t_sub >= cfg.pose_chain_slack * self.sub_budget[self.sub_idx])
+        truncated = (not terminated) and (self.t >= cfg.max_steps or late)
 
         # Keypoint progress counts only while holding (an empty hand moving the tool is no progress).
         if holding:
@@ -836,8 +889,19 @@ class PoseVelocityEnv(gym.Env):
             self.kp_best = min(d_star, d_kp)
         else:
             d_star = d_kp
+        # Motion diagnostics, the same whatever the reward's norm: joint speed, acceleration and action change.
+        qv = self.data.qvel[self.arm_dadr].copy()
+        m = self.ep_motion
+        m["qvel_l1"] += float(np.abs(qv).sum())
+        m["qvel_l2"] += float(np.linalg.norm(qv))
+        m["qvel_l2sq"] += float(qv @ qv)
+        m["qvel_peak"] = max(m["qvel_peak"], float(np.abs(qv).max()))
+        if self._prev_qvel is not None:
+            m["qacc"] += float(np.linalg.norm(qv - self._prev_qvel)) / (self.model.opt.timestep * cfg.frame_skip)
+            m["da"] += float(np.linalg.norm(a - self.prev_action))
+        self._prev_qvel = qv
         terms, q_v = step_terms(rc, d=d_kp, d_star=d_star, attempt=attempt, dv=dv_norm, speed=g.speed,
-                                qvel_l1=float(np.abs(self.data.qvel[self.arm_dadr]).sum()), bonus_frac=bonus_frac)
+                                qvel_cost=arm_vel_cost(qv, getattr(rc, "smooth_norm", "l1")), bonus_frac=bonus_frac)
         if attempt:
             v_along = float(lin @ g.direction)
             v_side = float(np.linalg.norm(lin - v_along * g.direction))
@@ -846,7 +910,8 @@ class PoseVelocityEnv(gym.Env):
                               "v_along_frac": v_along / s, "v_side_frac": v_side / s,
                               "theta_deg": float(np.degrees(theta)),
                               # Angle between the goal velocity and the goal head axis: 0 = strike, 90 = swipe.
-                              "swipe_deg": float(np.degrees(mu.angle_between(g.v, g.axis)))}
+                              "swipe_deg": float(np.degrees(mu.angle_between(g.v, g.axis))),
+                              "speed": g.speed, "down": bool(g.direction[2] <= cfg.goal.down_max_z)}
         if not self.weld:
             phi = self._grasp_potential(holding)
             terms["grasp"] = phi - self.phi_prev
@@ -857,6 +922,12 @@ class PoseVelocityEnv(gym.Env):
         self.ep_return += reward
         for k, v in terms.items():
             self.ep_terms[k] = self.ep_terms.get(k, 0.0) + float(v)
+
+        if advanced and not (terminated or truncated):
+            self.sub_idx += 1
+            self.goal = self.sub_goals[self.sub_idx]
+            self.t_sub, self.kp_best = 0, None
+            self._update_goal_markers()
 
         self.prev_action = a
         self._prev_head = head
@@ -885,8 +956,16 @@ class PoseVelocityEnv(gym.Env):
                 "ever_grasped": float(self.ever_grasped), "diverged": float(self.diverged),
                 "goal_fallback": float(self.goal_fallback), "goal_recovery": float(self.goal_recovery),
                 "next_reset": kind, "level": self.level,
-                "terms": dict(self.ep_terms), "start": self.start_type, "closest": dict(self.closest),
+                "terms": dict(self.ep_terms), "motion": self._motion_info(), "start": self.start_type, "closest": dict(self.closest),
                 "pass": dict(self.pass_info)}
+
+    def _motion_info(self) -> dict:
+        """Per-step means over the episode: arm |qdot|_1, |qdot|_2 (rad/s), sum qdot^2 (rad^2/s^2), |qddot|_2
+        (rad/s^2) and |a_t - a_t-1|_2 (action units, smoothed actions); and the peak |qdot| of any arm joint."""
+        m, n = self.ep_motion, max(self.t, 1)
+        return {"qvel_l1": m["qvel_l1"] / n, "qvel_l2": m["qvel_l2"] / n, "qvel_l2sq": m["qvel_l2sq"] / n,
+                "qvel_peak": m["qvel_peak"],
+                "qacc": m["qacc"] / max(n - 1, 1), "da": m["da"] / max(n - 1, 1)}
 
     # ------------------------------------------------------------------ observations
     def _get_obs(self) -> np.ndarray:
@@ -914,7 +993,7 @@ class PoseVelocityEnv(gym.Env):
             R_palm.T @ (d.xpos[self.tool_id] - palm), mu.rot6d(R_palm.T @ R_tool),
             self.tool.features(),
         ]
-        if self.cfg.goal_velocity:
+        if self.vel_obs:
             parts += [
                 g.p, g.v, mu.rot6d(mu.quat_to_mat(g.quat)),
                 head - g.p, lin - g.v, self._rot_error(),
@@ -925,7 +1004,10 @@ class PoseVelocityEnv(gym.Env):
             parts += [g.p, mu.rot6d(mu.quat_to_mat(g.quat)), head - g.p, self._rot_error(), [eps_p, eps_th]]
         if not self.weld:
             parts.append([float(self._holding()), float(self._grasp_condition())])
-        parts.append([1.0 - self.t / self.cfg.max_steps])
+        if self.chain_n:  # the current sub-goal's clock (goes negative when it is late)
+            parts.append([max(-1.0, 1.0 - self.t_sub / self.sub_budget[self.sub_idx])])
+        else:
+            parts.append([1.0 - self.t / self.cfg.max_steps])
         return np.concatenate(parts).astype(np.float32)
 
     def _get_priv(self) -> np.ndarray:
@@ -935,7 +1017,9 @@ class PoseVelocityEnv(gym.Env):
             np.minimum(self.tip_force, 50.0) / 10.0,
             [min(self.d_best, 1.0) if np.isfinite(self.d_best) else 1.0, self.level,
              float(self.ever_grasped), min(self.no_contact, 20) / 10.0, float(self.c_tool_table), self._tool_lift()],
-        ] + ([[self.near_steps / self.cfg.success_steps]] if self.pose_hold else []))
+        ] + ([[self.near_steps / self.cfg.success_steps]] if self.pose_hold else [])
+          # velocity_obs False: the critic still sees v_g, so it can value the velocity-scaled bonus.
+          + ([self.goal.v] if self.cfg.goal_velocity and not self.vel_obs else []))
         return priv.astype(np.float32)
 
     def oracle_action(self) -> np.ndarray:
@@ -945,9 +1029,12 @@ class PoseVelocityEnv(gym.Env):
         The oracle plans head twists; in joint mode they are converted with joint_action_for_twist.
         """
         if self._oracle is None:
-            from oracle import Oracle, PoseOracle
+            from oracle import ChainPoseOracle, Oracle, PoseOracle
 
-            self._oracle = Oracle() if self.cfg.goal_velocity else PoseOracle()
+            if self.cfg.goal_velocity:
+                self._oracle = Oracle()
+            else:
+                self._oracle = ChainPoseOracle() if self.chain_n else PoseOracle()
         a = self._oracle(self)
         if self.cfg.action_mode == "joint":
             a = self.joint_action_for_twist(a)
@@ -975,8 +1062,8 @@ class PoseVelocityEnv(gym.Env):
         g = self.goal
         P = self._dls_pinv() / self._joint_v_max()[:, None]
         z = np.zeros(3)
-        lin_terms = [self.lead_point() - head if self.cfg.goal_velocity else g.p - head]
-        if self.cfg.goal_velocity:
+        lin_terms = [self.lead_point() - head if self.vel_obs else g.p - head]
+        if self.vel_obs:
             rel = head - g.p
             lin_terms += [g.v, rel - (rel @ g.direction) * g.direction, lin - g.v]
         cols = [P[:, :3] @ x for x in lin_terms] + [P[:, 3:] @ self._rot_error()]

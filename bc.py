@@ -40,7 +40,7 @@ from collections import deque
 
 import numpy as np
 
-from config import EnvCfg, PPOCfg
+from config import EnvCfg, PPOCfg, add_goal_ablation_args, apply_goal_ablation_args, describe_goal
 from env import make_env
 from train import CKPT_FORMAT, resolve_device
 from vec_env import SerialVecEnv, SubprocVecEnv
@@ -75,9 +75,11 @@ def parse_args():
                         "data is mostly the oracle's own (easy) states and otherwise dominates the loss")
     p.add_argument("--levels", type=float, nargs=2, metavar=("LO", "HI"), default=(0.0, 1.0),
                    help="curriculum levels the envs are spread over")
-    p.add_argument("--pose-only", default=None, choices=["hold", "touch"],
-                   help="pose-only baseline (no goal velocity) with this success rule: 'hold' = SimToolReal's "
-                        "success_steps steps within tolerance, 'touch' = the first step within tolerance")
+    add_goal_ablation_args(p)
+    p.add_argument("--eps-v-frac", type=float, nargs=2, metavar=("LEVEL0", "LEVEL1"), default=None,
+                   help="success velocity tolerance (fraction of goal speed) at curriculum level 0 and 1")
+    p.add_argument("--sigma-v-frac", type=float, default=None,
+                   help="velocity scale (fraction of the goal speed) of the attempt bonus")
     p.add_argument("--action-mode", default=None, choices=["head_twist", "joint", "joint_vel"],
                    help="override EnvCfg.action_mode; joint labels are converted from the oracle's head twists")
     p.add_argument("--arm-action-scale", type=float, default=None,
@@ -107,8 +109,11 @@ def main():
         torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
 
     env_cfg, ppo_cfg = EnvCfg(), PPOCfg(num_envs=args.num_envs)
-    if args.pose_only is not None:
-        env_cfg.goal_velocity, env_cfg.pose_success = False, args.pose_only
+    apply_goal_ablation_args(env_cfg, args)
+    if args.eps_v_frac is not None:
+        env_cfg.curriculum.eps_v_frac = tuple(args.eps_v_frac)
+    if args.sigma_v_frac is not None:
+        env_cfg.reward.sigma_v_frac = args.sigma_v_frac
     if args.action_mode is not None:
         env_cfg.action_mode = args.action_mode
     if args.arm_action_scale is not None:
@@ -145,7 +150,7 @@ def main():
            for i, lv in enumerate(levels)]
     venv = SerialVecEnv(fns) if (args.serial or N == 1) else SubprocVecEnv(fns)
     obs_dim, act_dim, priv_dim = venv.observation_space.shape[0], venv.action_space.shape[0], venv.priv_dim
-    goal_txt = "pose+velocity" if env_cfg.goal_velocity else f"pose-only ({env_cfg.pose_success})"
+    goal_txt = describe_goal(env_cfg)
     print(f"goal={goal_txt}  actions={env_cfg.action_mode}  device={device}  num_envs={N} ({K} eval)  levels {lo:.2f}-{hi:.2f}  "
           f"noise std {noise_std:.3f}  "
           f"run_dir={run_dir}")

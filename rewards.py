@@ -4,7 +4,7 @@ The SimToolReal reward (see strl_env.py), extended with a goal velocity. Per ste
   keypoint  keypoint_rew_scale * max(d* - d, 0): paid only for getting closer to the goal pose than ever before this
             episode, so a wind-up away from the goal costs nothing. d is the largest distance between 4 keypoints
             on the tool and the same keypoints at the goal pose, so it covers position and orientation.
-  smooth    -arm_vel_penalty * L1 norm of the arm joint velocities
+  smooth    -arm_vel_penalty * smooth_norm of the arm joint velocities (L1 by default; see arm_vel_cost)
   bonus     reach_goal_bonus * bonus_frac, with bonus_frac chosen by the env:
             pose + velocity: velocity_match on the attempt (the first step with d within tolerance; the episode ends
             there), so arriving slowly or sideways earns little.
@@ -43,11 +43,27 @@ def velocity_match(dv: float, speed: float, sigma_v_frac: float) -> float:
     return float(np.exp(-dv / (sigma_v_frac * max(speed, 1e-6))))
 
 
+SMOOTH_NORMS = ("l1", "l2", "l2sq")
+
+
+def arm_vel_cost(qvel, norm: str = "l1") -> float:
+    """The smoothness term's cost of the arm joint velocities: l1 sum |q|, l2 |q|_2, l2sq sum q^2."""
+    q = np.asarray(qvel, dtype=np.float64)
+    if norm == "l1":
+        return float(np.abs(q).sum())
+    if norm == "l2":
+        return float(np.linalg.norm(q))
+    if norm == "l2sq":
+        return float(q @ q)
+    raise ValueError(f"smooth_norm must be one of {SMOOTH_NORMS}, got {norm!r}")
+
+
 def step_terms(cfg: RewardCfg, *, d: float, d_star: float, attempt: bool, dv: float, speed: float,
-               qvel_l1: float, bonus_frac: float | None = None) -> tuple[dict, float]:
+               qvel_cost: float, bonus_frac: float | None = None) -> tuple[dict, float]:
     """Reward terms of one step and the velocity match q_v (computed for diagnostics even when not paid).
 
     d_star: the closest keypoint distance before this step.
+    qvel_cost: arm_vel_cost of the arm joint velocities (in cfg.smooth_norm).
     bonus_frac: fraction of reach_goal_bonus paid this step. None (pose + velocity): q_v on the attempt, else 0.
     """
     q_v = velocity_match(dv, speed, cfg.sigma_v_frac)
@@ -55,7 +71,7 @@ def step_terms(cfg: RewardCfg, *, d: float, d_star: float, attempt: bool, dv: fl
         bonus_frac = q_v if attempt else 0.0
     terms = {
         "keypoint": cfg.keypoint_rew_scale * max(d_star - d, 0.0),
-        "smooth": -cfg.arm_vel_penalty * qvel_l1,
+        "smooth": -cfg.arm_vel_penalty * qvel_cost,
         "bonus": cfg.reach_goal_bonus * bonus_frac,
     }
     return terms, q_v

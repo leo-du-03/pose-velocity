@@ -82,7 +82,10 @@ class RewardCfg:
     # reach_goal_bonus * exp(-|v_head - v_g| / (sigma_v_frac * |v_g|)).
     keypoint_rew_scale: float = 200.0
     reach_goal_bonus: float = 1000.0
-    arm_vel_penalty: float = 0.03  # L1 norm of arm joint velocities (rad/s)
+    arm_vel_penalty: float = 0.03  # weight of the smoothness term, on smooth_norm of the arm joint velocities (rad/s)
+    # Norm of the arm joint velocities in the smoothness term: "l1" (sum |qdot|, SimToolReal), "l2" (|qdot|_2) or
+    # "l2sq" (sum qdot^2, which penalises fast joints more and slow ones less). arm_vel_penalty 0 drops the term.
+    smooth_norm: str = "l1"
     sigma_v_frac: float = 0.25  # velocity match is 1/e at this fraction of the goal speed (eps_v_frac at level 1)
     # Keypoints: corners of one fixed box, centered on the head, in the tool frame (x, y, z; z along the handle).
     # Same box as SimToolReal's reward keypoints (0.141 along the handle), scaled by keypoint_scale.
@@ -154,6 +157,17 @@ class EnvCfg:
     # episode, as in the pose + velocity setup (passing through the pose is allowed).
     pose_success: str = "hold"
     success_steps: int = 10
+    # Ablations of the goal velocity (goal_velocity True only; both True is the full method). velocity_obs False:
+    # the actor sees the pose-only observation (v_g goes to the critic instead). velocity_reward False: the attempt
+    # bonus is flat, not scaled by the velocity match q_v. The attempt and success rules are unchanged either way.
+    velocity_obs: bool = True
+    velocity_reward: bool = True
+    # Pose-only "touch" only: replace each goal with timed pose sub-goals along its strike line, the lead-in point
+    # (untimed approach) and then pose_chain more, evenly spaced, the last at p_g. Each timed one is due after
+    # spacing / |v_g| seconds; the time input shows that sub-goal's clock, and a sub-goal more than
+    # pose_chain_slack x late ends the episode. 0: off.
+    pose_chain: int = 0
+    pose_chain_slack: float = 2.0
     head_v_max: float = 0.8  # m/s at action 1
     head_w_max: float = 2.5  # rad/s at action 1
     ik_damping: float = 0.05
@@ -304,13 +318,10 @@ class TaskCfg:
     kerf_cell: float = 0.0025  # m, width of a kerf column (along the cut)
     crush_depth: float = 0.006  # m pressed into uncut loaf without slicing -> the loaf is crushed
     bind_depth: float = 0.003  # m: the blade counts as inside the loaf (for binding) below this depth
-    bind_deg: float = 10.0  # blade face twisted/tilted this far from the cut plane inside the loaf -> jammed
-    bind_slack: float = 0.004  # m of sideways motion of the blade inside the kerf -> jammed
-    line_tol: float = 0.006  # m: cutting farther than this from the marked line is off the line
+    bind_deg: float = 15.0  # blade face twisted/tilted this far from the cut plane inside the loaf -> jammed
+    bind_slack: float = 0.01  # m of sideways motion of the blade inside the kerf -> jammed
+    line_tol: float = 0.02  # m: cutting farther than this from the marked line is off the line
     through_tol: float = 0.003  # m: a kerf column is through when cut to within this of the loaf bottom
-    # N of blade on the board -> chopped into the board. The follower presses ~0 N; driving the saw 5 mm (15 mm) too
-    # deep gives ~12 N (~35 N) on this soft board.
-    board_force_limit: float = 25.0
     board_solref: Tuple[float, float] = (0.02, 1.0)  # cutting board contact softness (wood)
     slice_end_delay: float = 0.6  # s the episode runs on after a success or a failure, so the consequence shows
     # --- slice_tomato: a cherry tomato on the same board, cut with the same knife. Cutting is set by the pressing
@@ -373,7 +384,10 @@ class TaskCfg:
     flick_pitch_deg: Tuple[float, float] = (6.0, 12.0)
     flick_w_max: float = 2.0
     flick_accel_len: float = 0.06  # m spent accelerating
-    flick_const_len: float = 0.05  # m at constant speed before the release
+    # m at constant speed before the release. The launch's keypoints start GoalCfg.lead_in from the start pose (the
+    # policy runs up to a goal over lead_in, so an earlier one would have it back up first and drop the egg); this
+    # leaves ~accel_len + const_len - lead_in of keypoints before the release.
+    flick_const_len: float = 0.16
     # Release: in flick_drop_steps control steps the spatula's velocity goes from the launch velocity to
     # flick_back_speed back along the handle plus flick_drop_speed back along its own normal. The egg keeps going: it
     # rolls forward out of the cradle's open front and off the tip at about the launch velocity (the drop unloads the
@@ -432,3 +446,54 @@ class PPOCfg:
     init_log_std_joint_vel: float = -2.4
     scale_rewards: bool = True
     save_every: int = 50  # iterations
+
+
+# ---------------------------------------------------------------------- goal-velocity ablation flags
+# Shared by bc.py, train.py and evaluate.py, so every entry point applies them the same way.
+def add_goal_ablation_args(p, pose_only: bool = True) -> None:
+    if pose_only:
+        p.add_argument("--pose-only", default=None, choices=["hold", "touch"],
+                       help="pose-only baseline (no goal velocity) with this success rule: 'hold' = SimToolReal's "
+                            "success_steps steps within tolerance, 'touch' = the first step within tolerance")
+    p.add_argument("--no-vel-obs", action="store_true",
+                   help="ablation: keep the velocity goal and reward but give the actor the pose-only observation "
+                        "(EnvCfg.velocity_obs False)")
+    p.add_argument("--no-vel-reward", action="store_true",
+                   help="ablation: flat attempt bonus, not scaled by the velocity match (EnvCfg.velocity_reward False)")
+    p.add_argument("--pose-chain", type=int, default=None, metavar="N",
+                   help="pose-only touch: timed pose sub-goals along the strike line, the lead-in point and then N "
+                        "more (EnvCfg.pose_chain)")
+    p.add_argument("--vel-cone", type=float, nargs=2, default=None, metavar=("LEVEL0", "LEVEL1"),
+                   help="max angle (deg) between the goal velocity and the head axis, at curriculum level 0 and 1 "
+                        "(CurriculumCfg.vel_cone_deg)")
+
+
+def apply_goal_ablation_args(cfg: "EnvCfg", args) -> "EnvCfg":
+    if getattr(args, "pose_only", None) is not None:
+        cfg.goal_velocity, cfg.pose_success = False, args.pose_only
+    if args.no_vel_obs:
+        cfg.velocity_obs = False
+    if args.no_vel_reward:
+        cfg.velocity_reward = False
+    if args.pose_chain is not None:
+        cfg.pose_chain = args.pose_chain
+    if args.vel_cone is not None:
+        cfg.curriculum.vel_cone_deg = tuple(args.vel_cone)
+    if (not cfg.goal_velocity) and (not cfg.velocity_obs or not cfg.velocity_reward):
+        raise SystemExit("--no-vel-obs / --no-vel-reward ablate the pose + velocity goal; drop --pose-only")
+    return cfg
+
+
+def goal_obs_key(cfg: "EnvCfg") -> tuple:
+    """The settings that decide the actor observation layout (and meaning) of the goal."""
+    return (cfg.goal_velocity, getattr(cfg, "velocity_obs", True), cfg.pose_success if not cfg.goal_velocity else None,
+            getattr(cfg, "pose_chain", 0))
+
+
+def describe_goal(cfg: "EnvCfg") -> str:
+    if not cfg.goal_velocity:
+        chain = getattr(cfg, "pose_chain", 0)
+        return f"pose-only ({cfg.pose_success}{f', chain {chain}' if chain else ''})"
+    parts = [] if getattr(cfg, "velocity_obs", True) else ["no vel obs"]
+    parts += [] if getattr(cfg, "velocity_reward", True) else ["no vel reward"]
+    return "pose+velocity" + (f" ({', '.join(parts)})" if parts else "")

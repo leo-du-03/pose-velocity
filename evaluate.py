@@ -5,15 +5,63 @@ Examples:
   python evaluate.py --policy zero --episodes 3 --video zero.mp4
   python evaluate.py --policy oracle --episodes 50             # scripted strike: checks goals are feasible
   python evaluate.py --ckpt runs/<name>/ckpt_latest.pt --render human --level 1.0
+  python evaluate.py --ckpt runs/<name>/ckpt_best.pt --level 1 --episodes 500 --dump results/abl/<name>.json
+  python evaluate.py --policy oracle --pose-only touch --pose-chain 4 --level 1 --episodes 200
+
+The summary scores every policy by the same rule at the attempt (the first step within the keypoint tolerance), with
+the evaluated level's tolerances: pose (head distance < eps_p, rotation < eps_theta), velocity
+(|v - v_g| < eps_v_frac |v_g|) and both. Pose-only policies never observe v_g, but it is still sampled, so their
+velocity at the attempt is what a pose goal gives for free.
 """
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import time
 
 import numpy as np
 
-from config import EnvCfg, RewardCfg
+from config import EnvCfg, RewardCfg, describe_goal
+
+
+def _lerp(pair, level: float) -> float:
+    return float(pair[0] + (pair[1] - pair[0]) * level)
+
+
+def episode_row(e: dict, cfg: EnvCfg, level: float, eps_v_frac=None) -> dict:
+    """One episode's outcome, scored by the same pose / velocity rule whatever the policy's goal."""
+    cc, ps = cfg.curriculum, e["pass"]
+    row = {k: float(e[k]) for k in ("success", "passed", "pushed", "ik_failed", "dropped", "diverged")}
+    row["length"] = int(e["length"])
+    row["attempt"] = bool(ps)
+    row.update({k: float(v) for k, v in e.get("motion", {}).items()})
+    row.update({k: (bool(v) if isinstance(v, (bool, np.bool_)) else float(v)) for k, v in ps.items()})
+    if ps:
+        pose_ok = ps["dp"] < _lerp(cc.eps_p, level) and ps["theta_deg"] < _lerp(cc.eps_theta_deg, level)
+        vel_ok = ps["dv_frac"] < _lerp(eps_v_frac if eps_v_frac is not None else cc.eps_v_frac, level)
+        row.update(pose_ok=bool(pose_ok), vel_ok=bool(vel_ok), joint_ok=bool(pose_ok and vel_ok))
+    else:
+        row.update(pose_ok=False, vel_ok=False, joint_ok=False)
+    return row
+
+
+def print_summary(rows: list) -> None:
+    att = [r for r in rows if r["attempt"]]
+    print(f"attempt rate {len(att) / max(len(rows), 1):.3f}   over all episodes: "
+          + "  ".join(f"{k} {np.mean([r[k] for r in rows]):.3f}" for k in ("pose_ok", "vel_ok", "joint_ok")))
+    if not att:
+        return
+    print("at the attempt (median [25%, 75%]):")
+    for k, scale, unit in (("dp", 100, "cm"), ("theta_deg", 1, "deg"), ("dv_frac", 1, "x|v_g|"),
+                           ("v_along_frac", 1, "x|v_g|"), ("v_side_frac", 1, "x|v_g|"), ("length", 1, "steps")):
+        q = np.percentile([r[k] * scale for r in att], [50, 25, 75])
+        print(f"  {k:13s} {q[0]:7.3f} [{q[1]:7.3f}, {q[2]:7.3f}] {unit}")
+    if "qvel_l1" in rows[0]:
+        print("motion, per-episode step means (median [25%, 75%] over all episodes):")
+        for k, unit in (("qvel_l1", "rad/s"), ("qvel_peak", "rad/s (max)"), ("qacc", "rad/s^2"), ("da", "action")):
+            q = np.percentile([r[k] for r in rows], [50, 25, 75])
+            print(f"  {k:13s} {q[0]:7.3f} [{q[1]:7.3f}, {q[2]:7.3f}] {unit}")
 from env import PoseVelocityEnv
 
 
@@ -35,6 +83,17 @@ def main():
     p.add_argument("--pose-only", default=None, choices=["hold", "touch"],
                    help="without --ckpt: pose-only baseline (no goal velocity) with this success rule "
                         "(a checkpoint carries its own setting)")
+    p.add_argument("--pose-chain", type=int, default=None, metavar="N",
+                   help="pose-only touch (also a checkpoint's): timed pose sub-goals along the strike line "
+                        "(EnvCfg.pose_chain)")
+    p.add_argument("--vel-cone", type=float, nargs=2, default=None, metavar=("LEVEL0", "LEVEL1"),
+                   help="override CurriculumCfg.vel_cone_deg, e.g. 30 180 to test a strikes-only checkpoint on swipes")
+    p.add_argument("--score-eps-v-frac", type=float, nargs=2, default=None, metavar=("LEVEL0", "LEVEL1"),
+                   help="velocity tolerance (fraction of goal speed) for vel_ok / joint_ok in the summary and dump, so "
+                        "checkpoints trained with different ones are scored alike; the env and its observation keep "
+                        "the checkpoint's")
+    p.add_argument("--dump", default=None, metavar="PATH",
+                   help="write every episode's outcome and attempt diagnostics to this JSON file")
     p.add_argument("--episodes", type=int, default=5)
     p.add_argument("--render", default="none", choices=["none", "human", "rgb_array"])
     p.add_argument("--video", default=None, help="write an mp4 (implies --render rgb_array)")
@@ -81,6 +140,10 @@ def main():
         if policy == "ckpt":
             p.error("--pose-only is taken from the checkpoint; drop it with --ckpt")
         cfg.goal_velocity, cfg.pose_success = False, args.pose_only
+    if args.pose_chain is not None:
+        cfg.pose_chain = args.pose_chain  # the observation layout doesn't change, so a checkpoint can take it
+    if args.vel_cone is not None:
+        cfg.curriculum.vel_cone_deg = tuple(args.vel_cone)
 
     render_mode = "rgb_array" if args.video else (None if args.render == "none" else args.render)
     env = PoseVelocityEnv(cfg, render_mode=render_mode)
@@ -137,6 +200,15 @@ def main():
           f"pass rate {np.mean([r['passed'] for r in results]):.2f}  "
           f"drop rate {np.mean([r['dropped'] for r in results]):.2f}  "
           f"mean return {np.mean([r['return'] for r in results]):.2f}")
+    rows = [episode_row(r, cfg, level, args.score_eps_v_frac) for r in results]
+    print_summary(rows)
+    if args.dump:
+        os.makedirs(os.path.dirname(args.dump) or ".", exist_ok=True)
+        meta = {"ckpt": args.ckpt, "policy": policy, "level": level, "seed": args.seed, "goal": describe_goal(cfg),
+                "action_mode": cfg.action_mode, "vel_cone_deg": list(cfg.curriculum.vel_cone_deg)}
+        with open(args.dump, "w") as f:
+            json.dump({"meta": meta, "episodes": rows}, f)
+        print(f"wrote {args.dump}")
     if args.video and frames:
         import imageio
 

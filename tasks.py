@@ -172,6 +172,8 @@ class TaskEnv(PoseVelocityEnv):
         cfg = copy.deepcopy(cfg or EnvCfg())
         if cfg.grip_mode != "weld" or cfg.action_mode not in ("head_twist", "joint_vel"):
             raise ValueError("task envs need grip_mode 'weld' and action_mode 'head_twist' or 'joint_vel'")
+        if getattr(cfg, "pose_chain", 0):
+            raise ValueError("task envs feed their own keypoints; pose_chain checkpoints aren't supported")
         cfg.regrip_every = 1 if self.task_cfg.rehome_each_episode else 10**9
         cfg.regrip_rehome = True
         self.trace: Optional[Trace] = None
@@ -1326,8 +1328,8 @@ class SliceTask(Task):
       * orientation: the blade face turns more than bind_deg from the cut plane inside the loaf -> jammed (the knife
                      sticks: the arm is held where it is)
       * position:    sideways motion inside the kerf over bind_slack -> jammed; cutting farther than line_tol from the
-                     line -> off the line (kerf drawn red, the halves stay shut); too deep -> the blade chops into the
-                     board (board_force_limit); too shallow -> not through
+                     line -> off the line (kerf drawn red, the halves stay shut); too shallow -> not through. Going too
+                     deep is not a failure: the blade force on the board is only recorded (board_force)
     A clean cut through every column opens the halves.
 
     The board, knife, instance sampling, binding and board checks are shared with TomatoSliceTask; the object (its
@@ -1575,7 +1577,7 @@ class SliceTask(Task):
 
     # ---------------------------------------------------------------- state and its visuals
     def begin(self, env) -> None:
-        self.st = {"crushed": False, "jammed": False, "board": False, "off_line": False, "through": False,
+        self.st = {"crushed": False, "jammed": False, "off_line": False, "through": False,
                    "t_end": None, "t_kps": None, "fail": None, "q_jam": None, "n_entry": None,
                    "bind_deg_max": 0.0, "bind_off_max": 0.0, "line_off_max": 0.0, "board_peak": 0.0}
         self.st.update(self._object_state())
@@ -1601,7 +1603,7 @@ class SliceTask(Task):
     def _apply_visuals(self, env) -> None:
         """Model-side state (not in the physics state): board color, hinge springs, and the object's look."""
         m, st = env.model, self.st
-        m.geom_rgba[self.board_gid] = (0.85, 0.2, 0.15, 1.0) if st["board"] else self._BOARD_RGBA
+        m.geom_rgba[self.board_gid] = self._BOARD_RGBA
         m.qpos_spring[self.hinge_qadr] = self.open_angle if self._opened() else 0.0
         self._object_visuals(env)
 
@@ -1660,24 +1662,17 @@ class SliceTask(Task):
         if st["jammed"]:  # the knife is stuck in the object: the arm servos are held where it jammed
             d.ctrl[env.act_ids[:env.n_arm_act]] = st["q_jam"]
             return
-        if st["crushed"] or st["board"]:
+        if st["crushed"]:
             return
         Lx, W, H = self.dims()
-        # Blade on the board (also after the cut is through: too deep a finish chops into the board).
+        # Blade force on the board (also after the cut is through), for the metrics.
         f6, f_board = np.zeros(6), 0.0
         for i in range(d.ncon):
             g1, g2 = int(d.contact.geom1[i]), int(d.contact.geom2[i])
             if self.board_gid in (g1, g2) and env.tool_id in (int(m.geom_bodyid[g1]), int(m.geom_bodyid[g2])):
                 mujoco.mj_contactForce(m, d, i, f6)
                 f_board += abs(f6[0])
-        st["board_peak"] = max(st["board_peak"], f_board)
-        if f_board > tc.board_force_limit:
-            st["board"] = True
-            st["t_end"] = None  # a success that ends in the board is a failure, timed from here
-            self._fail(env, "board")
-            self._release(env)
-            self._apply_visuals(env)
-            return
+        st["board_peak"] = max(st["board_peak"], f_board)  # recorded only: hitting the board is not a failure
         if st["through"] or st["fail"] is not None:  # cut through, or already failed: nothing left to cut
             self._release(env)
             return
@@ -1769,7 +1764,7 @@ class SliceTask(Task):
         success = self._opened()
         reason = st["fail"] or (None if success else "not_through")
         out = {"success": success, "cut_frac": self._cut_frac(), "through": bool(st["through"]),
-               "crushed": bool(st["crushed"]), "jammed": bool(st["jammed"]), "board_hit": bool(st["board"]),
+               "crushed": bool(st["crushed"]), "jammed": bool(st["jammed"]),
                "off_line": bool(st["off_line"]), "fail_reason": reason or "-",
                "bind_deg_max": st["bind_deg_max"], "bind_offset_max": st["bind_off_max"],
                "line_offset": st["line_off_max"], "board_force": st["board_peak"],
@@ -1809,8 +1804,8 @@ class TomatoSliceTask(SliceTask):
         cut keeps up with the knife's descent: descending steeply for the sliding drives it up
       * too much force (tomato_crush_force), however it comes (pressing too deep, or descending faster than the
         sliding cuts, or not sliding at all): the tomato bursts -> crushed
-    Position and orientation matter much less than for the loaf (tomato_line_tol, tomato_bind_deg,
-    tomato_bind_slack), and the strokes reach far past it on both sides.
+    Orientation and sideways motion matter less than for the loaf (tomato_bind_deg, tomato_bind_slack); the cut
+    must stay within tomato_line_tol of the middle, and the strokes reach far past it on both sides.
     """
 
     name = "slice_tomato"
@@ -2235,14 +2230,17 @@ class FlickTask(Task):
                      elev_deg=float(np.degrees(np.arcsin(np.clip(d[2], -1.0, 1.0)))), pitch_deg=float(np.degrees(phi)),
                      launch_index=k_launch, release_index=k_rel, release_end_index=k_end, egg_release=egg0,
                      z_aim=plan["z_aim"], egg_rest_height=rest)
-        # Keypoints: every flick_kp_every-th sample of the throw that is a training-like goal (speed and height),
-        # and always the release. None while the velocity turns round at the release and for 2 steps after: a goal
+        # Keypoints: every flick_kp_every-th sample of the throw that is a training-like goal (speed and height) and
+        # at least lead_in into the launch, and always the release. None while the velocity turns round at the release and for 2 steps after: a goal
         # there has the head arrive from beyond its plane, so it would never be crossed.
         v_max = env.cfg.curriculum.speed_max[1] + 1e-6
         z_lo, z_hi = (env.rinfo.table_top + x for x in gc.height)
         turning = range(k_rel + 1, k_rel + n_r + 3)
+        # Launch goals only from lead_in along the throw on: the policy runs up to a goal from lead_in behind it, so
+        # one nearer the start would have it back up first, tipping the egg off the blade.
         ok = [k for k in range(k_launch + 1, k_end + 1) if k not in turning
-              and gc.speed_min <= np.linalg.norm(tr.v[k]) <= v_max and z_lo <= tr.p[k][2] <= z_hi]
+              and gc.speed_min <= np.linalg.norm(tr.v[k]) <= v_max and z_lo <= tr.p[k][2] <= z_hi
+              and (k > k_rel or (tr.p[k] - p0) @ d >= gc.lead_in - 1e-6)]
         for k in sorted(set(ok[::tc.flick_kp_every]) | ({k_rel} & set(ok))):
             tr.add_keypoint(k)
         return tr if tr.keypoints else None
