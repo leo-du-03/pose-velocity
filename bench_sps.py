@@ -1,6 +1,6 @@
-"""Measure simulation throughput of the simplify-weld env on this machine.
+"""Measure simulation throughput of PoseVelocityEnv on this machine.
 
-Put this file in the root of the pose-velocity repo (simplify-weld branch) and run:
+Run from the repo root:
     python bench_sps.py
 It uses weld grip and joint-delta arm actions (the SimToolReal-style action space).
 Takes about 1-3 minutes. Close other heavy apps first.

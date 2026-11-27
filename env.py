@@ -42,11 +42,12 @@ from gymnasium import spaces
 from gymnasium.utils import seeding
 
 import mathutils as mu
-from config import EnvCfg
+from config import EnvCfg, TrajCfg, check_goal_mode
 from goals import Goal, GoalSampler, ReachMap, plane_crossing
-from rewards import arm_vel_cost, grasp_potential, keypoint_distance, keypoint_offsets, step_terms
+from rewards import arm_vel_cost, grasp_potential, keypoint_distance, keypoint_offsets, step_terms, track_reward
 from scene import SceneBuilder
 from tool_gen import ToolParams, sample_tool
+from traces import Trace
 
 OBJ = mujoco.mjtObj
 
@@ -79,6 +80,15 @@ class PoseVelocityEnv(gym.Env):
             raise ValueError(f"pose_chain must be >= 0, got {self.chain_n}")
         if self.chain_n and (self.cfg.goal_velocity or self.cfg.pose_success != "touch"):
             raise ValueError("pose_chain needs the pose-only baseline with pose_success 'touch'")
+        check_goal_mode(self.cfg)
+        # goal_mode "trajectory": a time-indexed reference into each goal (_build_reference). Named ref / ref_q, not
+        # trace / task_t, which TaskEnv uses for its task traces.
+        self.traj_mode = getattr(self.cfg, "goal_mode", "points") == "trajectory"
+        self.tcfg: TrajCfg = getattr(self.cfg, "traj", None) or TrajCfg()
+        self.ref: Optional[Trace] = None
+        self.ref_q = self.ref_qd = None  # (N, n_arm) joint reference and its velocity
+        self.ref_goal_idx = 0  # sample index at p_g
+        self.ref_fallback = False
         self.sub_goals: list = []  # pose_chain: the current goal's sub-goals (self.goal is sub_goals[sub_idx])
         self.sub_idx, self.t_sub, self.sub_budget = 0, 0, [float(self.cfg.max_steps)]
         self.goal_full: Optional[Goal] = None  # the sampled goal (self.goal is its current sub-goal with pose_chain)
@@ -581,7 +591,7 @@ class PoseVelocityEnv(gym.Env):
         return self._ik_solve(q0, target, target_quat, iters) is not None
 
     def _ik_solve(self, q0: np.ndarray, target: np.ndarray, target_quat: np.ndarray,
-                  iters: int = 30) -> Optional[np.ndarray]:
+                  iters: int = 30, pos_tol: float = 3e-3, rot_tol: float = 0.02) -> Optional[np.ndarray]:
         """Like _ik_reachable, but returns the arm configuration it converged to (or None)."""
         m, sd = self.model, self._scratch
         q = np.asarray(q0, dtype=np.float64).copy()
@@ -590,7 +600,7 @@ class PoseVelocityEnv(gym.Env):
         for _ in range(iters):
             head, _, quat, _ = self._scratch_pose(q)
             e = np.concatenate([target - head, mu.quat_error(target_quat, quat)])
-            if np.linalg.norm(e[:3]) < 3e-3 and np.linalg.norm(e[3:]) < 0.02:
+            if np.linalg.norm(e[:3]) < pos_tol and np.linalg.norm(e[3:]) < rot_tol:
                 return None if self._scratch_collides() else q
             mujoco.mj_comPos(m, sd)  # mj_jac needs cdof / subtree_com, which mj_kinematics doesn't compute
             mujoco.mj_jac(m, sd, jacp, jacr, head, self.palm_id)
@@ -648,11 +658,186 @@ class PoseVelocityEnv(gym.Env):
         self.goal_fallback = goal is None and self.weld
         if goal is None:
             goal = self.goal_sampler.sample(self.np_random, speed_max, vel_cone, self.tool.head_axis)
+        if self.traj_mode:
+            goal = self._sample_reference(goal, speed_max, vel_cone)
         self.goal: Goal = goal
         self.goal_full = goal
         if self.chain_n:
             self._build_chain(goal)
         self._update_goal_markers()
+
+    # ------------------------------------------------------------------ trajectory goals (goal_mode "trajectory")
+    def _sample_reference(self, goal: Goal, speed_max: float, vel_cone: float, goal_tries: int = 4) -> Goal:
+        """Builds the reference into `goal`; if no valid one exists, tries other goals near the current pose. The
+        last resort keeps the last goal with an unchecked reference (no detour; ref_fallback)."""
+        self.ref_fallback = False
+        for _ in range(goal_tries - 1):
+            if self._build_reference(goal):
+                return goal
+            nxt = self._sample_weld_goal(speed_max, vel_cone) if self.weld else None
+            if nxt is None:
+                break
+            goal = nxt
+        if not self._build_reference(goal):
+            self._build_reference(goal, strict=False)
+            self.ref_fallback = True
+        return goal
+
+    def _build_reference(self, goal: Goal, strict: bool = True) -> bool:
+        """Time-indexed reference (one sample per control step, sample 0 = now) into the goal, in arm joint space.
+
+        1. Lead-in and follow-through: the head on the line p_g + s v_hat at v_g, the tool in the goal orientation,
+           solved by IK sample by sample (warm-started outward from the goal's joints q_ref).
+        2. Approach: a quintic from the current joints and joint velocity (zero acceleration) to the lead-in start
+           at its joint velocity, plus a random detour sin^3(pi tau) (c1 + c2 cos(pi tau)) that vanishes with its
+           first two derivatives at both ends.
+        3. Checks: joint limits, joint speeds within joint_v_max, no collisions (every check_every samples), the head
+           above the table. Up to TrajCfg.tries detours are drawn, then one without.
+        Returns False if no candidate passes (strict), or stores the last candidate anyway (not strict).
+        """
+        tc, gc, rng = self.tcfg, self.cfg.goal, self.np_random
+        dt = self.model.opt.timestep * self.cfg.frame_skip
+        q0 = self.data.qpos[self.arm_qadr].copy()
+        qd0 = self.data.qvel[self.arm_dadr].copy()
+        vmax = self._joint_v_max()
+        lo, hi = self.arm_range[:, 0], self.arm_range[:, 1]
+
+        q_goal = goal.q_ref
+        if q_goal is None:  # region-sampler fallback goal: no stored joints
+            q_goal = self._ik_solve(q0, goal.p, goal.quat, iters=100)
+        if q_goal is None:
+            return False if strict else self._set_hold_reference()
+        # 1. The straight part, tightly solved: the joint velocity is a finite difference of these solutions.
+        speed = max(goal.speed, 1e-6)
+        n_lead = max(1, int(round(gc.lead_in / (speed * dt))))
+        n_ft = max(1, int(round(gc.follow_through / (speed * dt))))
+        ik = functools.partial(self._ik_solve, iters=30, pos_tol=2e-4, rot_tol=2e-3)
+        back, q = [], np.asarray(q_goal, dtype=np.float64)
+        q_g = ik(q, goal.p, goal.quat)
+        if q_g is None:
+            return False if strict else self._set_hold_reference()
+        q = q_g
+        for k in range(1, n_lead + 1):
+            q = ik(q, goal.p - k * dt * goal.v, goal.quat)
+            if q is None:
+                return False if strict else self._set_hold_reference()
+            back.append(q)
+        fwd, q = [], q_g
+        for k in range(1, n_ft + 1):  # the follow-through may end early (it is after the attempt)
+            q = ik(q, goal.p + k * dt * goal.v, goal.quat)
+            if q is None:
+                break
+            fwd.append(q)
+        line = np.array(back[::-1] + [q_g] + fwd)
+        n_line = len(line)
+        k_line = np.arange(-n_lead, n_line - n_lead)
+        line_p = goal.p + (k_line * dt)[:, None] * goal.v
+        qd_line = np.gradient(line, dt, axis=0) if n_line > 1 else np.zeros_like(line)
+        q1, v1 = line[0], qd_line[0]
+
+        # 2. The approach.
+        dq = q1 - q0
+        T = max(tc.t_min, 1.875 * float(np.max(np.abs(dq) / (tc.qd_frac * vmax))))
+        bump_std = _lerp(tc.bump_rad, self.level)
+        cand = None
+        for attempt in range(tc.tries + 1):
+            std = bump_std if attempt < tc.tries else 0.0
+            n_app = int(round(T * rng.uniform(*tc.t_jitter) / dt))
+            n_app = min(max(n_app, 2), self.cfg.max_steps - n_line)
+            if n_app < 2:
+                return False if strict else self._set_hold_reference()
+            Ta = n_app * dt
+            tau = (np.arange(n_app) / n_app)[:, None]
+            t3, t4, t5 = tau ** 3, tau ** 4, tau ** 5
+            h00, h01 = 1 - 10 * t3 + 15 * t4 - 6 * t5, 10 * t3 - 15 * t4 + 6 * t5
+            h10, h11 = tau - 6 * t3 + 8 * t4 - 3 * t5, -4 * t3 + 7 * t4 - 3 * t5
+            app = h00 * q0 + h10 * (Ta * qd0) + h01 * q1 + h11 * (Ta * v1)
+            if std > 0:
+                c1, c2 = rng.normal(0.0, std, (2, self.n_arm_act))
+                app = app + np.sin(np.pi * tau) ** 3 * (c1 + c2 * np.cos(np.pi * tau))
+            q_all = np.vstack([app, line])
+            qd_all = np.gradient(q_all, dt, axis=0)
+            qd_all[0] = qd0
+            qd_all[n_app:] = qd_line
+            cand = (q_all, qd_all, n_app, line_p, n_lead)
+            if self._reference_ok(goal, q_all, qd_all, n_app, lo, hi, vmax):
+                self._store_reference(goal, *cand)
+                return True
+        if strict:
+            return False
+        self._store_reference(goal, *cand)
+        return True
+
+    def _reference_ok(self, goal: Goal, q_all, qd_all, n_app, lo, hi, vmax) -> bool:
+        """Joint limits and speeds on every sample; on the approach (the straight part was checked by the IK): table
+        clearance, collisions (every check_every samples), and staying out of the attempt region. An approach that
+        sweeps within eps_kp of the goal pose would make the attempt there, before lining up on the lead-in, so
+        it must keep 1.5 x eps_kp away (margin for tracking error)."""
+        if np.any(q_all < lo - 1e-6) or np.any(q_all > hi + 1e-6):
+            return False
+        if np.any(np.abs(qd_all[1:]) > vmax):
+            return False
+        min_z = self.rinfo.table_top + self.tcfg.min_clearance
+        step = max(1, int(self.tcfg.check_every))
+        offsets, keep_out = keypoint_offsets(self.cfg.reward), 1.5 * self.eps_kp()
+        for k in range(1, n_app):
+            head, _, quat, _ = self._scratch_pose(q_all[k])
+            if head[2] < min_z or keypoint_distance(head, quat, goal.p, goal.quat, offsets) < keep_out:
+                return False
+            if (k % step == 0 or k == n_app - 1) and self._scratch_collides():
+                return False
+        return True
+
+    def _store_reference(self, goal: Goal, q_all, qd_all, n_app, line_p, n_lead) -> None:
+        """FK of the approach, the exact line on the straight part; velocities by finite differences (the line's are
+        v_g, sample 0's the measured head velocity)."""
+        dt = self.model.opt.timestep * self.cfg.frame_skip
+        n = len(q_all)
+        p, quat = np.empty((n, 3)), np.empty((n, 4))
+        for k in range(n_app):
+            p[k], _, quat[k], _ = self._scratch_pose(q_all[k])
+        p[n_app:] = line_p
+        quat[n_app:] = goal.quat
+        v = np.gradient(p, dt, axis=0) if n > 1 else np.zeros((n, 3))
+        v[n_app:] = goal.v
+        v[0] = self._head_state()[1]
+        w = np.zeros((n, 3))
+        for k in range(1, n_app):
+            w[k] = mu.quat_error(quat[k + 1], quat[k - 1]) / (2 * dt)
+        self.ref = Trace(dt=dt, p=p, quat=quat, v=v, w=w, phase=np.zeros(n, np.int64), force_target=np.zeros(n),
+                         meta={"head_axis_tool": self.tool.head_axis.tolist()})
+        self.ref_q, self.ref_qd = q_all, qd_all
+        self.ref_goal_idx = n_app + n_lead
+
+    def _set_hold_reference(self) -> bool:
+        """Last resort: a one-sample reference that holds the current pose (the goal is unreachable from here)."""
+        dt = self.model.opt.timestep * self.cfg.frame_skip
+        head = self.data.site_xpos[self.head_site].copy()
+        self.ref = Trace(dt=dt, p=head[None], quat=self._tool_quat()[None], v=np.zeros((1, 3)), w=np.zeros((1, 3)),
+                         phase=np.zeros(1, np.int64), force_target=np.zeros(1),
+                         meta={"head_axis_tool": self.tool.head_axis.tolist()})
+        self.ref_q = self.data.qpos[self.arm_qadr].copy()[None]
+        self.ref_qd = np.zeros((1, self.n_arm_act))
+        self.ref_goal_idx = 0
+        return True
+
+    def ref_sample(self, k: int):
+        """Reference (head position, head velocity, tool orientation, arm joints, joint velocity) at step k; past the
+        end it holds the last pose at rest."""
+        n = len(self.ref)
+        if k < n:
+            return self.ref.p[k], self.ref.v[k], self.ref.quat[k], self.ref_q[k], self.ref_qd[k]
+        return self.ref.p[-1], np.zeros(3), self.ref.quat[-1], self.ref_q[-1], np.zeros(self.n_arm_act)
+
+    def _ref_obs(self, head: np.ndarray, lin: np.ndarray) -> list:
+        rp, rv, rq, rjq, rjqd = self.ref_sample(self.t)
+        out = [rp - head, rv - lin, rv, mu.quat_error(rq, self._tool_quat())]
+        for j in self.tcfg.preview:
+            pj, vj, _, _, _ = self.ref_sample(self.t + int(j))
+            out += [pj - head, vj]
+        if self.tcfg.joint_obs:
+            out += [rjq - self.data.qpos[self.arm_qadr], rjqd / self._joint_v_max()]
+        return out
 
     def _build_chain(self, goal: Goal) -> None:
         """pose_chain: sub-goal 0 at the lead-in point (untimed approach), then chain_n more along the strike line, the
@@ -710,6 +895,8 @@ class PoseVelocityEnv(gym.Env):
         self.ep_motion = {"qvel_l1": 0.0, "qvel_l2": 0.0, "qvel_l2sq": 0.0, "qvel_peak": 0.0, "qacc": 0.0, "da": 0.0}
         self._prev_qvel = None
         self.diverged = False
+        self.d_ref = 0.0  # trajectory: keypoint distance to the reference sample now
+        self.track_err_sum = 0.0
         self._prev_head = self.data.site_xpos[self.head_site].copy()
         # Phi is continuous across a soft reset (same physical state), so shaping telescopes across episodes.
         self.phi_prev = self._grasp_potential(self._holding())
@@ -865,6 +1052,13 @@ class PoseVelocityEnv(gym.Env):
             bonus_frac = 1.0 if near else 0.0
         passed = success if self.pose_hold else attempt
         d_perp = plane_crossing(prev_head, head, g.p, g.direction)  # goal-plane crossing (diagnostics only)
+        lost = False
+        if self.traj_mode:
+            rp, rv, rq, _, _ = self.ref_sample(self.t)
+            self.d_ref = keypoint_distance(head, self._tool_quat(), rp, rq, keypoint_offsets(rc))
+            dv_ref = float(np.linalg.norm(lin - rv))
+            self.track_err_sum += self.d_ref
+            lost = bool(self.tcfg.lost_dist > 0 and not passed and self.d_ref > self.tcfg.lost_dist)
 
         dropped = False
         if not self.weld:
@@ -878,7 +1072,7 @@ class PoseVelocityEnv(gym.Env):
         pushed = bool(self.table_force > rc.table_force_limit)
         # The arm can't follow the commanded head twist (singularity or joint limits): a failure, like a push.
         ik_failed = bool(cfg.ik_fail_tol > 0 and not passed and self.ik_error > cfg.ik_fail_tol)
-        terminated = passed or dropped or pushed or ik_failed
+        terminated = passed or dropped or pushed or ik_failed or lost
         late = bool(self.chain_n and self.sub_idx > 0 and not advanced
                     and self.t_sub >= cfg.pose_chain_slack * self.sub_budget[self.sub_idx])
         truncated = (not terminated) and (self.t >= cfg.max_steps or late)
@@ -902,6 +1096,10 @@ class PoseVelocityEnv(gym.Env):
         self._prev_qvel = qv
         terms, q_v = step_terms(rc, d=d_kp, d_star=d_star, attempt=attempt, dv=dv_norm, speed=g.speed,
                                 qvel_cost=arm_vel_cost(qv, getattr(rc, "smooth_norm", "l1")), bonus_frac=bonus_frac)
+        if self.traj_mode:  # tracking the reference replaces the keypoint progress toward the goal
+            del terms["keypoint"]
+            terms["track"] = track_reward(self.tcfg, d_ref=self.d_ref, dv_ref=dv_ref, speed=g.speed,
+                                          speed_min=cfg.goal.speed_min)
         if attempt:
             v_along = float(lin @ g.direction)
             v_side = float(np.linalg.norm(lin - v_along * g.direction))
@@ -935,6 +1133,8 @@ class PoseVelocityEnv(gym.Env):
         self._last_obs = obs
         info = {"priv": self._get_priv(), "success": success, "dropped": dropped, "passed": passed,
                 "holding": holding, "d_perp": d_perp, "d_kp": d_kp, "pushed": pushed, "ik_failed": ik_failed}
+        if self.traj_mode:
+            info.update(lost=lost, d_ref=self.d_ref)
         if terminated or truncated:
             self.goals_with_grip += 1
             if self.weld:
@@ -944,6 +1144,9 @@ class PoseVelocityEnv(gym.Env):
             self._forced_reset_kind = kind
             info["episode"] = self._episode_info(success=success, dropped=dropped, passed=passed, kind=kind,
                                                  pushed=pushed, ik_failed=ik_failed)
+            if self.traj_mode:
+                info["episode"].update(lost=float(lost), track_err=self.track_err_sum / max(self.t, 1),
+                                       ref_fallback=float(self.ref_fallback))
         if self.render_mode == "human":
             self.render()
         return obs, reward, terminated, truncated, info
@@ -1004,8 +1207,12 @@ class PoseVelocityEnv(gym.Env):
             parts += [g.p, mu.rot6d(mu.quat_to_mat(g.quat)), head - g.p, self._rot_error(), [eps_p, eps_th]]
         if not self.weld:
             parts.append([float(self._holding()), float(self._grasp_condition())])
+        if self.traj_mode:
+            parts += self._ref_obs(head, lin)
         if self.chain_n:  # the current sub-goal's clock (goes negative when it is late)
             parts.append([max(-1.0, 1.0 - self.t_sub / self.sub_budget[self.sub_idx])])
+        elif self.traj_mode:  # time until the reference reaches p_g (negative after)
+            parts.append([(self.ref_goal_idx - self.t) / self.cfg.max_steps])
         else:
             parts.append([1.0 - self.t / self.cfg.max_steps])
         return np.concatenate(parts).astype(np.float32)
@@ -1019,7 +1226,8 @@ class PoseVelocityEnv(gym.Env):
              float(self.ever_grasped), min(self.no_contact, 20) / 10.0, float(self.c_tool_table), self._tool_lift()],
         ] + ([[self.near_steps / self.cfg.success_steps]] if self.pose_hold else [])
           # velocity_obs False: the critic still sees v_g, so it can value the velocity-scaled bonus.
-          + ([self.goal.v] if self.cfg.goal_velocity and not self.vel_obs else []))
+          + ([self.goal.v] if self.cfg.goal_velocity and not self.vel_obs else [])
+          + ([[min(self.d_ref, 1.0)]] if self.traj_mode else []))
         return priv.astype(np.float32)
 
     def oracle_action(self) -> np.ndarray:
@@ -1027,7 +1235,14 @@ class PoseVelocityEnv(gym.Env):
 
         The oracle is stateful (approach, then strike), so call this once per step, before stepping.
         The oracle plans head twists; in joint mode they are converted with joint_action_for_twist.
+        goal_mode "trajectory": traces.TraceFollower on the reference (it outputs joint_vel actions itself).
         """
+        if self.traj_mode:
+            if self._oracle is None:
+                from traces import TraceFollower
+
+                self._oracle = TraceFollower()
+            return self._oracle(self, self.ref, self.t).astype(np.float32)
         if self._oracle is None:
             from oracle import ChainPoseOracle, Oracle, PoseOracle
 
@@ -1061,7 +1276,10 @@ class PoseVelocityEnv(gym.Env):
         real robot from its kinematics and the grasp."""
         g = self.goal
         P = self._dls_pinv() / self._joint_v_max()[:, None]
-        z = np.zeros(3)
+        if self.traj_mode:  # the reference's feedback and feedforward terms (what TraceFollower combines)
+            rp, rv, rq, _, _ = self.ref_sample(self.t)
+            cols = [P[:, :3] @ x for x in (rp - head, rv, lin - rv)]
+            return np.concatenate(cols + [P[:, 3:] @ mu.quat_error(rq, self._tool_quat())])
         lin_terms = [self.lead_point() - head if self.vel_obs else g.p - head]
         if self.vel_obs:
             rel = head - g.p

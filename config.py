@@ -129,12 +129,45 @@ class CurriculumCfg:
 
 
 @dataclass
+class TrajCfg:
+    """goal_mode "trajectory": a smooth random reference into each strike goal (PoseVelocityEnv._build_reference).
+
+    The reference is built in arm joint space, so every sample is reachable with the current grasp: a quintic from
+    the arm's current joints and velocity to the start of the lead-in, plus a random detour that vanishes (with its
+    first two derivatives) at both ends, then the straight lead-in through the goal at v_g in the goal orientation
+    (solved by IK sample by sample) and the follow-through. Pairs are (level 0, level 1), lerped by the curriculum.
+    """
+    bump_rad: Tuple[float, float] = (0.15, 0.4)  # std (rad) of the random joint-space detour, per joint
+    qd_frac: float = 0.6  # approach duration from this fraction of joint_v_max (headroom for feedback)
+    t_min: float = 0.6  # s, shortest approach
+    t_jitter: Tuple[float, float] = (1.0, 1.5)  # random stretch of the approach duration
+    min_clearance: float = 0.04  # m: every sample keeps the head this far above the table
+    check_every: int = 5  # collision-check every Nth sample (FK is done on all of them)
+    tries: int = 5  # detour draws per goal before trying without one
+    # Observation: the reference now and at these future offsets (steps); joint_obs adds q_ref - q and qdot_ref.
+    preview: Tuple[int, ...] = (5, 10, 20)
+    joint_obs: bool = True
+    # Per-step tracking reward (replaces the keypoint progress term): w_pos exp(-d_ref / sigma_pos) +
+    # w_vel exp(-|v - v_ref| / (sigma_vel_frac max(|v_g|, speed_min))), d_ref the keypoint distance to the reference.
+    w_pos: float = 1.0
+    w_vel: float = 1.0
+    sigma_pos: float = 0.05
+    sigma_vel_frac: float = 0.5
+    lost_dist: float = 0.15  # m: d_ref beyond this ends the episode as a failure ("lost"); 0 disables
+
+
+@dataclass
 class EnvCfg:
     scene: SceneCfg = field(default_factory=SceneCfg)
     tool: ToolCfg = field(default_factory=ToolCfg)
     goal: GoalCfg = field(default_factory=GoalCfg)
     reward: RewardCfg = field(default_factory=RewardCfg)
     curriculum: CurriculumCfg = field(default_factory=CurriculumCfg)
+    # "points": each episode is one strike goal (reach p_g in the goal orientation moving at v_g). "trajectory": the
+    # same goal and success rule, plus a time-indexed reference into it that the policy observes and is rewarded for
+    # tracking (TrajCfg). Weld grip, pose + velocity goals only.
+    goal_mode: str = "points"
+    traj: TrajCfg = field(default_factory=TrajCfg)
     # "weld": the tool is welded to the palm at a sampled grasp, the fingers are frozen and only the arm is
     # controlled (Stage A: learn the strike). "physical": the tool must be grasped and held by the hand.
     grip_mode: str = "weld"
@@ -466,9 +499,34 @@ def add_goal_ablation_args(p, pose_only: bool = True) -> None:
     p.add_argument("--vel-cone", type=float, nargs=2, default=None, metavar=("LEVEL0", "LEVEL1"),
                    help="max angle (deg) between the goal velocity and the head axis, at curriculum level 0 and 1 "
                         "(CurriculumCfg.vel_cone_deg)")
+    p.add_argument("--goal-mode", default=None, choices=GOAL_MODES,
+                   help="'points': one strike goal per episode; 'trajectory': the same goal plus a smooth random "
+                        "reference into it, observed and tracked (EnvCfg.goal_mode, TrajCfg)")
+
+
+GOAL_MODES = ("points", "trajectory")
+
+
+def check_goal_mode(cfg: "EnvCfg") -> None:
+    """ValueError if goal_mode is unknown or "trajectory" is combined with settings it doesn't support."""
+    mode = getattr(cfg, "goal_mode", "points")
+    if mode not in GOAL_MODES:
+        raise ValueError(f"goal_mode must be one of {GOAL_MODES}, got {mode!r}")
+    if mode == "trajectory":
+        if cfg.grip_mode != "weld":
+            raise ValueError("goal_mode 'trajectory' needs grip_mode 'weld' (the reference is built from arm joints)")
+        if not cfg.goal_velocity or not getattr(cfg, "velocity_obs", True) or getattr(cfg, "pose_chain", 0):
+            raise ValueError("goal_mode 'trajectory' needs the pose + velocity goal (no --pose-only, --no-vel-obs or "
+                             "--pose-chain)")
+        if cfg.action_mode == "joint":
+            raise ValueError("goal_mode 'trajectory' supports action_mode 'joint_vel' and 'head_twist', not 'joint'")
 
 
 def apply_goal_ablation_args(cfg: "EnvCfg", args) -> "EnvCfg":
+    if getattr(args, "goal_mode", None) is not None:
+        cfg.goal_mode = args.goal_mode
+        if not hasattr(cfg, "traj"):  # a checkpoint from before goal_mode
+            cfg.traj = TrajCfg()
     if getattr(args, "pose_only", None) is not None:
         cfg.goal_velocity, cfg.pose_success = False, args.pose_only
     if args.no_vel_obs:
@@ -486,8 +544,11 @@ def apply_goal_ablation_args(cfg: "EnvCfg", args) -> "EnvCfg":
 
 def goal_obs_key(cfg: "EnvCfg") -> tuple:
     """The settings that decide the actor observation layout (and meaning) of the goal."""
-    return (cfg.goal_velocity, getattr(cfg, "velocity_obs", True), cfg.pose_success if not cfg.goal_velocity else None,
-            getattr(cfg, "pose_chain", 0))
+    key = (cfg.goal_velocity, getattr(cfg, "velocity_obs", True), cfg.pose_success if not cfg.goal_velocity else None,
+           getattr(cfg, "pose_chain", 0))
+    if getattr(cfg, "goal_mode", "points") == "trajectory":
+        key += ("trajectory", tuple(cfg.traj.preview), cfg.traj.joint_obs)
+    return key
 
 
 def describe_goal(cfg: "EnvCfg") -> str:
@@ -496,4 +557,5 @@ def describe_goal(cfg: "EnvCfg") -> str:
         return f"pose-only ({cfg.pose_success}{f', chain {chain}' if chain else ''})"
     parts = [] if getattr(cfg, "velocity_obs", True) else ["no vel obs"]
     parts += [] if getattr(cfg, "velocity_reward", True) else ["no vel reward"]
-    return "pose+velocity" + (f" ({', '.join(parts)})" if parts else "")
+    traj = " trajectory" if getattr(cfg, "goal_mode", "points") == "trajectory" else ""
+    return "pose+velocity" + traj + (f" ({', '.join(parts)})" if parts else "")

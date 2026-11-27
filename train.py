@@ -250,7 +250,7 @@ def main():
     loaded_key = goal_obs_key(env_cfg)
     apply_goal_ablation_args(env_cfg, args)
     if (args.resume or args.init_from) and goal_obs_key(env_cfg) != loaded_key:
-        raise SystemExit("--pose-only / --no-vel-obs / --pose-chain change the observation; set them in bc.py (or "
+        raise SystemExit("--pose-only / --no-vel-obs / --pose-chain / --goal-mode change the observation; set them in bc.py (or "
                          "train from scratch) instead of on top of a checkpoint trained without them")
     if args.grasp_slide is not None:
         env_cfg.grasp_slide = args.grasp_slide
@@ -418,6 +418,10 @@ def main():
             d_kp_min = [e["d_kp_min"] for e in ep_stats if np.isfinite(e.get("d_kp_min", np.nan))]
             if d_kp_min:
                 log["ep/d_kp_min_cm"] = float(np.mean(d_kp_min) * 100)
+            if getattr(env_cfg, "goal_mode", "points") == "trajectory":
+                log["ep/lost"] = float(np.mean([e.get("lost", 0.0) for e in ep_stats]))
+                log["ep/ref_fallback"] = float(np.mean([e.get("ref_fallback", 0.0) for e in ep_stats]))
+                log["ep/track_err_cm"] = float(np.mean([e.get("track_err", np.nan) for e in ep_stats]) * 100)
             terms = defaultdict(list)
             for e in ep_stats:
                 for k, v in e["terms"].items():

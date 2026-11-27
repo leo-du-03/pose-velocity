@@ -1,26 +1,27 @@
-# SimToolReal baseline on the simplify-weld environment
+# SimToolReal baseline
 
-This branch adds a baseline that trains with the **SimToolReal** method (Kedia, Lum et al., arXiv 2602.16863) in the
-**simplify-weld** environment: same robot (UR5e + LEAP hand), same MuJoCo scene, same procedurally generated tools
-welded to the palm. Only the training method changes, so the two approaches can be compared directly.
+A reproduction of the **SimToolReal** method (Kedia, Lum et al., arXiv 2602.16863) in this repo's environment: the same
+robot (UR5e + LEAP hand), MuJoCo scene and procedurally generated tools welded to the palm. It lives in the `strl_*.py`
+files, which import the shared `config.py`, `env.py`, `ppo.py`, `vec_env.py`, ... modules, so the two approaches can be
+compared directly.
 
-It is built on top of `simplify-weld` (f31cc3f). **No existing file is modified**; everything lives in new `strl_*.py`
-files that import the existing `config.py`, `env.py`, `ppo.py`, `vec_env.py`, ... modules.
+The main method has since adopted SimToolReal's keypoint reward and extended it with the goal velocity (see the
+README's "How it works"). The rows below compare the two as they are now.
 
-| | simplify-weld | SimToolReal baseline (`strl_*.py`) |
+| | pose-velocity (main method) | SimToolReal baseline (`strl_*.py`) |
 |---|---|---|
 | Robot, scene, tools, palm weld | UR5e + LEAP, MuJoCo, random tools welded to the palm | same |
-| Goal | head position + velocity + tool orientation, one attempt | tool pose only, reached one after another |
-| Pose distance | position / velocity / angle errors | max distance over 4 object-frame keypoints |
-| Arm action | head twist (IK) | joint-position-target deltas |
-| Reward | pass quality at the goal plane | 200 x keypoint progress + 1000 success bonus - 0.03 x arm joint speed |
-| Training | oracle -> DAgger -> PPO fine-tune | PPO from scratch, asymmetric critic |
+| Goal | head position + velocity + tool orientation, one attempt per episode | tool pose only, reached one after another |
+| Pose distance | max distance over 4 tool-frame keypoints | max distance over 4 object-frame keypoints |
+| Arm action | head twist (IK), joint-target deltas or joint velocities (`--action-mode`) | joint-position-target deltas |
+| Reward | 200 x keypoint progress - 0.03 x arm joint speed, + 1000 x velocity match on the attempt | 200 x keypoint progress + 1000 success bonus - 0.03 x arm joint speed |
+| Training | oracle -> DAgger -> PPO fine-tune (or PPO from scratch with `--goal-mode trajectory`) | PPO from scratch, asymmetric critic |
 | Curriculum | tolerances, speed, velocity cone | success tolerance x0.9 when >= 3 goals per episode (7.5 cm -> 1 cm) |
 | Domain randomization | tool shape / mass / friction | optional (`--dr`): delays, pose / joint-velocity noise, random wrenches |
 
 ## Install
 
-Same environment as `simplify-weld` (see `README.md`). Nothing extra is needed. Tested on an M-series MacBook Pro, CPU
+Same environment as the main project (see [README.md](README.md)). Nothing extra is needed. Tested on an M-series MacBook Pro, CPU
 only.
 
 ## Verify, in this order
@@ -166,10 +167,10 @@ evaluation, so with a single seed the effect of the window is inconclusive.
 - **No grasping stage**: the tool is welded, so the approach and lift reward terms are dropped. This is the point of the
   comparison.
 - **PPO instead of SAPG** (SAPG needs thousands of parallel envs) and **MLP instead of LSTM** (for now).
-- **Arm speed 1.5 rad/s** instead of 0.15 rad/s, the same as simplify-weld's joint mode (`StrlCfg.arm_delta_scale`).
+- **Arm speed 1.5 rad/s** instead of 0.15 rad/s, the same as the main env's `joint` action mode (`StrlCfg.arm_delta_scale`).
   The initial action std is lowered from 1 to 0.1 so the exploration noise in joint speed matches the paper.
 - **Batch and curriculum cadence** scaled down for CPU training (comments in `strl_config.py`).
-- **Domain randomization off by default**: it is for sim-to-real; simplify-weld has none and both are evaluated in
+- **Domain randomization off by default**: it is for sim-to-real; the main env has none and both are evaluated in
   simulation.
 
 ## Troubleshooting

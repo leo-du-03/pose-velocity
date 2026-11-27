@@ -22,7 +22,7 @@ import time
 
 import numpy as np
 
-from config import EnvCfg, RewardCfg, describe_goal
+from config import GOAL_MODES, EnvCfg, RewardCfg, TrajCfg, describe_goal
 
 
 def _lerp(pair, level: float) -> float:
@@ -88,6 +88,9 @@ def main():
                         "(EnvCfg.pose_chain)")
     p.add_argument("--vel-cone", type=float, nargs=2, default=None, metavar=("LEVEL0", "LEVEL1"),
                    help="override CurriculumCfg.vel_cone_deg, e.g. 30 180 to test a strikes-only checkpoint on swipes")
+    p.add_argument("--goal-mode", default=None, choices=GOAL_MODES,
+                   help="without --ckpt: 'points' or 'trajectory' (a reference into each goal; --policy oracle then "
+                        "follows it). A checkpoint carries its own setting")
     p.add_argument("--score-eps-v-frac", type=float, nargs=2, default=None, metavar=("LEVEL0", "LEVEL1"),
                    help="velocity tolerance (fraction of goal speed) for vel_ok / joint_ok in the summary and dump, so "
                         "checkpoints trained with different ones are scored alike; the env and its observation keep "
@@ -144,6 +147,12 @@ def main():
         cfg.pose_chain = args.pose_chain  # the observation layout doesn't change, so a checkpoint can take it
     if args.vel_cone is not None:
         cfg.curriculum.vel_cone_deg = tuple(args.vel_cone)
+    if args.goal_mode is not None:
+        if policy == "ckpt" and args.goal_mode != getattr(cfg, "goal_mode", "points"):
+            p.error("--goal-mode is taken from the checkpoint (it changes the observation); drop it with --ckpt")
+        cfg.goal_mode = args.goal_mode
+        if not hasattr(cfg, "traj"):
+            cfg.traj = TrajCfg()
 
     render_mode = "rgb_array" if args.video else (None if args.render == "none" else args.render)
     env = PoseVelocityEnv(cfg, render_mode=render_mode)
@@ -191,6 +200,9 @@ def main():
                     f"(q_v {ps['q_v']:.2f}) rot {ps['theta_deg']:3.0f}deg" if ps else "no attempt")
         if env.pose_hold:
             pass_txt += f"  near steps {e['near_steps']}"
+        if env.traj_mode:
+            pass_txt += (f"  track {e['track_err'] * 100:4.1f}cm{'  LOST' if e['lost'] else ''}"
+                         f"{'  ref-fallback' if e['ref_fallback'] else ''}")
         print(f"episode {ep}: start {start_kind:7s}  return {ep_ret:8.2f}  len {e['length']:4d}  "
               f"success {bool(e['success'])}  dropped {bool(e['dropped'])}  {pass_txt}  "
               f"d_min {e['d_min'] * 100:.1f}cm")

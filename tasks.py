@@ -441,7 +441,19 @@ def _fixture_geom(body, solref, **kw):
 
 
 class HammerTask(Task):
-    """Shared by plate and nail: hit the target with the hammer face at a calibrated speed for a target peak force."""
+    """Shared by plate and nail: hit the target with the hammer face at a calibrated speed for a target peak force.
+
+    The force is the impact only: the peak normal contact force in the first TaskCfg.impact_window (6 ms) of contact,
+    measured every physics substep. In that time it comes from the hammer's own momentum; the hammer is coupled to the
+    hand through the weld's ~10 ms softness, so the arm's push hasn't arrived yet (the peak lands on the first contact
+    substep). A longer window mostly measures how hard the arm keeps pushing after the hit, which policies are never
+    trained on (training episodes end at the goal). The plate's force is sensitive to the face being square: a face
+    tilted a few degrees meets the rigid plate on an edge and spikes higher (TaskCfg.face_crown softens this).
+
+    Calibration: the reference follower runs the strike at calib_speeds impact speeds, the target force is drawn from
+    the measured range, and its speed is interpolated and refined with up to calib_refine more rollouts; instances
+    the follower misses by more than half of force_tol are resampled.
+    """
 
     vertical = False  # always strike straight down (a vertical target), in either layout
     last_keypoint_is_contact = True

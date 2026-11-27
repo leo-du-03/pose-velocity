@@ -184,9 +184,10 @@ class TraceFollower:
     def __init__(self, k_pos: float = 8.0, k_rot: float = 6.0):
         self.k_pos, self.k_rot = k_pos, k_rot
 
-    def __call__(self, env) -> np.ndarray:
-        tr, cfg = env.trace, env.cfg
-        k = min(env.task_t, len(tr) - 1)
+    def __call__(self, env, trace: "Trace | None" = None, k: "int | None" = None) -> np.ndarray:
+        """trace, k: the trace and the current step (default env.trace and env.task_t, the task envs' names)."""
+        tr, cfg = (env.trace if trace is None else trace), env.cfg
+        k = min(env.task_t if k is None else k, len(tr) - 1)
         k1 = min(k + 1, len(tr) - 1)
         head = env._head_state()[0]
         v = 0.5 * (tr.v[k] + tr.v[k1]) + self.k_pos * (tr.p[k] - head)

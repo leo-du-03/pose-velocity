@@ -77,6 +77,15 @@ def step_terms(cfg: RewardCfg, *, d: float, d_star: float, attempt: bool, dv: fl
     return terms, q_v
 
 
+def track_reward(traj_cfg, *, d_ref: float, dv_ref: float, speed: float, speed_min: float) -> float:
+    """goal_mode "trajectory": per-step reward for tracking the reference (replaces the keypoint progress term).
+
+    d_ref: keypoint pose distance to the reference sample (m); dv_ref: |v_head - v_ref| (m/s); speed: |v_g|.
+    """
+    sigma_v = traj_cfg.sigma_vel_frac * max(speed, speed_min, 1e-6)
+    return float(traj_cfg.w_pos * np.exp(-d_ref / traj_cfg.sigma_pos) + traj_cfg.w_vel * np.exp(-dv_ref / sigma_v))
+
+
 def grasp_potential(cfg: RewardCfg, *, reach_dist: float, n_tip_contacts: int, n_tips: int, hand_contact: bool,
                     lift: float, holding: bool) -> float:
     """Phi(s) for physical grip: how far along the reach -> touch -> lift sequence the hand is."""
