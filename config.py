@@ -29,6 +29,7 @@ class SceneCfg:
     table_center_dist: float = 0.6  # distance of table center from robot base, along arm's home direction
     table_half_size: Tuple[float, float, float] = (0.3, 0.45, 0.02)  # (radial, lateral, thickness)
     pedestal_height: float = 0.75  # table top and robot base are both at z = 0; floor at -pedestal_height
+    weld_solref: Tuple[float, float] = (0.01, 1.0)  # stiffness of the palm-tool weld in grip_mode "weld"
 
 
 @dataclass
@@ -53,58 +54,106 @@ class GoalCfg:
     lateral: Tuple[float, float] = (-0.35, 0.35)
     height: Tuple[float, float] = (0.15, 0.5)
     min_base_dist: float = 0.3
-    lead_in: float = 0.12  # p_g - lead_in * v_hat must be reachable
+    lead_in: float = 0.12  # p_g - lead_in * v_hat must be reachable (with the goal orientation)
     follow_through: float = 0.08  # p_g + follow_through * v_hat must be reachable
     min_clearance: float = 0.08  # all three points must be this far above the table
-    min_dir_z: float = -0.5  # reject velocity directions pointing steeply into the table
-    speed_min: float = 0.1
-    axis_mode: str = "velocity"  # "velocity": head axis = v_hat; "cone": random within axis_cone_deg of v_hat
-    axis_cone_deg: float = 30.0
+    min_dir_z: float = -1.0  # steepest allowed downward velocity (z of its direction); -1 allows straight-down strikes
+    # Weld goals: this fraction is a steep downward strike (velocity z <= down_max_z), like hammering a vertical nail.
+    # Without it they are rare (~3% below -0.9), since most arm configurations don't point the head axis down.
+    down_frac: float = 0.25
+    down_max_z: float = -0.85
+    speed_min: float = 0.3  # m/s; tolerances are relative to speed, so slow goals are the hardest under noise
     reach_samples: int = 50000
     reach_voxel: float = 0.05
+    # Weld mode samples goals from arm configurations (see GoalSampler.sample_from_grasp): joints are drawn
+    # around the home pose or the current pose with this std (rad), so goals stay on a reachable IK branch.
+    goal_q_std: float = 0.5
+    goal_q_home_prob: float = 0.0  # fraction of proposals centered on the home pose (else the current pose)
+    goal_q_tries: int = 400
+    # A crossing of the goal plane farther than this from p_g is not an attempt (it is ignored).
+    pass_radius: float = 0.15
 
 
 @dataclass
 class RewardCfg:
-    sigma_p: float = 0.05
-    sigma_v: float = 0.2
-    sigma_theta: float = 0.5
-    # Grasp potential Phi = reach + contact + lift; rewarded as gamma*Phi' - Phi (paid once, not per step held).
+    # The SimToolReal reward (strl_config.StrlCfg, paper Table I) extended with the goal velocity; see rewards.py.
+    # Per step: keypoint_rew_scale * max(d* - d, 0) - arm_vel_penalty * |qdot_arm|_1, where d is the keypoint pose
+    # distance and d* the closest so far. On the attempt (first step with d <= eps_kp, the episode ends there):
+    # reach_goal_bonus * exp(-|v_head - v_g| / (sigma_v_frac * |v_g|)).
+    keypoint_rew_scale: float = 200.0
+    reach_goal_bonus: float = 1000.0
+    arm_vel_penalty: float = 0.03  # weight of the smoothness term, on smooth_norm of the arm joint velocities (rad/s)
+    # Norm of the arm joint velocities in the smoothness term: "l1" (sum |qdot|, SimToolReal), "l2" (|qdot|_2) or
+    # "l2sq" (sum qdot^2, which penalises fast joints more and slow ones less). arm_vel_penalty 0 drops the term.
+    smooth_norm: str = "l1"
+    sigma_v_frac: float = 0.25  # velocity match is 1/e at this fraction of the goal speed (eps_v_frac at level 1)
+    # Keypoints: corners of one fixed box, centered on the head, in the tool frame (x, y, z; z along the handle).
+    # Same box as SimToolReal's reward keypoints (0.141 along the handle), scaled by keypoint_scale.
+    keypoint_scale: float = 1.5
+    keypoint_size: Tuple[float, float, float] = (0.03025, 0.0271, 0.141)
+    # Terminate when the robot or tool pushes on the table, pedestal or floor harder than this (N; physical grip:
+    # arm links only, since the hand has to touch the table to pick the tool up).
+    table_force_limit: float = 100.0
+    # Physical grip only: grasp potential Phi = reach + contact + lift, paid as Phi' - Phi, and the drop penalty.
     w_reach: float = 1.0
     w_contact: float = 2.0
     w_lift: float = 5.0
     lift_scale: float = 0.1
-    shaping_gamma: float = 0.99  # keep equal to PPOCfg.gamma so the shaping doesn't change the optimal policy
-    # Goal potential Phi_goal = wide + tight, also rewarded as gamma*Phi' - Phi (approaching pays, hovering doesn't).
-    w_goal_wide: float = 5.0
-    goal_wide_scale: float = 0.3
-    w_goal_tight: float = 5.0
-    w_progress: float = 3.0
-    w_action: float = 1e-3
-    w_action_rate: float = 2e-3
-    w_arm_vel: float = 1e-4
-    w_table_contact: float = 0.5
-    success_bonus: float = 50.0
-    success_time_bonus: float = 20.0
-    drop_penalty: float = 20.0
-    closest_approach_bonus: float = 10.0
+    drop_penalty: float = 10.0
 
 
 @dataclass
 class CurriculumCfg:
     # (start, end) values, linearly interpolated by the difficulty level in [0, 1].
     eps_p: Tuple[float, float] = (0.08, 0.03)
+    # Keypoint pose distance (rewards.keypoint_distance, m) that makes the attempt: the reward's success region.
+    # SimToolReal starts at 0.11 (0.075 * keypoint_scale 1.5), but that is about the lead-in (12 cm): the attempt
+    # would fire while the head is still lining up behind the goal (the oracle then succeeds 42% at level 0, vs 94%
+    # at 0.06 and 100% at 0.03). Ends at the tightest eps_p.
+    # eps_p and eps_theta_deg stay in the observation (the policy was trained with them) and in diagnostics.
+    eps_kp: Tuple[float, float] = (0.06, 0.03)
     # Velocity tolerance as a fraction of the goal speed: |v_head - v_g| < eps_v_frac * |v_g|.
     # Always < 1, so a stationary head can never count as matching the goal velocity.
     eps_v_frac: Tuple[float, float] = (0.6, 0.25)
-    eps_theta_deg: Tuple[float, float] = (60.0, 20.0)
-    speed_max: Tuple[float, float] = (0.1, 0.6)
-    start_in_hand_prob: Tuple[float, float] = (0.5, 0.0)
-    up_threshold: float = 0.6
+    eps_theta_deg: Tuple[float, float] = (60.0, 20.0)  # full rotation angle between tool and goal orientation
+    # Max angle between the goal velocity and the head axis at the goal pose: small = strike out of the head's face,
+    # 180 = any direction (swipes). Sampled uniformly within it.
+    vel_cone_deg: Tuple[float, float] = (30.0, 180.0)
+    speed_max: Tuple[float, float] = (0.3, 0.6)
+    start_in_hand_prob: Tuple[float, float] = (0.5, 0.0)  # physical grip only
+    up_threshold: float = 0.5
     down_threshold: float = 0.2
     step: float = 0.05
     window: int = 200
     min_episodes: int = 100
+
+
+@dataclass
+class TrajCfg:
+    """goal_mode "trajectory": a smooth random reference into each strike goal (PoseVelocityEnv._build_reference).
+
+    The reference is built in arm joint space, so every sample is reachable with the current grasp: a quintic from
+    the arm's current joints and velocity to the start of the lead-in, plus a random detour that vanishes (with its
+    first two derivatives) at both ends, then the straight lead-in through the goal at v_g in the goal orientation
+    (solved by IK sample by sample) and the follow-through. Pairs are (level 0, level 1), lerped by the curriculum.
+    """
+    bump_rad: Tuple[float, float] = (0.15, 0.4)  # std (rad) of the random joint-space detour, per joint
+    qd_frac: float = 0.6  # approach duration from this fraction of joint_v_max (headroom for feedback)
+    t_min: float = 0.6  # s, shortest approach
+    t_jitter: Tuple[float, float] = (1.0, 1.5)  # random stretch of the approach duration
+    min_clearance: float = 0.04  # m: every sample keeps the head this far above the table
+    check_every: int = 5  # collision-check every Nth sample (FK is done on all of them)
+    tries: int = 5  # detour draws per goal before trying without one
+    # Observation: the reference now and at these future offsets (steps); joint_obs adds q_ref - q and qdot_ref.
+    preview: Tuple[int, ...] = (5, 10, 20)
+    joint_obs: bool = True
+    # Per-step tracking reward (replaces the keypoint progress term): w_pos exp(-d_ref / sigma_pos) +
+    # w_vel exp(-|v - v_ref| / (sigma_vel_frac max(|v_g|, speed_min))), d_ref the keypoint distance to the reference.
+    w_pos: float = 1.0
+    w_vel: float = 1.0
+    sigma_pos: float = 0.05
+    sigma_vel_frac: float = 0.5
+    lost_dist: float = 0.15  # m: d_ref beyond this ends the episode as a failure ("lost"); 0 disables
 
 
 @dataclass
@@ -114,11 +163,63 @@ class EnvCfg:
     goal: GoalCfg = field(default_factory=GoalCfg)
     reward: RewardCfg = field(default_factory=RewardCfg)
     curriculum: CurriculumCfg = field(default_factory=CurriculumCfg)
+    # "points": each episode is one strike goal (reach p_g in the goal orientation moving at v_g). "trajectory": the
+    # same goal and success rule, plus a time-indexed reference into it that the policy observes and is rewarded for
+    # tracking (TrajCfg). Weld grip, pose + velocity goals only.
+    goal_mode: str = "points"
+    traj: TrajCfg = field(default_factory=TrajCfg)
+    # "weld": the tool is welded to the palm at a sampled grasp, the fingers are frozen and only the arm is
+    # controlled (Stage A: learn the strike). "physical": the tool must be grasped and held by the hand.
+    grip_mode: str = "weld"
+    # "head_twist": arm actions are the tool head's linear + angular velocity, mapped to joints by damped
+    # least squares. "joint": arm actions are changes to the joint-position targets. "joint_vel": arm actions are
+    # joint velocities (a * joint_v_max), the servo targets set to q + lead * dq (the velocity servo head_twist uses,
+    # without the IK).
+    action_mode: str = "head_twist"
+    # joint_vel: rad/s per arm joint at action 1. About the oracle's 99.5th percentile per joint, capped at
+    # max_joint_speed (head_twist clips there too).
+    joint_v_max: Tuple[float, ...] = (2.0, 2.0, 2.5, 3.0, 3.0, 3.0)
+    # joint_vel only (older joint / head_twist observations stay unchanged): add the goal errors mapped into joint space by the damped pseudo-inverse of the head
+    # Jacobian (PoseVelocityEnv._kin_features), so the policy doesn't have to learn the IK itself.
+    kin_obs: bool = True
+    # False: pose-only baseline. Goals are sampled as usual but their velocity is neither observed nor scored.
+    # Kept in EnvCfg (not RewardCfg) so it travels with checkpoints through train.py --init-from.
+    goal_velocity: bool = True
+    # Pose-only success rule. "hold" (SimToolReal): success after success_steps steps within the keypoint tolerance
+    # (not necessarily consecutive), the bonus paid per near step. "touch": the first near step succeeds and ends the
+    # episode, as in the pose + velocity setup (passing through the pose is allowed).
+    pose_success: str = "hold"
+    success_steps: int = 10
+    # Ablations of the goal velocity (goal_velocity True only; both True is the full method). velocity_obs False:
+    # the actor sees the pose-only observation (v_g goes to the critic instead). velocity_reward False: the attempt
+    # bonus is flat, not scaled by the velocity match q_v. The attempt and success rules are unchanged either way.
+    velocity_obs: bool = True
+    velocity_reward: bool = True
+    # Pose-only "touch" only: replace each goal with timed pose sub-goals along its strike line, the lead-in point
+    # (untimed approach) and then pose_chain more, evenly spaced, the last at p_g. Each timed one is due after
+    # spacing / |v_g| seconds; the time input shows that sub-goal's clock, and a sub-goal more than
+    # pose_chain_slack x late ends the episode. 0: off.
+    pose_chain: int = 0
+    pose_chain_slack: float = 2.0
+    head_v_max: float = 0.8  # m/s at action 1
+    head_w_max: float = 2.5  # rad/s at action 1
+    ik_damping: float = 0.05
+    max_joint_speed: float = 3.0  # rad/s, per arm joint, head_twist only
+    # head_twist only: end the episode as a failure (like a table push) when the arm can't follow the commanded head
+    # twist: the shortfall after the damped least squares, joint speed and joint limit clipping, in action units
+    # (linear over head_v_max, angular over head_w_max), exceeds this. 0 disables.
+    ik_fail_tol: float = 0.5
     frame_skip: int = 10  # 0.002 s * 10 = 50 Hz control
-    max_steps: int = 500  # 10 s episodes
-    arm_action_scale: float = 0.03  # rad per control step
+    max_steps: int = 250  # 5 s per goal
+    regrip_every: int = 8  # weld: new tool and grasp after this many goals
+    regrip_rehome: bool = True  # weld: a regrip also returns the arm to home (limits drift into awkward postures)
+    grasp_slide: float = 0.7  # weld: grasp point offset along the handle, as a fraction of its half length (0.7 reaches
+    # grips near the end of the handle, as people hold hammers)
+    arm_action_scale: float = 0.03  # rad per control step, joint mode
     hand_action_scale: float = 0.08
-    action_ema: float = 0.0  # 0 disables action smoothing
+    # 0 disables action smoothing; prev_action in the obs is the smoothed action. Smoothing also filters the
+    # exploration noise, which otherwise swamps the velocity tolerance (see init_log_std).
+    action_ema: float = 0.8
     home_noise: float = 0.05
     spawn_radial: Tuple[float, float] = (0.45, 0.65)
     spawn_lateral: Tuple[float, float] = (-0.2, 0.2)
@@ -134,28 +235,327 @@ class EnvCfg:
 
 
 @dataclass
+class TaskCfg:
+    """Task evaluation (tasks.py, evaluate_tasks.py): hammer a plate, hammer a nail, sweep dirt off a board, slice a
+    loaf or a cherry tomato."""
+    # "in_dist": fixtures sit where training goals do (strikes no steeper than GoalCfg.min_dir_z, the sweep board
+    # raised into the goal height range). "realistic": plate and nail flat on the table struck from above, the brush
+    # sweeps the tabletop itself; out of distribution for the trained policies.
+    layout: str = "in_dist"
+    rehome_each_episode: bool = True  # every task starts at home with a new grasp (EnvCfg.regrip_rehome)
+    max_time: float = 20.0  # s per task episode
+    # --- hammer tasks (plate, nail)
+    # Hammer grip (HammerTask.grasp): hand this far from the handle's end, head beyond the index finger, face pointing
+    # the way the knuckles do; jittered by these amounts.
+    grasp_from_end: float = 0.06
+    grasp_slide_jitter: float = 0.01
+    grasp_roll_jitter_deg: float = 8.0
+    strike_speed: Tuple[float, float] = (0.3, 0.6)  # m/s at impact; target forces are drawn from what this range gives
+    # Windup: raise the hammer back along an arc, as if pivoting at the wrist/elbow windup_radius behind the head, then
+    # swing down the arc into the target, the head axis tangent to it. The largest of windup_angles that is reachable
+    # (well-conditioned and collision-free all along the arc) is used. Off: a straight run-up along the strike line.
+    windup: bool = True
+    windup_radius: float = 0.35
+    windup_angles: Tuple[float, ...] = (80.0, 65.0, 50.0, 35.0, 20.0)  # deg of backswing, tried in order
+    windup_raise_speed: float = 0.4  # m/s peak head speed while raising the hammer to the top of the windup
+    windup_joint_speed: float = 1.0  # rad/s peak joint speed of the raise (a joint-space move)
+    windup_pause: float = 0.15  # s at the top
+    # m of straight run-in at the end of the swing: the arc ends this far back from the hit (tangent to the strike
+    # line) and the head goes straight in, orientation held, through the contact and follow-through. The policy hits
+    # without the arc's rotation (~speed / windup_radius at impact); with this, the reference follower does too, so
+    # the speed -> force calibration matches a policy's strike. 0: the hit is on the arc.
+    swing_straight: float = 0.08
+    # m the hammer's striking face bulges at its center (a crowned face, like a real hammer's); 0: flat. A flat face
+    # on the rigid plate lands on its rim at the policy's ~1-2 deg of tilt, which cuts the peak force by up to ~20%.
+    face_crown: float = 0.002
+    swing_accel_frac: float = 0.6  # fraction of the swing arc spent accelerating; the rest is at the impact speed
+    accel_time: float = 0.3  # windup off: s to ramp from rest at the pre-lead point up to the impact speed
+    # s after first contact over which the peak force is taken: only the impact. The hammer is coupled to the hand
+    # through the weld's ~10 ms softness, so in the first few ms the force comes from the hammer's own momentum;
+    # longer windows mostly measure how hard the arm keeps pushing afterwards (which policies were never trained on).
+    impact_window: float = 0.006
+    calib_speeds: int = 5  # strike rollouts per episode used to map impact speed -> peak force
+    calib_refine: int = 2  # extra rollouts that correct the speed towards the target force
+    force_tol: float = 0.15  # success: |F - F*| < force_tol * F*
+    fixture_solref: Tuple[float, float] = (0.004, 1.0)  # contact softness of plate, nail head and board
+    plate_half_size: Tuple[float, float, float] = (0.08, 0.08, 0.006)
+    nail_protrude: float = 0.03  # nail length above the block before the hit
+    nail_travel: float = 0.03
+    nail_hold: float = 80.0  # N, frictionloss resisting the nail (it is held by friction, like a real nail)
+    nail_damping: float = 0.0  # N s/m; viscous resistance would make the force keep rising while the arm pushes
+    nail_mass: float = 0.03
+    nail_head_radius: float = 0.008
+    nail_tol: float = 0.012  # m: the face center must be within this of the nail axis at first contact
+    # in_dist layout: head-center height above the table at contact, in the lower part of GoalCfg.height so the top of
+    # the windup (up to ~0.2 m higher) stays reachable and inside it too. The nail stands vertical and is struck
+    # straight down, which is steeper than training velocities (GoalCfg.min_dir_z) in either layout.
+    nail_height: Tuple[float, float] = (0.15, 0.28)
+    # --- sweep task
+    pad_stiffness: float = 1200.0  # N/m bristle spring
+    pad_damping: float = 6.0
+    pad_travel: float = 0.02  # must stay below the bristle length (2 * pad_half_thick), or the head hits the board
+    pad_half_thick: float = 0.012
+    pad_friction: float = 0.3  # bristles on the board (the board uses the same, MuJoCo takes the larger of the two)
+    board_height: float = 0.12  # m above the table (in_dist); realistic sweeps the table itself
+    dirt_size: Tuple[float, float] = (0.30, 0.22)  # dirty region: along the strokes, across them
+    dirt_cell: float = 0.02
+    dirt_forces: Tuple[float, ...] = (3.0, 14.0, 18.0)  # N needed to remove dirt of level 1, 2, 3 (its adhesion)
+    # How dirt comes off. "scrub" (Preston's wear law with an adhesion threshold): a cell under the pad accumulates
+    # pad force x sliding speed x dt while the force is at least its dirt_forces value, and is removed once that
+    # reaches scrub_len x dirt_forces. So the pad has to slide across the cell (pressing in place removes nothing),
+    # removal depends on the distance slid, not the speed, and pressing harder scrubs faster. "force": removed as soon
+    # as the pad presses on the cell with its dirt_forces value, even standing still (the original rule).
+    sweep_rule: str = "scrub"
+    # m: sliding distance needed at exactly the adhesion force (less when pressing harder). The pad is 7 cm long
+    # along the stroke, so one pass of the trace (pressing force_margin above the adhesion) scrubs a cell about twice
+    # over.
+    scrub_len: float = 0.04
+    dirt_blobs: Tuple[int, int] = (3, 6)
+    force_margin: float = 0.15  # the trace presses this fraction above the required force
+    sweep_speed: float = 0.35  # m/s along a stroke (>= GoalCfg.speed_min so keypoints are in distribution)
+    stroke_overlap: float = 0.25  # fraction of the brush width that consecutive strokes overlap
+    run_up: float = 0.12  # stroke length before the dirt (= GoalCfg.lead_in, the model's own run-up)
+    overrun: float = 0.05
+    hover: float = 0.04  # lift between strokes
+    waypoint_spacing: float = 0.04  # model keypoints along a stroke
+    min_arm_margin: float = 0.08  # smallest head-Jacobian singular value allowed along the sweep (avoids singularities)
+    # --- slice task: saw a loaf in half with a knife
+    # Loaf (m): length across the cut (along the cut-plane normal), width along the cut (the sawing axis), height.
+    # It is split into two halves on the marked line in its middle, each hinged to the cutting board at its outer
+    # bottom edge, so a finished cut lets them fall open.
+    loaf_size: Tuple[float, float, float] = (0.12, 0.06, 0.05)
+    # Cutting board under the loaf (half sizes: across the cut, along it, thickness). Only a little longer than the
+    # loaf along the cut, so the hand, which hangs below the handle beyond the heel, stays clear of it.
+    board_half_size: Tuple[float, float, float] = (0.10, 0.042, 0.01)
+    # in_dist: height of the board top above the table, so the blade center stays in GoalCfg.height during the cut.
+    slice_height: Tuple[float, float] = (0.12, 0.2)
+    # Knife: blade half length (along the handle), blade height, half thickness, handle length. The handle runs along
+    # the blade's spine, so the edge is the full blade height below the handle axis.
+    blade_half_len: float = 0.10
+    blade_height: float = 0.04
+    blade_half_thick: float = 0.001
+    knife_handle_len: float = 0.12
+    knife_grasp_from_end: float = 0.05  # grip center this far from the handle's back end
+    heel_clear: float = 0.03  # the heel stays this far outside the loaf while the blade is in it (hand clearance)
+    # Trace: sawing strokes along the blade, descending all the while; the tangential speed is saw_ratio times the
+    # descent speed throughout each stroke (a slicing cut).
+    saw_speed: Tuple[float, float] = (0.32, 0.4)  # m/s along the blade (>= GoalCfg.speed_min for the keypoints)
+    saw_ratio: float = 3.0
+    saw_stroke_accel: float = 0.02  # m of each stroke spent speeding up (and slowing down) at the ends
+    saw_entry: float = 0.01  # m above the loaf top where the first stroke starts
+    slice_waypoint_spacing: float = 0.02  # model keypoints along the constant-speed part of each stroke
+    # Cutting rules, applied along the edge every physics substep. The edge cuts where it moves into the loaf while
+    # slicing: tangential speed >= cut_speed_min and >= slice_ratio_min x its speed into the material.
+    cut_speed_min: float = 0.12
+    slice_ratio_min: float = 1.5
+    kerf_cell: float = 0.0025  # m, width of a kerf column (along the cut)
+    crush_depth: float = 0.006  # m pressed into uncut loaf without slicing -> the loaf is crushed
+    bind_depth: float = 0.003  # m: the blade counts as inside the loaf (for binding) below this depth
+    bind_deg: float = 15.0  # blade face twisted/tilted this far from the cut plane inside the loaf -> jammed
+    bind_slack: float = 0.01  # m of sideways motion of the blade inside the kerf -> jammed
+    line_tol: float = 0.02  # m: cutting farther than this from the marked line is off the line
+    through_tol: float = 0.003  # m: a kerf column is through when cut to within this of the loaf bottom
+    board_solref: Tuple[float, float] = (0.02, 1.0)  # cutting board contact softness (wood)
+    slice_end_delay: float = 0.6  # s the episode runs on after a success or a failure, so the consequence shows
+    # --- slice_tomato: a cherry tomato on the same board, cut with the same knife. Cutting is set by the pressing
+    # force: the tomato is a spring (tomato_stiffness) under the edge, so the force is how far the edge presses below
+    # the uncut surface. While the knife slides (cut_speed_min) with at least tomato_cut_force, the cut deepens with
+    # the distance slid, the faster the harder it presses (tomato_cut_rate per m slid at tomato_press_force, 0 at
+    # tomato_cut_force); with less, nothing is cut (the skin only dents); at tomato_crush_force the tomato bursts,
+    # whatever the knife is doing. The force settles where the cut keeps pace with the descent, so descending too
+    # steeply for the sliding (or not sliding) crushes it, and too shallow a finish never cuts through.
+    tomato_radius: float = 0.0125
+    tomato_stiffness: float = 500.0  # N/m
+    tomato_cut_force: float = 1.0  # N
+    tomato_crush_force: float = 4.0  # N
+    tomato_press_force: float = 2.5  # N the trace presses with (the middle of the window: 2 mm to 8 mm deep)
+    tomato_cut_rate: float = 0.15  # m of cut depth per m slid along the edge, at tomato_press_force
+    tomato_press_speed: float = 0.04  # m/s the trace's edge descends at most (pressing in at the start)
+    # The tomato is small and soft, so where the cut goes matters much less than with the loaf: anywhere through the
+    # middle two thirds splits it, and its flesh doesn't bind a blade that drifts or twists a little.
+    tomato_line_tol: float = 0.008
+    tomato_bind_deg: float = 30.0
+    tomato_bind_slack: float = 0.02
+    # --- flick: toss an egg off a spatula into a bowl
+    # Spatula: round handle, thin flat blade in line with it (half sizes: along the handle, across it, thickness).
+    spatula_handle_len: float = 0.22
+    spatula_blade_half: Tuple[float, float, float] = (0.055, 0.04, 0.002)
+    spatula_grasp_from_end: float = 0.05
+    spatula_friction: float = 0.1
+    # Cradle on the blade's top face: a horseshoe of capsules (a ring with the cradle_open_deg towards the tip left
+    # out), cradle_offset towards the tip from the blade center. Its radius lets the egg rest on the blade with the
+    # capsules as stops behind and beside it (cradle_clearance beyond touching them); the egg leaves over the open front.
+    cradle_offset: float = 0.04
+    cradle_tube: float = 0.003
+    cradle_segments: int = 8
+    cradle_open_deg: float = 200.0  # only the three capsules behind the egg remain (sideways loads are small)
+    cradle_clearance: float = 0.001
+    # The egg: a free sphere. condim 6 (rolling friction) so it stops rolling in the bowl.
+    egg_radius: float = 0.02
+    egg_mass: float = 0.05
+    # Slick on the spatula (the pair's friction is the larger of the two geoms', and the spatula's is spatula_friction),
+    # so the egg slides off at the release rather than rolling (a rolling ball would lose 2/7 of the blade's
+    # deceleration); the bowl's own friction (1) and the rolling friction stop it in the bowl.
+    egg_friction: Tuple[float, float, float] = (0.1, 0.005, 0.0005)
+    egg_solref: Tuple[float, float] = (0.005, 1.0)
+    flick_start_pitch_deg: float = 3.0  # the start pose's tip is this far above flat (against the arm's sag)
+    egg_settle: float = 0.5  # s the egg settles in the cradle (spatula flat, arm held) before the trace starts
+    # Bowl on the table: inner radius, wall height, wall half thickness, floor thickness, number of wall segments.
+    bowl_radius: float = 0.07
+    bowl_height: float = 0.045
+    bowl_wall: float = 0.004
+    bowl_floor: float = 0.012  # thickness
+    bowl_segments: int = 16
+    bowl_region: Tuple[Tuple[float, float], Tuple[float, float]] = ((0.5, 0.72), (-0.22, 0.22))  # table (u, w)
+    # Throw: the spatula launches from rest along its blade (towards the tip and the bowl) at flick_speed
+    # (<= CurriculumCfg.speed_max so the keypoints are training-like), released with the head at flick_release_height
+    # above the table (in GoalCfg.height). While launching it pitches tip-up by flick_pitch_deg (a wrist flick;
+    # min-jerk, back to zero angular speed at the release, peak <= flick_w_max), and the launch runs along the blade's
+    # direction at the release, so the egg leaves the tip at about that elevation.
+    flick_speed: Tuple[float, float] = (0.45, 0.55)
+    flick_release_height: Tuple[float, float] = (0.22, 0.34)
+    flick_pitch_deg: Tuple[float, float] = (6.0, 12.0)
+    flick_w_max: float = 2.0
+    flick_accel_len: float = 0.06  # m spent accelerating
+    # m at constant speed before the release. The launch's keypoints start GoalCfg.lead_in from the start pose (the
+    # policy runs up to a goal over lead_in, so an earlier one would have it back up first and drop the egg); this
+    # leaves ~accel_len + const_len - lead_in of keypoints before the release.
+    flick_const_len: float = 0.16
+    # Release: in flick_drop_steps control steps the spatula's velocity goes from the launch velocity to
+    # flick_back_speed back along the handle plus flick_drop_speed back along its own normal. The egg keeps going: it
+    # rolls forward out of the cradle's open front and off the tip at about the launch velocity (the drop unloads the
+    # blade, so little of that is lost to the rolling). The spatula keeps that velocity for flick_retract_time, then
+    # stops over flick_stop_time.
+    flick_drop_speed: float = 0.3
+    flick_back_speed: float = 0.5
+    flick_drop_steps: int = 3
+    flick_retract_time: float = 0.08
+    flick_stop_time: float = 0.25
+    flick_unpitch_time: float = 0.5  # s back to flat after the stop
+    # Control steps between keypoints (on every sample at or above GoalCfg.speed_min). 1 would put them a step's travel
+    # apart: a lagging head then crosses two goal planes in one step, and TaskEnv only checks the current one.
+    flick_kp_every: int = 2
+    flick_heading_deg: float = 30.0  # throw heading within this of the direction from the robot base to the bowl
+    # Calibration: follower rollouts; the path is shifted by the landing error until within flick_aim_tol.
+    flick_calib_iters: int = 4
+    flick_aim_tol: float = 0.015
+    egg_release_time: float = 0.02  # s out of contact with the spatula -> released (its velocity: at the last contact)
+    egg_rest_speed: float = 0.05  # m/s: the egg counts as at rest below this
+    egg_rest_time: float = 0.2  # s at rest inside the bowl -> success
+    flick_timeout: float = 2.0  # s after the throw (or the last keypoint) before the episode ends undecided
+    # --- reference trace follower (traces.TraceFollower)
+    k_pos: float = 8.0
+    k_rot: float = 6.0
+
+
+@dataclass
 class PPOCfg:
-    num_envs: int = 16
-    rollout_steps: int = 64
+    num_envs: int = 32
+    rollout_steps: int = 256
     total_steps: int = 200_000_000
     epochs: int = 5
     minibatches: int = 4
     lr: float = 3e-4
+    lr_final: float = 3e-5  # linear anneal from lr to lr_final over the run (when adaptive_lr is off)
     gamma: float = 0.99
     lam: float = 0.95
     clip: float = 0.2
     value_clip: float = 0.2
-    vf_coef: float = 1.0
     ent_coef: float = 0.0
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 1.0  # applied to the actor and the critic separately (they have separate optimizers)
+    # Optional KL-adaptive lr, once per update: /1.5 if the update was stopped early or ended above 2 x target,
+    # x1.5 if it ended below 0.5 x target. Floor 1e-5.
+    adaptive_lr: bool = False
     kl_target: float = 0.016
-    # lr is adapted once per update from the KL the whole update produced: /1.5 if the update was stopped early
-    # or ended above 2 x target, x1.5 if it ended below 0.5 x target.
-    adaptive_lr: bool = True
-    # Stop the update's remaining minibatch steps once KL to the rollout policy exceeds this multiple of kl_target.
-    kl_stop_mult: float = 1.5
+    # Safety stop: skip the update's remaining minibatch steps once KL to the rollout policy exceeds this.
+    kl_stop: float = 0.05
     actor_hidden: Tuple[int, ...] = (512, 256, 128)
     critic_hidden: Tuple[int, ...] = (512, 512, 256)
-    init_log_std: float = -0.7
+    # exp(-2) = 0.135. With head_twist actions (0.8 m/s at action 1) and action_ema 0.8 this is ~0.05 m/s of
+    # velocity noise per axis; at -1.0 it was ~0.15 m/s, which kept even a perfect policy under 5% success.
+    init_log_std: float = -2.0
+    # joint_vel actions (EnvCfg.joint_v_max at action 1): the same ~0.019 m/s of one-step head-velocity noise as
+    # head_twist at -2.0 (-2.0 here is 1.7x that, and the noisy oracle falls from ~90% to ~45%).
+    init_log_std_joint_vel: float = -2.4
     scale_rewards: bool = True
     save_every: int = 50  # iterations
+
+
+# ---------------------------------------------------------------------- goal-velocity ablation flags
+# Shared by bc.py, train.py and evaluate.py, so every entry point applies them the same way.
+def add_goal_ablation_args(p, pose_only: bool = True) -> None:
+    if pose_only:
+        p.add_argument("--pose-only", default=None, choices=["hold", "touch"],
+                       help="pose-only baseline (no goal velocity) with this success rule: 'hold' = SimToolReal's "
+                            "success_steps steps within tolerance, 'touch' = the first step within tolerance")
+    p.add_argument("--no-vel-obs", action="store_true",
+                   help="ablation: keep the velocity goal and reward but give the actor the pose-only observation "
+                        "(EnvCfg.velocity_obs False)")
+    p.add_argument("--no-vel-reward", action="store_true",
+                   help="ablation: flat attempt bonus, not scaled by the velocity match (EnvCfg.velocity_reward False)")
+    p.add_argument("--pose-chain", type=int, default=None, metavar="N",
+                   help="pose-only touch: timed pose sub-goals along the strike line, the lead-in point and then N "
+                        "more (EnvCfg.pose_chain)")
+    p.add_argument("--vel-cone", type=float, nargs=2, default=None, metavar=("LEVEL0", "LEVEL1"),
+                   help="max angle (deg) between the goal velocity and the head axis, at curriculum level 0 and 1 "
+                        "(CurriculumCfg.vel_cone_deg)")
+    p.add_argument("--goal-mode", default=None, choices=GOAL_MODES,
+                   help="'points': one strike goal per episode; 'trajectory': the same goal plus a smooth random "
+                        "reference into it, observed and tracked (EnvCfg.goal_mode, TrajCfg)")
+
+
+GOAL_MODES = ("points", "trajectory")
+
+
+def check_goal_mode(cfg: "EnvCfg") -> None:
+    """ValueError if goal_mode is unknown or "trajectory" is combined with settings it doesn't support."""
+    mode = getattr(cfg, "goal_mode", "points")
+    if mode not in GOAL_MODES:
+        raise ValueError(f"goal_mode must be one of {GOAL_MODES}, got {mode!r}")
+    if mode == "trajectory":
+        if cfg.grip_mode != "weld":
+            raise ValueError("goal_mode 'trajectory' needs grip_mode 'weld' (the reference is built from arm joints)")
+        if not cfg.goal_velocity or not getattr(cfg, "velocity_obs", True) or getattr(cfg, "pose_chain", 0):
+            raise ValueError("goal_mode 'trajectory' needs the pose + velocity goal (no --pose-only, --no-vel-obs or "
+                             "--pose-chain)")
+        if cfg.action_mode == "joint":
+            raise ValueError("goal_mode 'trajectory' supports action_mode 'joint_vel' and 'head_twist', not 'joint'")
+
+
+def apply_goal_ablation_args(cfg: "EnvCfg", args) -> "EnvCfg":
+    if getattr(args, "goal_mode", None) is not None:
+        cfg.goal_mode = args.goal_mode
+        if not hasattr(cfg, "traj"):  # a checkpoint from before goal_mode
+            cfg.traj = TrajCfg()
+    if getattr(args, "pose_only", None) is not None:
+        cfg.goal_velocity, cfg.pose_success = False, args.pose_only
+    if args.no_vel_obs:
+        cfg.velocity_obs = False
+    if args.no_vel_reward:
+        cfg.velocity_reward = False
+    if args.pose_chain is not None:
+        cfg.pose_chain = args.pose_chain
+    if args.vel_cone is not None:
+        cfg.curriculum.vel_cone_deg = tuple(args.vel_cone)
+    if (not cfg.goal_velocity) and (not cfg.velocity_obs or not cfg.velocity_reward):
+        raise SystemExit("--no-vel-obs / --no-vel-reward ablate the pose + velocity goal; drop --pose-only")
+    return cfg
+
+
+def goal_obs_key(cfg: "EnvCfg") -> tuple:
+    """The settings that decide the actor observation layout (and meaning) of the goal."""
+    key = (cfg.goal_velocity, getattr(cfg, "velocity_obs", True), cfg.pose_success if not cfg.goal_velocity else None,
+           getattr(cfg, "pose_chain", 0))
+    if getattr(cfg, "goal_mode", "points") == "trajectory":
+        key += ("trajectory", tuple(cfg.traj.preview), cfg.traj.joint_obs)
+    return key
+
+
+def describe_goal(cfg: "EnvCfg") -> str:
+    if not cfg.goal_velocity:
+        chain = getattr(cfg, "pose_chain", 0)
+        return f"pose-only ({cfg.pose_success}{f', chain {chain}' if chain else ''})"
+    parts = [] if getattr(cfg, "velocity_obs", True) else ["no vel obs"]
+    parts += [] if getattr(cfg, "velocity_reward", True) else ["no vel reward"]
+    traj = " trajectory" if getattr(cfg, "goal_mode", "points") == "trajectory" else ""
+    return "pose+velocity" + traj + (f" ({', '.join(parts)})" if parts else "")

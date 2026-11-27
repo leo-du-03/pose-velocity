@@ -1,0 +1,261 @@
+"""Behavior-clone the scripted oracle (oracle.py) into the PPO actor, as a starting point for PPO fine-tuning.
+
+Uses DAgger rather than plain behavior cloning. Each round rolls out a mixture: on each step, every training env
+executes the oracle's action with probability beta (beta_decay ** round, so round 0 is pure oracle) and the learner's
+otherwise, plus Gaussian noise at PPO's exploration std. Every visited state is labelled with the oracle's action and
+added to an aggregated dataset, and the actor is regressed onto it. Plain cloning only sees the oracle's own states,
+so the learner's small errors take it to states it never saw labels for; DAgger labels the states the learner
+actually visits.
+
+The oracle is stateful (approach the lead-in point, then strike) and reads privileged env state, so each env worker
+runs its own oracle (PoseVelocityEnv.oracle_action). Weld grip only.
+
+--action-mode joint clones the same oracle into a policy that outputs arm joint-target changes: the env converts
+each head-twist label to the joint action that sets the servo targets head_twist mode would
+(PoseVelocityEnv.joint_action_for_twist). The setting travels with the checkpoint, like --pose-only.
+
+--action-mode joint_vel clones it into a policy that outputs arm joint velocities (EnvCfg.joint_v_max at action 1):
+the labels are the oracle's head twists mapped through the damped pseudo-inverse of the head Jacobian
+(PoseVelocityEnv.joint_vel_action_for_twist), with no EMA inversion, so they are smooth in the state. Its observation
+adds the goal errors mapped into joint space the same way (EnvCfg.kin_obs; --no-kin-obs leaves them out).
+
+--pose-only {hold,touch} clones the pose-only baseline instead (EnvCfg.goal_velocity False, oracle.PoseOracle); the
+setting is saved in the checkpoint's env_cfg, so train.py --init-from fine-tunes the same task.
+
+The envs are spread evenly over --levels: the curriculum tolerances are part of the observation, so the cloned
+policy has to have seen the levels PPO will run at.
+
+The checkpoint works with evaluate.py (--ckpt) and train.py (--init-from):
+  python bc.py --name bc
+  python evaluate.py --ckpt runs/bc/bc_latest.pt --episodes 100
+  python train.py --init-from runs/bc/bc_latest.pt --name strike_bc --lr 1e-4
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import os
+import time
+from collections import deque
+
+import numpy as np
+
+from config import EnvCfg, PPOCfg, add_goal_ablation_args, apply_goal_ablation_args, describe_goal
+from env import make_env
+from train import CKPT_FORMAT, resolve_device
+from vec_env import SerialVecEnv, SubprocVecEnv
+
+# torch / ppo are imported inside main(), as in train.py: env workers re-import this module under "spawn".
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--num-envs", type=int, default=PPOCfg.num_envs)
+    p.add_argument("--eval-envs", type=int, default=4,
+                   help="envs driven by the deterministic learner alone (no oracle, no noise); their success is "
+                        "reported as 'eval succ'. Their states are still labelled and trained on")
+    p.add_argument("--rollout-steps", type=int, default=256, help="steps per env per DAgger round")
+    p.add_argument("--rounds", type=int, default=120, help="DAgger rounds")
+    p.add_argument("--beta-decay", type=float, default=0.8,
+                   help="probability of executing the oracle's action in round i is beta_decay ** i")
+    p.add_argument("--noise-std", type=float, default=None,
+                   help="std of the Gaussian noise added to executed actions in the training envs "
+                        "(default: exp(PPOCfg.init_log_std), PPO's exploration noise)")
+    p.add_argument("--grad-steps", type=int, default=500, help="actor gradient steps per round")
+    p.add_argument("--batch-size", type=int, default=4096)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-final", type=float, default=1e-4, help="lr is annealed linearly to this over the rounds")
+    p.add_argument("--buffer-size", type=int, default=2_000_000,
+                   help="aggregated dataset size; the oldest samples are dropped beyond this")
+    p.add_argument("--recent-rounds", type=int, default=10,
+                   help="the newest this-many rounds of data form the 'recent' pool (see --recent-frac)")
+    p.add_argument("--recent-frac", type=float, default=0.5,
+                   help="fraction of each batch drawn from the recent pool, the rest from the whole dataset. Early "
+                        "data is mostly the oracle's own (easy) states and otherwise dominates the loss")
+    p.add_argument("--levels", type=float, nargs=2, metavar=("LO", "HI"), default=(0.0, 1.0),
+                   help="curriculum levels the envs are spread over")
+    add_goal_ablation_args(p)
+    p.add_argument("--eps-v-frac", type=float, nargs=2, metavar=("LEVEL0", "LEVEL1"), default=None,
+                   help="success velocity tolerance (fraction of goal speed) at curriculum level 0 and 1")
+    p.add_argument("--sigma-v-frac", type=float, default=None,
+                   help="velocity scale (fraction of the goal speed) of the attempt bonus")
+    p.add_argument("--action-mode", default=None, choices=["head_twist", "joint", "joint_vel"],
+                   help="override EnvCfg.action_mode; joint labels are converted from the oracle's head twists")
+    p.add_argument("--arm-action-scale", type=float, default=None,
+                   help="override EnvCfg.arm_action_scale (rad per step at action 1, joint mode)")
+    p.add_argument("--joint-v-max", type=float, nargs=6, default=None, metavar="V",
+                   help="override EnvCfg.joint_v_max (rad/s per arm joint at action 1, joint_vel mode)")
+    p.add_argument("--no-kin-obs", action="store_true",
+                   help="joint_vel: leave the Jacobian-projected goal errors out of the observation (EnvCfg.kin_obs)")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--serial", action="store_true", help="run envs in the main process (debugging)")
+    p.add_argument("--logdir", default="runs")
+    p.add_argument("--name", default=None)
+    return p.parse_args()
+
+
+def main():
+    import torch
+    import torch.nn as nn
+
+    from ppo import ActorCritic
+
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
+    device = resolve_device(args.device)
+    if device.type == "cpu":
+        torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
+
+    env_cfg, ppo_cfg = EnvCfg(), PPOCfg(num_envs=args.num_envs)
+    apply_goal_ablation_args(env_cfg, args)
+    if args.eps_v_frac is not None:
+        env_cfg.curriculum.eps_v_frac = tuple(args.eps_v_frac)
+    if args.sigma_v_frac is not None:
+        env_cfg.reward.sigma_v_frac = args.sigma_v_frac
+    if args.action_mode is not None:
+        env_cfg.action_mode = args.action_mode
+    if args.arm_action_scale is not None:
+        env_cfg.arm_action_scale = args.arm_action_scale
+    if args.joint_v_max is not None:
+        env_cfg.joint_v_max = tuple(args.joint_v_max)
+    if args.no_kin_obs:
+        env_cfg.kin_obs = False
+    if env_cfg.grip_mode != "weld":
+        raise SystemExit("the oracle needs grip_mode 'weld'")
+    K, N, T = args.eval_envs, args.num_envs, args.rollout_steps
+    if not 0 <= K < N:
+        raise SystemExit(f"--eval-envs must be in [0, num_envs), got {K}")
+    n_train = N - K
+    if env_cfg.action_mode == "joint_vel":
+        ppo_cfg.init_log_std = ppo_cfg.init_log_std_joint_vel  # saved as the actor's log_std
+    noise_std = args.noise_std if args.noise_std is not None else float(np.exp(ppo_cfg.init_log_std))
+
+    run_name = args.name or time.strftime("bc_%Y%m%d_%H%M%S")
+    run_dir = os.path.join(args.logdir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+
+        writer = SummaryWriter(run_dir)
+        writer.add_text("args", "  \n".join(f"{k}: {v}" for k, v in vars(args).items()))
+    except Exception:
+        writer = None
+
+    lo, hi = args.levels
+    spread = lambda k: list(np.linspace(lo, hi, k)) if k > 1 else [hi] * k  # noqa: E731
+    levels = spread(n_train) + spread(K)
+    fns = [make_env(dataclasses.replace(env_cfg, curriculum_level=float(lv)), args.seed * 1000 + i)
+           for i, lv in enumerate(levels)]
+    venv = SerialVecEnv(fns) if (args.serial or N == 1) else SubprocVecEnv(fns)
+    obs_dim, act_dim, priv_dim = venv.observation_space.shape[0], venv.action_space.shape[0], venv.priv_dim
+    goal_txt = describe_goal(env_cfg)
+    print(f"goal={goal_txt}  actions={env_cfg.action_mode}  device={device}  num_envs={N} ({K} eval)  levels {lo:.2f}-{hi:.2f}  "
+          f"noise std {noise_std:.3f}  "
+          f"run_dir={run_dir}")
+
+    agent = ActorCritic(obs_dim, priv_dim, act_dim, ppo_cfg).to(device)
+    opt = torch.optim.Adam(agent.actor.parameters(), lr=args.lr)
+    f32 = dict(device=device, dtype=torch.float32)
+
+    cap = args.buffer_size
+    data_obs = np.zeros((cap, obs_dim), np.float32)
+    data_act = np.zeros((cap, act_dim), np.float32)
+    size, ptr = 0, 0
+    ep_stats, eval_stats = deque(maxlen=200), deque(maxlen=100)
+
+    def mse(o: np.ndarray, a: np.ndarray) -> float:
+        if len(o) == 0:
+            return float("nan")
+        with torch.no_grad():
+            pred = agent.actor(agent.obs_rms(torch.as_tensor(o, **f32)))
+            return float(((pred - torch.as_tensor(a, **f32)) ** 2).mean())
+
+    obs_np, priv_np = venv.reset(seeds=[args.seed * 1000 + i for i in range(N)])
+    t_start = time.time()
+    for rnd in range(args.rounds):
+        t_round = time.time()
+        beta = args.beta_decay ** rnd
+        lr = args.lr + (args.lr_final - args.lr) * rnd / max(1, args.rounds - 1)
+        for group in opt.param_groups:
+            group["lr"] = lr
+        r_obs, r_priv, r_act = [], [], []
+        for _ in range(T):
+            expert = np.stack(venv.call("oracle_action"))
+            with torch.no_grad():
+                learner = agent.act_deterministic(torch.as_tensor(obs_np, **f32)).cpu().numpy()
+            use_expert = rng.random(N) < beta
+            use_expert[n_train:] = False
+            act = np.where(use_expert[:, None], expert, learner)
+            act[:n_train] += rng.normal(0.0, noise_std, (n_train, act_dim))
+            r_obs.append(obs_np)
+            r_priv.append(priv_np)
+            r_act.append(expert)
+            obs_np, priv_np, _, _, _, eps = venv.step(np.clip(act, -1.0, 1.0))
+            for i, e in enumerate(eps):
+                if e is not None:
+                    (eval_stats if i >= n_train else ep_stats).append(e)
+
+        new_obs = np.concatenate(r_obs)
+        new_act = np.concatenate(r_act)
+        # Loss on this round's states before training on them: how well the policy matches the oracle where it
+        # actually goes. The training loss is averaged over all the data and hides this. Rows are step-major.
+        is_eval = (np.arange(len(new_obs)) % N) >= n_train
+        loss_new, loss_new_eval = mse(new_obs, new_act), mse(new_obs[is_eval], new_act[is_eval])
+        idx = (ptr + np.arange(len(new_obs))) % cap
+        data_obs[idx], data_act[idx] = new_obs, new_act
+        ptr, size = (ptr + len(new_obs)) % cap, min(cap, size + len(new_obs))
+        # The critic is not trained here (train.py warms it up), but its priv normalizer is fitted.
+        agent.obs_rms.update(torch.as_tensor(new_obs, **f32))
+        agent.priv_rms.update(torch.as_tensor(np.concatenate(r_priv), **f32))
+
+        losses = []
+        n_recent = int(round(args.recent_frac * args.batch_size))
+        pool = min(size, args.recent_rounds * N * T)
+        for _ in range(args.grad_steps):
+            b = np.concatenate([(ptr - 1 - rng.integers(0, pool, n_recent)) % cap,
+                                rng.integers(0, size, args.batch_size - n_recent)])
+            o, a = torch.as_tensor(data_obs[b], **f32), torch.as_tensor(data_act[b], **f32)
+            loss = ((agent.actor(agent.obs_rms(o)) - a) ** 2).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(agent.actor.parameters(), ppo_cfg.max_grad_norm)
+            opt.step()
+            losses.append(float(loss.detach()))
+
+        mean = lambda stats, k: float(np.mean([e[k] for e in stats])) if stats else float("nan")  # noqa: E731
+        side = [e["pass"]["v_side_frac"] for e in eval_stats if e.get("pass")]
+        # Which tolerance the clone misses: errors at the eval envs' attempts.
+        pass_mean = lambda k: float(np.mean([e["pass"][k] for e in eval_stats if e.get("pass")])) if side else float("nan")  # noqa: E731
+        clip_frac = float(np.mean(np.abs(new_act) >= 0.999))
+        log = {"bc/loss": float(np.mean(losses)), "bc/loss_new": loss_new, "bc/loss_new_eval": loss_new_eval,
+               "bc/lr": lr, "bc/beta": beta, "bc/dataset": size,
+               "ep/success": mean(ep_stats, "success"),
+               "eval/success": mean(eval_stats, "success"), "eval/passed": mean(eval_stats, "passed"),
+               "eval/pass/v_side_frac": float(np.mean(side)) if side else float("nan"),
+               "eval/pass/dv_frac": pass_mean("dv_frac"), "eval/pass/theta_deg": pass_mean("theta_deg"),
+               "eval/pass/dp": pass_mean("dp"), "bc/label_clip_frac": clip_frac}
+        if writer is not None:
+            for k, v in log.items():
+                writer.add_scalar(k, v, rnd)
+        print(f"round {rnd:3d} | beta {beta:.3f} | data {size:8d} | loss {log['bc/loss']:.5f} new {loss_new:.5f} | "
+              f"mix succ {log['ep/success']:.3f} | eval succ {log['eval/success']:.3f} "
+              f"pass {log['eval/passed']:.3f} "
+              f"side {log['eval/pass/v_side_frac']:.2f} dv {log['eval/pass/dv_frac']:.2f} "
+              f"th {log['eval/pass/theta_deg']:.1f} dp {100 * log['eval/pass/dp']:.1f}cm (last {len(eval_stats)}) | "
+              f"clip {clip_frac:.3f} | {time.time() - t_round:.0f}s")
+
+        # Same keys train.py and evaluate.py read from a PPO checkpoint (no optimizer: --init-from starts fresh).
+        torch.save({"format": CKPT_FORMAT, "agent": agent.state_dict(), "env_cfg": env_cfg, "ppo_cfg": ppo_cfg,
+                    "obs_dim": obs_dim, "priv_dim": priv_dim, "act_dim": act_dim, "level": hi,
+                    "bc_round": rnd, "bc_args": vars(args)}, os.path.join(run_dir, "bc_latest.pt"))
+
+    venv.close()
+    if writer is not None:
+        writer.close()
+    print(f"saved {os.path.join(run_dir, 'bc_latest.pt')}  done in {time.time() - t_start:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

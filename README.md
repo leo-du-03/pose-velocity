@@ -1,211 +1,268 @@
 # pose-velocity
 
-A UR5e arm with a LEAP hand has to grasp a randomly generated tool. It then moves the tool so that the **head center passes through a goal point, with the head axis aligned to a goal direction, while moving at a goal velocity**.
+A UR5e arm with a LEAP hand holds a randomly generated tool and moves it so that the **head center passes through a
+goal point, in a goal orientation, at a goal velocity**. The velocity need not point out of the head's face, so a goal
+can be a straight strike or a swipe where the tool faces one way and moves another.
 
-- **Simulator:** MuJoCo, running on CPU in subprocess workers.
-- **Policy:** asymmetric PPO in PyTorch, running on CPU or CUDA.
+- **Stage A (default, `grip_mode = "weld"`):** the tool is welded to the palm at a random grasp and the policy controls
+  only the arm.
+- **Stage B (`grip_mode = "physical"`):** the hand must grasp the tool from the table and hold it. This works but is
+  not tuned.
+
+MuJoCo runs on CPU in subprocess workers; the policy is asymmetric PPO in PyTorch (CPU or CUDA). The recommended
+pipeline is: a scripted oracle, then DAgger behavior cloning of it (`bc.py`), then PPO fine-tuning (`train.py
+--init-from`). Trained policies are then evaluated on downstream tasks (hammering, sweeping, slicing, flicking).
 
 ## Install
 
 ```bash
 conda env create -f environment.yml        # creates env "pose-velocity" (Python 3.10)
 conda activate pose-velocity
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # optional: smaller CPU-only torch
 ```
 
-To get a smaller CPU-only PyTorch, run this **before** the step above, or afterwards to replace the default build:
+For a GPU under WSL, install the NVIDIA Windows driver, restart WSL (`wsl --shutdown`), check `nvidia-smi`, then
+install a CUDA build of torch from pytorch.org.
 
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-```
-
-To train on a GPU under WSL:
-1. Install the NVIDIA Windows driver.
-2. Run `wsl --shutdown`, then reopen WSL.
-3. Check that `nvidia-smi` works inside WSL.
-4. Install a CUDA build of torch from pytorch.org.
-
-The robot models come from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie). `robot_descriptions` clones them into `~/.cache/robot_descriptions` on first use, which needs `git` and internet access. If you work offline, clone Menagerie yourself and point to it:
+Robot models come from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie): `robot_descriptions`
+clones them into `~/.cache/robot_descriptions` on first use (needs `git` and internet). Offline, clone Menagerie
+yourself and set:
 
 ```bash
 export POSEVEL_UR5E_XML=/path/to/mujoco_menagerie/universal_robots_ur5e/ur5e.xml
 export POSEVEL_LEAP_XML=/path/to/mujoco_menagerie/leap_hand/right_hand.xml
 ```
 
-## Verify, in this order
+## Quick start
 
-Run every command from the project root.
+Run everything from the project root.
 
-1. **Scene builds; robot is discovered correctly**
-   ```bash
-   python scene.py
-   ```
-   Expected output:
-   - `arm joints (6)`
-   - `hand joints (16)`
-   - 4 fingertips, with the thumb last
-   - `action dim: 22`
-   - an obs dim of about 160
+```bash
+python scene.py              # 6 arm + 16 hand joints, 4 fingertips (thumb last); action dim 6, obs dim ~104 (weld)
+python scene.py --view       # viewer; markers: green = goal point, red = goal velocity, blue = goal head axis,
+                             #   yellow = goal handle direction
+pytest -q tests
+python evaluate.py --policy oracle --episodes 100            # scripted oracle, level 0
+python evaluate.py --policy oracle --episodes 100 --level 1  # tightest tolerances, fastest goals, full swipe cone
+```
 
-   The first run downloads Menagerie and builds the reach map, which takes a few seconds.
+The oracle succeeds on about 75–80% of goals at both levels (100 episodes each, default tolerances). If it falls well
+below that after an env change, the env is broken, not the learner.
 
-2. **Look at the scene**
-   ```bash
-   python scene.py --view
-   ```
-   - Check that the hand is mounted sensibly on the flange.
-   - The tool should be lying on the table in front of the arm.
-   - Goal markers: the **green** sphere is the goal point, the **red** arrow is the goal velocity (its length scales with speed), and the **blue** arrow is the goal head axis.
+**Train** (BC, then PPO fine-tuning):
 
-   If the hand is rotated or offset wrongly, tune `SceneCfg.hand_mount_euler` and `SceneCfg.hand_mount_pos` in `config.py`.
+```bash
+python train.py --device cpu --num-envs 4 --total-steps 20000   # smoke test, under a minute
+python bc.py --name bc                                          # DAgger from the oracle, ~6 min on 32 envs
+python evaluate.py --ckpt runs/bc/bc_latest.pt --episodes 100   # should approach the oracle
+python train.py --init-from runs/bc/bc_latest.pt --name strike_bc --lr 1e-4
+tensorboard --logdir runs
+python evaluate.py --ckpt runs/strike_bc/ckpt_best.pt --episodes 100
+```
 
-3. **Unit and integration tests**
-   ```bash
-   pytest -q tests
-   ```
-   The tests cover:
-   - joint and fingertip discovery;
-   - 50 random tools compile within the mass bounds and settle on the table;
-   - goal constraints;
-   - the Gymnasium `check_env`;
-   - a 1500-step random rollout stays finite;
-   - soft and respawn reset semantics (the arm stays put, the tool or goal changes);
-   - a scripted pass-through of the goal triggers success.
+- PPO from scratch tends to find a reward hack (swooping in steeply and turning at the goal); starting from the cloned
+  oracle avoids it. [Trajectory goals](#trajectory-goals) are the from-scratch alternative.
+- Training success includes exploration noise; the deterministic `evaluate.py` number is the real one. `ckpt_best.pt`
+  is saved when the deterministic eval envs beat the previous best at the same or a higher level.
+- In `bc.py`, watch `bc/loss_new` (loss on each round's new states), not `bc/loss`. The oracle's design and the DAgger
+  schedule are explained in the `oracle.py` and `bc.py` docstrings.
+- `--init-from` loads weights, normalizers and env config; the optimizer, curriculum and steps start fresh, the reward
+  comes from `config.py`, and the first `--critic-warmup` (20) iterations train only the critic.
 
-4. **Watch the env live with random actions**
-   ```bash
-   python evaluate.py --policy random --render human --realtime --episodes 3
-   ```
-   You can also write a video instead: `python evaluate.py --policy zero --episodes 2 --video zero.mp4`
+**Evaluate on tasks:**
 
-5. **Training smoke test** (runs about 1–2 minutes on CPU)
-   ```bash
-   python train.py --device cpu --num-envs 4 --total-steps 20000
-   ```
-   - The output should show iterations with `sps`, return, success and grasp rates.
-   - It saves `runs/<name>/ckpt_latest.pt`, and `runs/<name>/ckpt_best.pt` whenever the success rate over the
-     last 200 episodes beats the previous best at the same or a higher curriculum level.
-   - `--device auto` uses CUDA when available.
+```bash
+python evaluate_tasks.py --task plate --policy trace --episodes 20     # the reference trace follower
+python evaluate_tasks.py --task nail --ckpt runs/strike_bc/ckpt_best.pt --episodes 50 --video nail.mp4
+```
 
-6. **Real training run and monitoring**
-   ```bash
-   python train.py --device auto --num-envs 16
-   tensorboard --logdir runs
-   python evaluate.py --ckpt runs/<name>/ckpt_latest.pt --render human --realtime
-   ```
+## How it works
 
-## Command-line flags
+An episode is one goal, which gets one attempt. All values below are defaults in `config.py`.
 
-Defaults marked `PPOCfg` come from `config.py`.
+**Grip (weld).** The fingers are frozen closed and the tool is welded to the palm with its handle across the fingers,
+slid up to `grasp_slide` (±70%) of the handle's half length from its center, at a random roll, head on a random side.
+Hand–tool collisions are off; the arm, table and floor still collide with the tool. Every `regrip_every` (8) goals
+brings a new tool and grasp, and the arm returns home.
 
-### `train.py`
+**Goal.** A point `p_g`, a velocity `v_g` and a full tool orientation `R_g`.
+- Weld goals are the tool pose at a sampled arm configuration near the current one, so they are reachable with this
+  grasp by construction. Physical-grip goals come from a precomputed palm reach map.
+- `v_g` is drawn within a cone around the head axis that widens with the curriculum (`vel_cone_deg`, 30° → 180°, so
+  sideways and backwards swipes appear). A quarter of goals (`down_frac`) are steep downward strikes, as for a nail.
+- The lead-in point (12 cm before `p_g`) and the follow-through point (8 cm after) must be reachable and
+  collision-free in the goal orientation. If no goal can be found, the arm re-homes and/or regrips
+  (`ep/goal_recovery`).
 
-| flag | default | description |
+**Attempt and success.** The attempt is the first step where the keypoint distance `d` (max distance between 4
+keypoints on the tool and the same keypoints at the goal pose, so it covers position and orientation) is within
+`eps_kp`. The episode ends there. It is a success if the head is within `eps_p` of `p_g`, the rotation to `R_g` is
+under `eps_theta`, and `|v_head − v_g| < eps_v_frac · |v_g|` (so a stationary head never qualifies). The curriculum
+moves up at 50% success, tightening the tolerances from 8 cm / 60° / 60% of goal speed to 3 cm / 20° / 25%,
+raising the max goal speed from 0.3 to 0.6 m/s and widening the velocity cone.
+
+**Other episode ends.** A 5 s time-out (250 steps at 50 Hz); the robot or tool pushing on the table or floor harder
+than 100 N; in `head_twist`, the arm being unable to follow the commanded twist (`ik_fail_tol`); physics divergence;
+for physical grip, a drop (`ep/dropped`). After an episode the physics state is kept and only the goal changes (a
+soft reset), unless it is time to regrip or the tool was lost.
+
+**Actions** (6 values in [-1, 1] with weld; 22 with physical grip), smoothed by an EMA (`action_ema = 0.8`):
+- `head_twist` (default): the head's linear and angular velocity (0.8 m/s, 2.5 rad/s at 1), mapped to joint velocities
+  by damped least squares; the servo target `q + (kv/kp)·dq` turns the PD position servos into velocity servos.
+- `joint`: joint-target changes of up to `arm_action_scale` (0.03 rad) per step.
+- `joint_vel`: joint velocities up to `joint_v_max`, through the same velocity servo, with no IK at runtime. Its
+  observation adds the goal errors mapped through the head-Jacobian pseudo-inverse (`kin_obs`). For a joint-space
+  policy, this is the mode that clones well.
+- Physical grip adds 16 hand joint-target changes.
+
+**Observation.** Actor: arm joints and velocities, the smoothed previous action, palm pose, the grasp (tool pose in the
+palm frame), head pose and velocity, tool shape features, the goal (`p_g`, `v_g`, `R_g` as a 6D rotation) and its
+errors, the offset to the lead-in point, the current tolerances and the time remaining. Physical grip adds hand joints,
+fingertips and contact flags. The critic also gets privileged state (`info["priv"]`): tool mass, center of mass and
+friction, contact forces, the closest distance so far and the curriculum level.
+
+**Reward** (`RewardCfg`, `rewards.py`): SimToolReal's reward extended with the goal velocity.
+- Keypoint progress per step: `200 · max(d* − d, 0)`, where `d*` is the closest so far, so a windup costs nothing.
+- Smoothness per step: `−0.03 · Σ|q̇_arm|` (`--smooth-norm` chooses L1, L2 or L2²).
+- Attempt bonus, once: `1000 · exp(−|v_head − v_g| / (0.25·|v_g|))`, so arriving slowly or sideways earns little.
+- Physical grip adds a grasp potential (reach, touch, lift) and a drop penalty.
+- Every episode end cuts the PPO return, so each goal is scored on its own attempt and rushing through one to reach
+  the next doesn't pay.
+
+**Networks and PPO.** Actor MLP 512-256-128 (ELU, Gaussian), critic MLP 512-512-256, running observation
+normalization. 32 envs × 256 steps per update, 5 epochs of 4 minibatches, KL early stop at 0.05, lr annealed linearly
+from `--lr` to `--lr-final` over each invocation. The last `--eval-envs` (2) envs act deterministically, stay out of
+the PPO batch, and drive the curriculum and `ckpt_best`.
+
+## Variants
+
+### Trajectory goals
+
+`--goal-mode trajectory` (`EnvCfg.goal_mode`, settings in `TrajCfg`) lets PPO learn from scratch, without behavior
+cloning, by giving it a path into the strike. The goal and success rule are unchanged; each episode also gets a smooth
+random reference, one sample per control step.
+- It is built in joint space, so every sample is reachable: a quintic from the current joints to the start of the
+  lead-in plus a random detour (`bump_rad`, growing with the level), then the lead-in through `p_g` at `v_g` and the
+  follow-through. References are checked against joint limits, `joint_v_max`, collisions and table clearance, and
+  their approach stays 1.5 × `eps_kp` from the goal pose. If none passes, the last resort is an unchecked reference
+  (`ep/ref_fallback`).
+- The actor also observes the reference now and `preview` steps ahead, and the joint reference (`joint_obs`).
+- The keypoint progress term becomes a tracking reward, `w_pos·exp(−d_ref/σ_pos) + w_vel·exp(−|v − v_ref| /
+  (σ_v·|v_g|))`. An episode also ends as `lost` when `d_ref > lost_dist` (15 cm).
+- Weld grip, pose + velocity goals only, with `joint_vel` or `head_twist` actions. `--policy oracle` here is
+  `traces.TraceFollower` on the reference (about 96% success in `joint_vel` at level 0).
+
+```bash
+python evaluate.py --policy oracle --goal-mode trajectory --action-mode joint_vel --episodes 100
+python train.py --device auto --name traj_jv --goal-mode trajectory --action-mode joint_vel
+```
+
+### Pose-only baselines and goal-velocity ablations
+
+These take the pose + velocity goal apart. All settings are saved in the checkpoint. Flags that change the observation
+(`--pose-only`, `--no-vel-obs`, `--pose-chain`, `--goal-mode`) must be set in `bc.py` (or a from-scratch `train.py`);
+`train.py --init-from` inherits them.
+
+| flag | what changes |
+|---|---|
+| `--pose-only hold` | No goal velocity in the observation or reward. Success after 10 (not necessarily consecutive) steps within tolerance, as in SimToolReal. Expert: `oracle.PoseOracle` |
+| `--pose-only touch` | As above, but the first step within tolerance succeeds and ends the episode |
+| `--no-vel-obs` | Velocity goal and reward kept, but the actor gets the pose-only observation (`v_g` goes to the critic) |
+| `--no-vel-reward` | `v_g` observed, but the attempt bonus is flat; success still needs the velocity |
+| `--pose-chain N` | With `touch`: the velocity spelled out as N timed pose sub-goals along the strike line after the lead-in point. Expert: `oracle.ChainPoseOracle` |
+
+`evaluate.py` scores every policy by the same rule at the attempt (pose, velocity, and both as `joint_ok`), so a
+pose-only policy's velocity at the attempt shows what a pose goal gives for free. `--dump` writes per-episode results
+for `analyze_ablation.py`. `eval_attempt_reward.py` compares checkpoints on the reward earned up to the attempt.
+
+```bash
+python bc.py --name bc_pose_hold --pose-only hold
+python train.py --init-from runs/bc_pose_hold/bc_latest.pt --name strike_bc_pose_hold --lr 1e-4
+python evaluate.py --ckpt runs/strike_bc_pose_hold/ckpt_best.pt --level 1 --episodes 200 --dump results/hold_s0.json
+python analyze_ablation.py results/ --bins
+```
+
+### SimToolReal baseline
+
+`strl_*.py` reproduce SimToolReal (pose goals reached one after another, joint-delta actions, PPO from scratch) in
+the same scene. See [STRL_BASELINE.md](STRL_BASELINE.md); a trained checkpoint is in `checkpoints/strl_seed0/`.
+
+## Task evaluation
+
+`tasks.py` builds task envs on top of `PoseVelocityEnv`, each with a fixed tool and fixtures (settings in `TaskCfg`):
+
+| task | tool | goal | success |
+|---|---|---|---|
+| `plate` | hammer | hit a plate with a target peak impact force | peak force within 15% of the target |
+| `nail` | hammer | hit a vertical nail straight down with a target force | the face hits the nail head first, within 1.2 cm of its axis, force within 15% |
+| `sweep` | brush with a spring bristle pad | scrub a dirty patch; stronger dirt needs more force | at least 95% of the dirt removed |
+| `slice` | kitchen knife | saw a loaf in half along a marked line | cut through every column, on the line, without crushing the loaf or jamming the knife |
+| `slice_tomato` | kitchen knife | slice a cherry tomato in half | cut through with the pressing force between the cut and crush forces, near the middle |
+| `flick` | spatula | flick an egg off the spatula into a bowl | the egg comes to rest in the bowl |
+
+- Each episode samples an instance and a **trace** (head pose, velocity and angular velocity per control step,
+  `traces.Trace`) that achieves the task when followed exactly. Instances are calibrated and checked by running the
+  reference follower (`--policy trace`, `traces.TraceFollower`), and resampled if it fails.
+- Policies only know single goals, so the env feeds them the trace's **keypoints** one at a time as ordinary goals
+  (the impact for hammering, plus two windup goals; waypoints along strokes for sweeping and slicing). It advances
+  when the head crosses the current keypoint's goal plane.
+- Tools are held as a person would hold them (handle across the fingers, the face or edge pointing the way the
+  knuckles do), not at the random training grasps.
+- `--layout in_dist` (default) places fixtures within the training goal region; `realistic` puts everything on the
+  tabletop, which is out of distribution for current policies.
+- The failure rules and physics of each task are documented in the task class docstrings in `tasks.py`.
+
+## Common flags
+
+Run `python <script> --help` for the full list; defaults live in `config.py`.
+
+| flag | scripts | |
 |---|---|---|
-| `--device {auto,cpu,cuda}` | `auto` | Torch device; `auto` uses CUDA when available |
-| `--num-envs N` | `16` (`PPOCfg.num_envs`) | Number of parallel envs |
-| `--rollout-steps N` | `64` (`PPOCfg.rollout_steps`) | Steps per env per PPO iteration |
-| `--total-steps N` | `200000000` (`PPOCfg.total_steps`) | Total env steps to train for |
-| `--lr LR` | `3e-4` (`PPOCfg.lr`) | Learning rate |
-| `--seed N` | `0` | Seed for torch, numpy and the envs (env `i` gets `seed*1000 + i`) |
-| `--level L` | `0.0` | Initial curriculum level, from 0 to 1 |
-| `--fixed-level` | off | Disable the automatic curriculum and stay at `--level` |
-| `--serial` | off | Run envs in the main process instead of subprocesses, for debugging (always on when `--num-envs 1`) |
-| `--logdir DIR` | `runs` | Parent directory for runs |
-| `--name NAME` | `posevel_<timestamp>` | Run name; output goes to `<logdir>/<name>` |
-| `--resume CKPT` | none | Checkpoint to resume from; its env config is used instead of `config.py` |
-| `--save-every N` | `50` (`PPOCfg.save_every`) | Checkpoint interval in iterations |
-| `--eps-p LEVEL0 LEVEL1` | `0.08 0.03` | Success position tolerance in meters at curriculum level 0 and 1. Also overrides a resumed checkpoint's config |
-| `--sigma-p S` | `0.05` | Position scale in meters of the phase distance D used by the goal reward. Also overrides a resumed checkpoint's config |
-
-### `evaluate.py`
-
-| flag | default | description |
-|---|---|---|
-| `--ckpt CKPT` | none | Checkpoint to load; the env config and curriculum level are taken from it |
-| `--policy {ckpt,random,zero}` | `ckpt` if `--ckpt` is given, else `random` | Which policy drives the robot |
-| `--episodes N` | `5` | Number of episodes |
-| `--render {none,human,rgb_array}` | `none` | Render mode; `human` opens the viewer |
-| `--video PATH` | none | Write an mp4 (implies `--render rgb_array`) |
-| `--level L` | from checkpoint, else `0` | Curriculum level |
-| `--stochastic` | off | Sample actions instead of using the mean |
-| `--realtime` | off | Slow down to real time in the viewer |
-| `--seed N` | `0` | Seed for the env and the random policy |
-| `--device DEVICE` | `cpu` | Torch device for the policy |
-| `--table-start` | off | Every episode starts with a new tool on the table (no in-hand starts, no soft resets); the arm still stays where the previous episode left it |
-
-### `scene.py`
-
-| flag | default | description |
-|---|---|---|
-| `--view` | off | Open the interactive MuJoCo viewer |
-| `--seed N` | `0` | Seed for the tool and goal |
-| `--level L` | `0.0` | Curriculum level (affects in-hand starts) |
+| `--device {auto,cpu,cuda}` | train, bc, evaluate* | `auto` uses CUDA when available |
+| `--num-envs N`, `--name`, `--logdir` | train, bc | parallel envs; output goes to `<logdir>/<name>` |
+| `--init-from CKPT` / `--resume CKPT` | train | start a new run from a checkpoint (e.g. BC) / continue a run |
+| `--action-mode {head_twist,joint,joint_vel}` | train, bc, evaluate | arm action space |
+| `--goal-mode {points,trajectory}` | train, bc, evaluate | see [Trajectory goals](#trajectory-goals) |
+| `--pose-only`, `--no-vel-obs`, `--no-vel-reward`, `--pose-chain`, `--vel-cone` | train, bc (evaluate: all but the `--no-vel-*` pair) | see [ablations](#pose-only-baselines-and-goal-velocity-ablations) |
+| `--level L` | train, evaluate* | curriculum level (0–1); train's `--fixed-level` disables the curriculum |
+| `--eps-p`, `--eps-kp`, `--eps-v-frac`, `--sigma-v-frac` | train (bc: last two) | tolerances at levels 0 and 1, and the bonus's velocity scale |
+| `--ckpt CKPT`, `--policy` | evaluate* | the env config and level come from the checkpoint |
+| `--episodes`, `--render human`, `--realtime`, `--video PATH` | evaluate* | `--video` renders headless to mp4 |
+| `--dump PATH` | evaluate | per-episode JSON for `analyze_ablation.py` |
+| `--task`, `--layout`, `--save-traces DIR` | evaluate_tasks | plus per-task overrides of `TaskCfg` fields |
 
 ## Files
 
 | file | contents |
 |---|---|
-| `config.py` | Every tunable setting: scene, tool ranges, goal region, reward weights, curriculum, PPO |
-| `scene.py` | Attaches the LEAP hand to the UR5e flange (`MjSpec.attach`) and adds the table, floor and goal markers. Recompiles the model per tool. |
-| `tool_gen.py` | Random tool: handle (cylinder/capsule/box) + head (box/cylinder/sphere/ellipsoid/capsule) in a T, L or inline layout |
-| `goals.py` | Goal sampling from a precomputed reach map, plus the segment-based pass-through test |
-| `rewards.py` | Dense and terminal reward terms |
+| `config.py` | Every tunable setting (dataclasses), plus the shared ablation flags |
+| `scene.py` | Builds the scene: LEAP hand on the UR5e flange, table, goal markers, the tool, optional palm weld |
+| `tool_gen.py` | Random tools (handle + head in a T, L or inline layout) and fixed task tools |
+| `goals.py` | Goal sampling (from arm configurations, or the reach map) and the goal-plane crossing test |
+| `rewards.py` | Keypoint distance, velocity match, smoothness, trajectory tracking reward, grasp potential |
 | `env.py` | `PoseVelocityEnv` (Gymnasium) |
-| `vec_env.py` | Subprocess vector env with same-step autoreset that also returns privileged critic features |
+| `mathutils.py` | Quaternion and rotation helpers |
+| `vec_env.py` | Subprocess vector env with same-step autoreset and privileged critic features |
 | `ppo.py` | Asymmetric actor-critic, observation normalizers, PPO update, GAE |
-| `train.py` | Training: rollouts, curriculum, TensorBoard, checkpoints |
-| `evaluate.py` | Evaluation: viewer, video, success stats |
-
-## How an episode works
-
-- **Goal:** a point `p_g`, a velocity `v_g` and a head axis `a_g`. By default `a_g` points along `v_g`, like a strike. All three are sampled inside the arm's reach. The point slightly before the goal along the motion (lead-in) and slightly after it (follow-through) must also be reachable.
-- **Success:** checked once per control step against the head's path since the previous step, so fast passes aren't missed. While the tool is held, all three must hold:
-  - the closest approach to `p_g` is within `eps_p`;
-  - `|v_head - v_g| < eps_v_frac · |v_g|`, a fraction of the goal speed, so a stationary head never qualifies;
-  - the angle between the head axis and `a_g` is below `eps_theta`.
-
-  The curriculum tightens these from 8 cm / 60% of goal speed / 60° to 3 cm / 25% of goal speed / 20°.
-- **Drop:** the tool had been grasped and then either lost all hand contact for 0.2 s or touched the floor. It also counts as a drop if the tool is knocked off the table. A drop ends the episode early.
-- **Time limit:** 10 s (500 control steps at 50 Hz).
-- **After an episode:**
-  - The arm is **never** re-homed.
-  - **Soft reset:** if the tool is still held, the whole physics state is kept and only the goal changes.
-  - **Respawn:** otherwise, a new tool is generated and placed on the table (or in the hand, early in the curriculum), and the arm stays where it was.
-  - The arm returns to its home pose only on the first reset, on `reset(seed=...)`, or after the physics diverges.
-
-## Model inputs and outputs
-
-- **Action (22 values in [-1, 1]):** changes to the joint-position targets.
-  - Arm: 6 joints, up to 0.03 rad per step.
-  - Hand: 16 joints, up to 0.08 rad per step.
-- **Actor observation (about 160 values):**
-  - arm and hand joint positions and velocities;
-  - the previous action;
-  - palm pose and fingertip positions;
-  - fingertip contact flags;
-  - tool head pose and velocity;
-  - shape features of the tool;
-  - the goal, and the position, velocity and axis errors to it;
-  - grasp flags and time remaining.
-- **Critic-only inputs** (`info["priv"]`): tool mass, center of mass and friction; contact forces; best distance so far; curriculum level.
-- **Networks:**
-  - Actor: MLP 512-256-128 (ELU) with a Gaussian output.
-  - Critic: MLP 512-512-256.
-  - Both use running observation normalization.
-- **Reward:**
-  - Reaching the handle, fingertip contact and lifting are combined into a grasp potential Φ, rewarded as potential-based shaping `γΦ' − Φ`. Progress toward a grasp pays once; just holding the tool pays nothing; dropping it costs the same amount back.
-  - Goal attraction while holding is also potential-based: Φ_goal = wide position term + tight `exp(−D)` term. Approaching the goal pays, hovering near it pays nothing. Closest-approach progress pays for each new best D.
-  - Episode boundaries after a soft reset (success, or a time-out with the tool still held) don't cut the PPO return. The world carries on with a new goal, so finishing a goal never forfeits future reward.
-  - Small penalties on actions and on the robot touching the table.
-  - Terminal terms: success +50 (plus a bonus for finishing early), drop -20, and `10·exp(-D_min)` for how close the attempt got.
-  - The weights are in `RewardCfg`.
-
-`PoseVelocityEnv` is a standard Gymnasium env, so SB3 also works as a quick baseline: `PPO("MlpPolicy", PoseVelocityEnv())`. The SB3 baseline uses only the actor observation.
+| `oracle.py` | Scripted experts: `Oracle` (strike), `PoseOracle`, `ChainPoseOracle` |
+| `bc.py` | DAgger behavior cloning of an oracle into the actor |
+| `train.py` | PPO training: rollouts, curriculum, TensorBoard, checkpoints |
+| `evaluate.py` | Evaluation: success stats, viewer, video, `--dump` |
+| `traces.py` | Reference traces, their builders, and `TraceFollower` |
+| `tasks.py`, `evaluate_tasks.py` | Task envs and their evaluation script |
+| `analyze_ablation.py` | Mean ± std tables over `evaluate.py --dump` files, optionally binned |
+| `eval_attempt_reward.py` | Reward up to the attempt, compared across checkpoints |
+| `bench_sps.py` | Simulation throughput benchmark |
+| `strl_*.py`, `STRL_BASELINE.md` | The SimToolReal baseline |
+| `checkpoints/`, `results/` | The SimToolReal checkpoint, its evaluation outputs, and ablation dumps |
+| `tests/` | pytest suite |
 
 ## Troubleshooting
 
-- **`AttributeError` mentioning `MjSpec` / `attach` / `copy`:** your MuJoCo is too old. Run `pip install -U "mujoco>=3.3"`.
-- **`ImportError: robot_descriptions`:** install it, or set the two `POSEVEL_*_XML` variables shown above.
-- **Hand mount:** by default (`auto_align_hand=True`) the fingers are aligned with the flange axis and the palm sits flush on the flange. To change which way the palm faces, set `hand_mount_euler = (0, 0, angle)`, which spins the hand about the wrist axis. Use `hand_mount_pos` for small offsets. Re-run `python scene.py --view` to check.
-- **Viewer does not open under WSL:** WSLg is needed (`echo $DISPLAY` should print something). Use `--video` as a headless alternative.
-- **Headless video rendering fails:** run `export MUJOCO_GL=egl` (or `osmesa`) first.
+- **`AttributeError` mentioning `MjSpec` / `attach` / `copy`:** MuJoCo is too old: `pip install -U "mujoco>=3.3"`.
+- **`ImportError: robot_descriptions`:** install it, or set the two `POSEVEL_*_XML` variables above.
+- **Hand mount:** by default (`auto_align_hand`) the fingers continue along the flange axis, palm flush on it.
+  `SceneCfg.hand_mount_euler = (0, 0, angle)` spins the hand about the wrist; `hand_mount_pos` adds small offsets.
+  Check with `python scene.py --view`.
+- **Viewer doesn't open under WSL:** WSLg is needed (`echo $DISPLAY` should print something); use `--video` instead.
+- **Headless video rendering fails:** `export MUJOCO_GL=egl` (or `osmesa`).

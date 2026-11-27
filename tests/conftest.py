@@ -24,3 +24,20 @@ def env(cfg):
     e.reset(seed=0)
     yield e
     e.close()
+
+
+@pytest.fixture
+def physical_cfg(cfg):
+    cfg.grip_mode = "physical"
+    cfg.action_mode = "joint"
+    return cfg
+
+
+@pytest.fixture
+def physical_env(physical_cfg):
+    from env import PoseVelocityEnv
+
+    e = PoseVelocityEnv(physical_cfg)
+    e.reset(seed=0)
+    yield e
+    e.close()

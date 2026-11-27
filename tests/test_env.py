@@ -1,5 +1,8 @@
 import mujoco
 import numpy as np
+import pytest
+
+import mathutils as mu
 
 
 def test_check_env(cfg):
@@ -12,7 +15,9 @@ def test_check_env(cfg):
     env.close()
 
 
-def test_random_rollout_is_finite(env):
+@pytest.mark.parametrize("env_fixture", ["env", "physical_env"])
+def test_random_rollout_is_finite(env_fixture, request):
+    env = request.getfixturevalue(env_fixture)
     rng = np.random.default_rng(0)
     obs, _ = env.reset(seed=0)
     episodes = 0
@@ -41,7 +46,8 @@ def test_soft_reset_keeps_state_and_changes_goal(env):
     assert not np.allclose(env.goal.p, goal_before)
 
 
-def test_respawn_keeps_arm_and_changes_tool(env):
+def test_respawn_keeps_arm_and_changes_tool(physical_env):
+    env = physical_env
     env.set_curriculum(1.0)  # table spawn only
     rng = np.random.default_rng(0)
     for _ in range(20):
@@ -54,7 +60,8 @@ def test_respawn_keeps_arm_and_changes_tool(env):
     np.testing.assert_allclose(env.data.qpos[env.arm_qadr], arm_before, atol=0.05)
 
 
-def test_episode_end_sets_next_reset_kind(env):
+def test_episode_end_sets_next_reset_kind(physical_env):
+    env = physical_env
     env.set_curriculum(1.0)
     env.reset(options={"kind": "respawn"})
     for _ in range(env.cfg.max_steps):
@@ -69,10 +76,197 @@ def test_episode_end_sets_next_reset_kind(env):
     np.testing.assert_allclose(env.data.qpos[env.arm_qadr], arm_before, atol=0.05)
 
 
-def test_scripted_pass_through_succeeds(cfg):
+def test_weld_regrips_after_n_goals(cfg):
+    from env import PoseVelocityEnv
+
+    cfg.regrip_every = 2
+    cfg.max_steps = 5
+    env = PoseVelocityEnv(cfg)
+    env.reset(seed=0)
+    kinds = []
+    for _ in range(4):
+        for _ in range(cfg.max_steps):
+            _, _, term, trunc, info = env.step(np.zeros(env.action_space.shape))
+            if term or trunc:
+                break
+        kinds.append(info["episode"]["next_reset"])
+        _, rinfo = env.reset()
+        assert rinfo["reset_kind"] == kinds[-1]
+    assert kinds == ["soft", "regrip", "soft", "regrip"]
+    env.close()
+
+
+def test_weld_holds(env):
+    """Random arm motion must not move the tool relative to the palm (beyond the weld's softness)."""
+    rng = np.random.default_rng(0)
+    worst = 0.0
+    for _ in range(500):
+        _, _, term, trunc, _ = env.step(rng.uniform(-1, 1, env.action_space.shape))
+        d = env.data
+        R = d.xmat[env.palm_id].reshape(3, 3)
+        worst = max(worst, np.linalg.norm(R.T @ (d.xpos[env.tool_id] - d.xpos[env.palm_id]) - env.grasp_pos))
+        if term or trunc:
+            env.reset(options={"kind": "soft"})
+    assert worst < 0.005, worst
+
+
+def test_head_twist_tracks(cfg):
+    """A constant linear-velocity command moves the head at roughly that velocity."""
+    from env import PoseVelocityEnv
+
+    cfg.max_steps = 1000
+    env = PoseVelocityEnv(cfg)
+    env.reset(seed=0)
+    for axis in range(3):
+        a = np.zeros(6)
+        a[axis] = 0.25
+        vs = []
+        for k in range(30):
+            env.step(a)
+            if k >= 10:
+                vs.append(env._head_state()[1])
+        v = np.mean(vs, 0)
+        target = a[:3] * cfg.head_v_max
+        assert np.linalg.norm(v - target) < 0.3 * np.linalg.norm(target), (axis, v)
+    env.close()
+
+
+@pytest.mark.parametrize("level", [0.0, 1.0])
+def test_goal_from_grasp_is_reachable(env, level):
+    """Weld goals come from arm configurations: q_ref puts the head on the goal in the goal orientation, and the
+    velocity is within the curriculum's cone of the head axis."""
+    env.set_curriculum(level)
+    cone = env.cfg.curriculum.vel_cone_deg[0] + (env.cfg.curriculum.vel_cone_deg[1]
+                                                  - env.cfg.curriculum.vel_cone_deg[0]) * level
+    for _ in range(20):
+        env._sample_goal()
+        g = env.goal
+        assert not env.goal_fallback and g.q_ref is not None
+        head, axis, quat, _ = env._scratch_pose(g.q_ref)
+        assert np.linalg.norm(head - g.p) < 1e-3
+        assert np.linalg.norm(mu.quat_error(g.quat, quat)) < np.deg2rad(1.0)
+        assert mu.angle_between(axis, g.axis) < np.deg2rad(1.0)
+        assert np.degrees(mu.angle_between(g.v, g.axis)) <= cone + 1e-6
+        assert env.goal_sampler.in_region(g.p)
+
+
+def test_full_curriculum_samples_swipes(env):
+    """At level 1 the velocity is independent of the head axis, so many goals move sideways or backwards."""
+    env.set_curriculum(1.0)
+    angles = []
+    for _ in range(40):
+        env._sample_goal()
+        angles.append(np.degrees(mu.angle_between(env.goal.v, env.goal.axis)))
+    assert np.mean(np.array(angles) > 60.0) > 0.3, angles
+
+
+@pytest.mark.parametrize("offset, expect_attempt", [(0.01, True), (0.3, False)])
+def test_attempt_only_within_keypoint_tolerance(env, offset, expect_attempt):
+    """The attempt (and the episode end) happens only within eps_kp of the goal pose."""
+    from goals import Goal
+
+    env.set_curriculum(0.0)
+    head = env.data.site_xpos[env.head_site].copy()
+    d = np.array([0.0, 0.0, 1.0])
+    env.goal = Goal(p=head + offset * d, v=0.3 * d, quat=env._tool_quat(), axis=d)
+    _, _, term, _, info = env.step(np.zeros(env.action_space.shape))
+    assert info["passed"] == expect_attempt and term == expect_attempt
+
+
+def test_stationary_arrival_is_an_attempt_without_success(env):
+    """Reaching the goal pose without moving ends the episode with a near-zero bonus and no success."""
+    from goals import Goal
+
+    head = env.data.site_xpos[env.head_site].copy()
+    d = np.array([0.0, 0.0, -1.0])
+    env.goal = Goal(p=head, v=0.4 * d, quat=env._tool_quat(), axis=d)
+    _, r, term, _, info = env.step(np.zeros(env.action_space.shape))
+    assert term and info["passed"] and not info["success"]
+    assert info["episode"]["terms"]["bonus"] < 0.05 * env.cfg.reward.reach_goal_bonus
+
+
+def _run_attempt(env, policy):
+    while True:
+        _, _, term, trunc, info = env.step(policy(env))
+        if term or trunc:
+            return info["episode"]
+
+
+def _speed_scaled_oracle(mult):
+    """The oracle, but striking at mult x the goal speed."""
+    from oracle import Oracle
+
+    class Scaled(Oracle):
+        def __call__(self, env):
+            g = env.goal
+            v0 = g.v.copy()
+            g.v = v0 * mult
+            try:
+                return super().__call__(env)
+            finally:
+                g.v = v0
+
+    return Scaled()
+
+
+def test_attempt_bonus_prefers_the_right_strike(env):
+    """Striking at the goal velocity earns more attempt bonus than crawling or rushing at the goal."""
+    per_policy = {}
+    for mult in (1.0, 0.3, 3.0):
+        env.reset(seed=11)
+        pol = _speed_scaled_oracle(mult)
+        got = []
+        for _ in range(6):
+            got.append(_run_attempt(env, pol)["terms"]["bonus"])
+            env.reset()
+        per_policy[mult] = float(np.mean(got))
+    assert per_policy[1.0] > 0.2 * env.cfg.reward.reach_goal_bonus, per_policy
+    assert per_policy[0.3] < 0.5 * per_policy[1.0] and per_policy[3.0] < 0.5 * per_policy[1.0], per_policy
+
+
+def test_awkward_posture_recovers_with_reachable_goal(env):
+    """If no goal can be sampled near the current pose, the arm is re-homed (and if needed regripped) instead of
+    falling back to a grasp-agnostic, possibly unreachable goal."""
+    home = np.asarray(env.cfg.scene.arm_home)
+    propose = env._propose_goal_q
+
+    def only_near_home(rng):  # simulate a posture where nothing nearby is reachable
+        if np.linalg.norm(env.data.qpos[env.arm_qadr] - home) > 0.2:
+            return None
+        return propose(rng)
+
+    env._propose_goal_q = only_near_home
+    env.data.qpos[env.arm_qadr] = home + np.array([0.8, -0.6, 0.7, 0.5, -0.4, 0.3])
+    mujoco.mj_forward(env.model, env.data)
+    env._sample_goal()
+    assert env.goal_recovery == 1 and not env.goal_fallback
+    assert np.linalg.norm(env.data.qpos[env.arm_qadr] - home) < 0.2
+    head, axis, _, _ = env._scratch_pose(env.goal.q_ref)
+    assert np.linalg.norm(head - env.goal.p) < 1e-3
+    # The re-home must not register as head motion (no spurious goal-plane crossing on the next step).
+    np.testing.assert_allclose(env._prev_head, env.data.site_xpos[env.head_site])
+
+
+def test_goal_sampling_rarely_needs_recovery(env):
+    rng = np.random.default_rng(0)
+    rec, fb = [], []
+    for _ in range(40):
+        for _ in range(25):
+            env.step(rng.uniform(-1, 1, env.action_space.shape))
+        env._sample_goal()
+        rec.append(env.goal_recovery)
+        fb.append(env.goal_fallback)
+    assert not any(fb)
+    assert np.mean(np.array(rec) > 0) < 0.3, rec
+
+
+
+
+def test_scripted_pass_through_succeeds(physical_cfg):
     """Fly the tool head through the goal at the goal velocity (no gravity/contacts): success must fire."""
     from env import PoseVelocityEnv
 
+    cfg = physical_cfg
     cfg.success_requires_grasp = False
     env = PoseVelocityEnv(cfg)
     env.set_curriculum(0.0)
@@ -81,14 +275,76 @@ def test_scripted_pass_through_succeeds(cfg):
     env.model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
     g = env.goal
     dt = env.model.opt.timestep * cfg.frame_skip
-    env.debug_set_head_state(g.p - g.v * 5 * dt, g.axis, g.v)
-    success, total = False, 0.0
+    env.debug_set_head_state(g.p - g.v * 5 * dt, g.quat, g.v)
+    success = False
     for _ in range(10):
         _, r, term, trunc, info = env.step(np.zeros(env.action_space.shape))
-        total += r
         if info["success"]:
             success = True
             break
-    assert success, f"seg_dist={info['seg_dist']:.3f}"
-    assert total > env.cfg.reward.success_bonus * 0.9
+    assert success, f"d_perp={info['d_perp']}"
+    assert term
+    # Only the bonus term: teleporting the tool out of a scripted grasp also (correctly) costs grasp potential.
+    assert env.ep_terms["bonus"] > 0.95 * env.cfg.reward.reach_goal_bonus
+    assert info["episode"]["pass"]["dv_frac"] < 0.05
+    env.close()
+
+
+def test_oracle_succeeds(cfg):
+    """The scripted strike (oracle.Oracle) succeeds on most weld goals: they are feasible."""
+    from env import PoseVelocityEnv
+    from oracle import Oracle
+
+    env = PoseVelocityEnv(cfg)
+    env.reset(seed=1)
+    oracle = Oracle()
+    successes = 0
+    for _ in range(12):
+        while True:
+            _, _, term, trunc, info = env.step(oracle(env))
+            if term or trunc:
+                break
+        successes += info["episode"]["success"]
+        env.reset()
+    assert successes >= 8, successes
+    env.close()
+
+
+def test_oracle_labels_have_no_jumps(cfg):
+    """The oracle's linear-velocity action changes smoothly along its own rollouts. A hard approach/strike switch
+    jumps by about the goal speed (up to ~0.65 here), and a clone regressed onto it averages the two sides."""
+    from env import PoseVelocityEnv
+    from oracle import Oracle
+
+    env = PoseVelocityEnv(cfg)
+    env.set_curriculum(1.0)
+    env.reset(seed=3)
+    oracle, worst = Oracle(), 0.0
+    for _ in range(6):
+        prev = None
+        while True:
+            a = oracle(env)
+            if prev is not None:
+                worst = max(worst, float(np.abs(a[:3] - prev).max()))
+            prev = a[:3]
+            _, _, term, trunc, _ = env.step(a)
+            if term or trunc:
+                break
+        env.reset()
+    assert worst < 0.3, worst
+    env.close()
+
+
+def test_ik_failure_ends_episode(cfg):
+    from env import PoseVelocityEnv
+
+    env = PoseVelocityEnv(cfg)
+    env.reset(seed=0)
+    _, _, term, _, info = env.step(np.zeros(env.action_space.shape))
+    assert env.ik_error < 1e-6 and not info["ik_failed"]  # a zero twist is always reachable
+    # Any shortfall at all (damping alone leaves some) counts as a failure at a tiny tolerance.
+    env.cfg.ik_fail_tol = 1e-9
+    _, _, term, trunc, info = env.step(np.ones(env.action_space.shape))
+    assert info["ik_failed"] and term and not trunc
+    assert info["episode"]["ik_failed"] == 1.0 and info["episode"]["success"] == 0.0
     env.close()

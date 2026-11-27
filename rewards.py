@@ -1,65 +1,96 @@
-"""Reward terms. Pure functions returning dicts of named terms (summed by the env, logged per term)."""
+"""Reward terms. Pure functions (summed by the env, logged per term).
+
+The SimToolReal reward (see strl_env.py), extended with a goal velocity. Per step:
+  keypoint  keypoint_rew_scale * max(d* - d, 0): paid only for getting closer to the goal pose than ever before this
+            episode, so a wind-up away from the goal costs nothing. d is the largest distance between 4 keypoints
+            on the tool and the same keypoints at the goal pose, so it covers position and orientation.
+  smooth    -arm_vel_penalty * smooth_norm of the arm joint velocities (L1 by default; see arm_vel_cost)
+  bonus     reach_goal_bonus * bonus_frac, with bonus_frac chosen by the env:
+            pose + velocity: velocity_match on the attempt (the first step with d within tolerance; the episode ends
+            there), so arriving slowly or sideways earns little.
+            pose-only "touch": 1 on the attempt. Pose-only "hold" (SimToolReal): 1 / success_steps on every step
+            within tolerance.
+Physical grip adds a grasp potential (Phi' - Phi) and a drop penalty.
+"""
 from __future__ import annotations
 
 import numpy as np
 
+import mathutils as mu
 from config import RewardCfg
 
+KEYPOINT_CORNERS = np.array([[1, 1, 1], [1, 1, -1], [-1, -1, 1], [-1, -1, -1]], dtype=np.float64)
 
-def phase_distance(dp: np.ndarray, dv: np.ndarray, theta: float, cfg: RewardCfg) -> float:
-    """Dimensionless distance in (position, velocity, head-axis) space."""
-    return float(np.linalg.norm(dp) / cfg.sigma_p + np.linalg.norm(dv) / cfg.sigma_v + theta / cfg.sigma_theta)
+
+def keypoints(pos, quat, offsets) -> np.ndarray:
+    """World positions (K, 3) of body-frame offsets (K, 3) at a body pose (pos, quat w x y z)."""
+    return np.asarray(pos) + np.asarray(offsets) @ mu.quat_to_mat(quat).T
+
+
+def keypoint_offsets(cfg: RewardCfg) -> np.ndarray:
+    """Tool-frame keypoints: corners of one fixed box (the same for every tool), centered on the head."""
+    return KEYPOINT_CORNERS * (0.5 * cfg.keypoint_scale * np.asarray(cfg.keypoint_size, dtype=np.float64))
+
+
+def keypoint_distance(pos_a, quat_a, pos_b, quat_b, offsets) -> float:
+    """Largest distance between matching keypoints at two poses."""
+    return float(np.max(np.linalg.norm(keypoints(pos_a, quat_a, offsets) - keypoints(pos_b, quat_b, offsets),
+                                       axis=1)))
+
+
+def velocity_match(dv: float, speed: float, sigma_v_frac: float) -> float:
+    """exp(-|v - v_g| / (sigma_v_frac * |v_g|)) in (0, 1]: 1/e at sigma_v_frac of the goal speed."""
+    return float(np.exp(-dv / (sigma_v_frac * max(speed, 1e-6))))
+
+
+SMOOTH_NORMS = ("l1", "l2", "l2sq")
+
+
+def arm_vel_cost(qvel, norm: str = "l1") -> float:
+    """The smoothness term's cost of the arm joint velocities: l1 sum |q|, l2 |q|_2, l2sq sum q^2."""
+    q = np.asarray(qvel, dtype=np.float64)
+    if norm == "l1":
+        return float(np.abs(q).sum())
+    if norm == "l2":
+        return float(np.linalg.norm(q))
+    if norm == "l2sq":
+        return float(q @ q)
+    raise ValueError(f"smooth_norm must be one of {SMOOTH_NORMS}, got {norm!r}")
+
+
+def step_terms(cfg: RewardCfg, *, d: float, d_star: float, attempt: bool, dv: float, speed: float,
+               qvel_cost: float, bonus_frac: float | None = None) -> tuple[dict, float]:
+    """Reward terms of one step and the velocity match q_v (computed for diagnostics even when not paid).
+
+    d_star: the closest keypoint distance before this step.
+    qvel_cost: arm_vel_cost of the arm joint velocities (in cfg.smooth_norm).
+    bonus_frac: fraction of reach_goal_bonus paid this step. None (pose + velocity): q_v on the attempt, else 0.
+    """
+    q_v = velocity_match(dv, speed, cfg.sigma_v_frac)
+    if bonus_frac is None:
+        bonus_frac = q_v if attempt else 0.0
+    terms = {
+        "keypoint": cfg.keypoint_rew_scale * max(d_star - d, 0.0),
+        "smooth": -cfg.arm_vel_penalty * qvel_cost,
+        "bonus": cfg.reach_goal_bonus * bonus_frac,
+    }
+    return terms, q_v
+
+
+def track_reward(traj_cfg, *, d_ref: float, dv_ref: float, speed: float, speed_min: float) -> float:
+    """goal_mode "trajectory": per-step reward for tracking the reference (replaces the keypoint progress term).
+
+    d_ref: keypoint pose distance to the reference sample (m); dv_ref: |v_head - v_ref| (m/s); speed: |v_g|.
+    """
+    sigma_v = traj_cfg.sigma_vel_frac * max(speed, speed_min, 1e-6)
+    return float(traj_cfg.w_pos * np.exp(-d_ref / traj_cfg.sigma_pos) + traj_cfg.w_vel * np.exp(-dv_ref / sigma_v))
 
 
 def grasp_potential(cfg: RewardCfg, *, reach_dist: float, n_tip_contacts: int, n_tips: int, hand_contact: bool,
                     lift: float, holding: bool) -> float:
-    """Phi(s): how far along the reach -> touch -> lift sequence the hand is.
-
-    Used as potential-based shaping (gamma*Phi(s') - Phi(s)), so improving it is rewarded once and
-    merely maintaining it is not; losing it (e.g. a drop) is penalized by the same amount.
-    """
+    """Phi(s) for physical grip: how far along the reach -> touch -> lift sequence the hand is."""
     # Reach saturates once held so that a held tool is never worse than a hovering hand.
     reach = cfg.w_reach if holding else cfg.w_reach * (1.0 - np.tanh(5.0 * reach_dist))
     contact = cfg.w_contact * n_tip_contacts / max(n_tips, 1)
     lift_term = cfg.w_lift * float(np.clip(lift / cfg.lift_scale, 0.0, 1.0)) if hand_contact else 0.0
     return float(reach + contact + lift_term)
-
-
-def goal_potential(cfg: RewardCfg, *, holding: bool, dp_norm: float, phase_d: float) -> float:
-    """Phi_goal(s): closeness of the held tool's head to the goal.
-
-    wide  ~ position only, informative from far away
-    tight ~ position + velocity + axis together (phase distance D)
-    Used as potential-based shaping, so hovering near the goal earns nothing; only approaching does.
-    """
-    if not holding:
-        return 0.0
-    return float(cfg.w_goal_wide * np.exp(-dp_norm / cfg.goal_wide_scale) + cfg.w_goal_tight * np.exp(-phase_d))
-
-
-def step_reward(cfg: RewardCfg, *, phi: float, phi_prev: float, phi_goal: float, phi_goal_prev: float,
-                progress: float, action: np.ndarray, prev_action: np.ndarray, arm_qvel: np.ndarray,
-                robot_env_contact: bool) -> dict:
-    terms = {}
-    # 1-2. Reach / touch / lift, as potential-based shaping.
-    terms["grasp_shaping"] = cfg.shaping_gamma * phi - phi_prev
-    # 3. Goal attraction while holding, as potential-based shaping.
-    terms["goal_shaping"] = cfg.shaping_gamma * phi_goal - phi_goal_prev
-    # 4. Closest-approach progress (sums to D_start - D_min over an episode).
-    terms["progress"] = cfg.w_progress * progress
-    # 5. Regularizers.
-    terms["action"] = -cfg.w_action * float(np.sum(action**2))
-    terms["action_rate"] = -cfg.w_action_rate * float(np.sum((action - prev_action) ** 2))
-    terms["arm_vel"] = -cfg.w_arm_vel * float(np.sum(arm_qvel**2))
-    terms["table_contact"] = -cfg.w_table_contact if robot_env_contact else 0.0
-    return terms
-
-
-def terminal_reward(cfg: RewardCfg, *, success: bool, dropped: bool, time_frac_left: float, d_min: float) -> dict:
-    terms = {
-        "success": (cfg.success_bonus + cfg.success_time_bonus * time_frac_left) if success else 0.0,
-        "drop": -cfg.drop_penalty if dropped else 0.0,
-        # Graded credit for how close the attempt got (0 if the tool was never held).
-        "closest": cfg.closest_approach_bonus * float(np.exp(-d_min)) if np.isfinite(d_min) else 0.0,
-    }
-    return terms

@@ -11,6 +11,7 @@ the direction that must match the goal axis.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import mujoco
 import numpy as np
@@ -55,6 +56,11 @@ class ToolParams:
     head_axis: np.ndarray  # unit vector in tool frame
     mass: float
     rest_half_height: float  # height of tool origin above the table when lying flat
+    pad: Optional["PadParams"] = None  # brushes only: compliant bristle pad (tasks.py)
+    # Box heads only: a crowned striking face. A massless ellipsoid cap over the head's +x face, as wide as the face,
+    # bulging face_crown (m) beyond it at the center; 0: the flat box face.
+    face_crown: float = 0.0
+    cradle: Optional["CradleParams"] = None  # spatulas only: a ring of capsules on the blade that seats a ball (tasks.py)
 
     def features(self) -> np.ndarray:
         f = np.concatenate([
@@ -105,6 +111,31 @@ def _head_geom(kind: str, a: float, b: float, c: float):
     return np.array([r, 0.0, 0.0]), np.array([1.0, 0, 0, 0]), 4 / 3 * np.pi * r**3, r, r, r
 
 
+@dataclass
+class PadParams:
+    """Compliant bristle pad under a brush head: a box on a spring-loaded slide joint along the tool's +z."""
+    half_size: np.ndarray  # box half extents in the pad frame (x along the head's long axis, z along the tool's +z)
+    pos: np.ndarray  # pad body origin in the tool frame (the head face farthest from the handle)
+    stiffness: float  # N/m
+    damping: float  # N s/m
+    travel: float  # m of compression before the joint limit
+    friction: float
+
+
+@dataclass
+class CradleParams:
+    """A ring of capsules lying on a flat face of the head: a cradle that seats a ball (spatula + egg in tasks.py).
+    The ring's capsules are the edges of a regular n-gon whose edges are tangent to a circle of radius ring_radius;
+    the edges within open_deg / 2 of open_dir are left out (a horseshoe, open that way)."""
+    center: np.ndarray  # ring center in the tool frame, on the face
+    normal: np.ndarray  # face normal in the tool frame (unit), pointing out of the head
+    ring_radius: float  # m, from the center to each capsule's axis
+    tube_radius: float  # m, capsule radius
+    n: int = 8
+    open_dir: Optional[np.ndarray] = None  # tool frame, in the face's plane; edge 0 is centered on it
+    open_deg: float = 0.0
+
+
 def sample_tool(rng: np.random.Generator, cfg: ToolCfg) -> ToolParams:
     u = lambda lo_hi: float(rng.uniform(*lo_hi))  # noqa: E731
     handle_type = HANDLE_TYPES[rng.integers(len(HANDLE_TYPES))]
@@ -114,7 +145,19 @@ def sample_tool(rng: np.random.Generator, cfg: ToolCfg) -> ToolParams:
     a, b, c = u(cfg.head_long), u(cfg.head_short), u(cfg.head_width)
     roll = float(rng.uniform(-np.pi, np.pi))
     jx, jy = rng.uniform(-cfg.head_jitter, cfg.head_jitter, size=2)
+    return build_tool(handle_type, length, rad, aspect, head_type, layout, a, b, c, roll, (jx, jy),
+                      density=u(cfg.density), friction=u(cfg.friction), mass_range=cfg.mass,
+                      head_jitter=cfg.head_jitter)
 
+
+def build_tool(handle_type: str, length: float, rad: float, aspect: float, head_type: str, layout: str,
+               a: float, b: float, c: float, roll: float = 0.0, jitter=(0.0, 0.0), density: float = 800.0,
+               friction: float = 1.0, mass_range=(0.1, 0.6), head_jitter: float = 0.01) -> ToolParams:
+    """A tool with the given shape (sample_tool draws these at random; tasks use fixed presets).
+
+    a, b, c: the head's long, short and width half-extents. The mass is density * volume, clipped to mass_range.
+    """
+    jx, jy = jitter
     handle_size, handle_vol, handle_vert = _handle_geom(handle_type, length, rad, aspect)
     head_size, q_type, head_vol, long_h, short_h, width_h = _head_geom(head_type, a, b, c)
 
@@ -136,16 +179,16 @@ def sample_tool(rng: np.random.Generator, cfg: ToolCfg) -> ToolParams:
     head_quat = mu.quat_mul(layout_q, q_type)
 
     volume = handle_vol + head_vol
-    mass = float(np.clip(u(cfg.density) * volume, *cfg.mass))
+    mass = float(np.clip(density * volume, *mass_range))
     density = mass / volume
     # When spawned flat (see env._spawn_on_table) the head's width axis is vertical.
     head_vert = width_h if head_type in ("box", "ellipsoid") else short_h
-    rest = max(handle_vert, head_vert) + cfg.head_jitter + 0.002
+    rest = max(handle_vert, head_vert) + head_jitter + 0.002
 
     return ToolParams(
         handle_type=handle_type, handle_len=length, handle_rad=rad, handle_aspect=aspect,
         head_type=head_type, layout=layout, head_long=a, head_short=b, head_width=c, head_roll=roll,
-        density=density, friction=u(cfg.friction),
+        density=density, friction=friction,
         handle_size=handle_size, head_size=head_size, head_pos=head_pos, head_quat=head_quat,
         head_axis=mu.normalize(axis), mass=mass, rest_half_height=rest,
     )
@@ -164,5 +207,37 @@ def add_tool(spec: mujoco.MjSpec, p: ToolParams, park_pos=(0.0, 0.0, 3.0)) -> No
                   rgba=[0.55, 0.35, 0.2, 1.0], **common)
     body.add_geom(name="tool_head", type=_GEOM[p.head_type], size=list(p.head_size),
                   pos=list(p.head_pos), quat=list(p.head_quat), rgba=[0.6, 0.62, 0.68, 1.0], **common)
+    if p.face_crown > 0:
+        if p.head_type != "box":
+            raise ValueError("face_crown needs a box head")
+        # Cap centered on the face plane: its front half bulges face_crown out, the back half is inside the head.
+        body.add_geom(name="tool_face", type=_GEOM["ellipsoid"],
+                      size=[p.face_crown, p.head_size[1], p.head_size[2]],
+                      pos=list(p.head_pos + p.head_long * p.head_axis), quat=list(p.head_quat), density=0.0,
+                      friction=common["friction"], condim=common["condim"], rgba=[0.7, 0.72, 0.78, 1.0])
+    if p.cradle is not None:
+        c = p.cradle
+        nrm = mu.normalize(c.normal)
+        u = mu.normalize(c.open_dir - (c.open_dir @ nrm) * nrm) if c.open_dir is not None else mu.any_perpendicular(nrm)
+        w = np.cross(nrm, u)
+        half = c.ring_radius * np.tan(np.pi / c.n)
+        for i in range(c.n):
+            ang = 2 * np.pi * i / c.n
+            if c.open_dir is not None and np.degrees(min(ang, 2 * np.pi - ang)) < 0.5 * c.open_deg:
+                continue
+            radial = np.cos(ang) * u + np.sin(ang) * w
+            tangent = np.cross(nrm, radial)
+            pos = np.asarray(c.center) + c.ring_radius * radial + c.tube_radius * nrm
+            body.add_geom(name=f"tool_cradle{i}", type=_GEOM["capsule"], size=[c.tube_radius, half, 0.0],
+                          pos=list(pos), quat=list(mu.quat_from_two_vectors([0.0, 0, 1], tangent)), density=0.0,
+                          friction=common["friction"], condim=common["condim"], rgba=[0.5, 0.52, 0.58, 1.0])
     body.add_site(name="tool_head_center", pos=list(p.head_pos), size=[0.008, 0, 0], rgba=[1, 0.2, 0.2, 1])
     body.add_site(name="tool_handle_center", pos=[0, 0, 0], size=[0.006, 0, 0], rgba=[0.2, 0.2, 1, 1])
+    if p.pad is not None:
+        pd = p.pad
+        pad = body.add_body(name="tool_pad", pos=list(pd.pos), gravcomp=1.0)
+        pad.add_joint(name="tool_pad_slide", type=mujoco.mjtJoint.mjJNT_SLIDE, axis=[0, 0, 1],
+                      stiffness=[pd.stiffness, 0.0, 0.0], damping=pd.damping, range=[-pd.travel, 0.0],
+                      limited=mujoco.mjtLimited.mjLIMITED_TRUE)
+        pad.add_geom(name="tool_pad", type=_GEOM["box"], size=list(pd.half_size), pos=[0, 0, pd.half_size[2]],
+                     mass=0.02, friction=[pd.friction, 0.01, 0.001], condim=3, rgba=[0.85, 0.75, 0.4, 1.0])

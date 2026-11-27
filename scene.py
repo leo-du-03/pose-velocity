@@ -196,12 +196,14 @@ def build_base_spec(cfg: SceneCfg):
     offset = mu.rotate(user_quat, auto_pos) + np.asarray(cfg.hand_mount_pos, dtype=np.float64)
     mount_pos = site_pos + mu.rotate(site_quat, offset)
     frame = _find_body(arm, site_body).add_frame(pos=list(mount_pos), quat=list(mount_quat))
+    # Set the solver options on both specs before attaching: the LEAP MJCF sets its own
+    # cone/impratio, and attach() warns when parent and child options disagree.
+    for s in (arm, hand):
+        s.option.timestep = cfg.timestep
+        s.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+        s.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+        s.option.impratio = cfg.impratio
     arm.attach(hand, frame=frame, prefix=HAND_PREFIX)
-
-    arm.option.timestep = cfg.timestep
-    arm.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
-    arm.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
-    arm.option.impratio = cfg.impratio
     if cfg.gravcomp:
         for b in _all_bodies(arm):
             if b.name != "world":
@@ -271,6 +273,11 @@ def build_base_spec(cfg: SceneCfg):
     ga = wb.add_body(name="goal_axis", mocap=True)
     ga.add_geom(name="goal_axis_geom", type=_GEOM.mjGEOM_CAPSULE, size=[0.003, 0.06, 0], pos=[0, 0, 0.06],
                 rgba=[0.1, 0.4, 1.0, 0.8], **nocol)
+    # Oriented as the goal tool frame; the bar runs along the tool's handle (-z, from the head back toward the hand),
+    # which together with the head axis pins down the full goal orientation.
+    gh = wb.add_body(name="goal_handle", mocap=True)
+    gh.add_geom(name="goal_handle_geom", type=_GEOM.mjGEOM_CAPSULE, size=[0.003, 0.05, 0], pos=[0, 0, -0.05],
+                rgba=[0.95, 0.8, 0.1, 0.8], **nocol)
 
     info = RobotInfo(
         arm_joints=arm_joints,
@@ -297,10 +304,32 @@ class SceneBuilder:
         self.cfg = cfg
         self.base_spec, self.info = build_base_spec(cfg)
 
-    def compile(self, tool: ToolParams) -> mujoco.MjModel:
+    def compile(self, tool: ToolParams, weld: bool = False, fixtures=None) -> mujoco.MjModel:
+        """weld=True adds an equality "grip" (palm -> tool) and turns off hand-tool collisions.
+
+        The weld's relative pose is set at runtime (eq_data[3:10], tool pose in the palm frame, see
+        PoseVelocityEnv._weld_tool); its anchor eq_data[0:3] must stay zero.
+        fixtures: optional callable(spec) that adds extra scene objects (task fixtures) before compiling.
+        """
         spec = self._copy_base()
         add_tool(spec, tool, park_pos=(float(self.info.table_center[0]), float(self.info.table_center[1]), 3.0))
-        return spec.compile()
+        if fixtures is not None:
+            fixtures(spec)
+        if weld:
+            eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_WELD, name="grip", name1=self.info.palm_body,
+                                   name2="tool", objtype=mujoco.mjtObj.mjOBJ_BODY)
+            eq.solref = list(self.cfg.weld_solref)
+            tool_bodies = ["tool"] + [b.name for b in _find_body(spec, "tool").find_all(mujoco.mjtObj.mjOBJ_BODY)]
+            for name in self.info.robot_bodies:
+                if name.startswith(HAND_PREFIX):
+                    for tb in tool_bodies:
+                        spec.add_exclude(bodyname1=name, bodyname2=tb)
+        m = spec.compile()
+        if weld:
+            m.eq_data[0, :] = 0.0
+            m.eq_data[0, 6] = 1.0  # identity quaternion until the grasp is set
+            m.eq_data[0, 10] = 1.0  # torquescale
+        return m
 
     def _copy_base(self) -> mujoco.MjSpec:
         try:
@@ -338,12 +367,12 @@ def _main():
     print(f"tool: handle={t.handle_type} L={t.handle_len:.3f} r={t.handle_rad:.3f} head={t.head_type} "
           f"layout={t.layout} mass={t.mass:.3f}kg")
     g = env.goal
-    print(f"goal: p={np.round(g.p, 3)} v={np.round(g.v, 3)} axis={np.round(g.axis, 3)}")
+    print(f"goal: p={np.round(g.p, 3)} v={np.round(g.v, 3)} axis={np.round(g.axis, 3)} quat={np.round(g.quat, 3)}")
     print(f"reset kind: {info['reset_kind']}  reach voxels: {len(env.reach.keys)}")
     if args.view:
         from mujoco import viewer  # `import mujoco.viewer` here would shadow the module-level mujoco
 
-        print("Opening viewer: green sphere = goal point, red arrow = goal velocity, blue = goal head axis.")
+        print("Opening viewer: green sphere = goal point, red arrow = goal velocity, blue = goal head axis, yellow = goal handle direction.")
         viewer.launch(env.model, env.data)
 
 

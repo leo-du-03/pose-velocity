@@ -1,17 +1,30 @@
-"""PoseVelocityEnv: grasp a random tool and pass its head through a goal pose at a goal velocity.
+"""PoseVelocityEnv: move a held tool so its head passes through a goal point at a goal velocity and axis.
 
-Episode rules
--------------
-* terminated: success (head passes through the goal with matching velocity and axis while held),
-  or drop (tool released for `drop_no_contact_steps`, hits the floor, or is knocked away).
+Grip modes (EnvCfg.grip_mode)
+-----------------------------
+* weld      (Stage A) the tool is welded to the palm at a sampled grasp, fingers are frozen and only the
+            arm is controlled. Goals are sampled from arm configurations, so every goal is reachable.
+* physical  the tool starts on the table or in a scripted grasp and must be grasped and held by the hand.
+
+Episode rules (one episode = one goal = one attempt)
+-----------------------------------------------------
+* terminated: the head crosses the goal plane (through p_g, normal v_hat, going forward) within
+  pass_radius of p_g: a "pass". It is a success if the crossing distance, the velocity error and the
+  orientation error (full rotation angle to the goal orientation) are all within the curriculum tolerances. Physical grip also terminates on a drop.
+  Also terminated (as failures): a push on the table/pedestal/floor over table_force_limit, or (head_twist) an IK
+  failure: the arm can't follow the commanded head twist to within ik_fail_tol.
 * truncated: time limit (`max_steps`) or physics divergence.
+* Pose-only baseline (EnvCfg.goal_velocity False): the goal velocity is dropped from the observation and the
+  reward. pose_success "touch": the first step within the keypoint tolerance succeeds and terminates. "hold"
+  (SimToolReal): success and termination after success_steps steps within it, the bonus paid per near step.
 * The arm is never re-homed between episodes (except on the very first reset, an explicit
   `reset(seed=...)` / `options={"full": True}`, or after physics divergence).
 
 Reset kinds (reported in info["reset_kind"]):
   soft     tool still held: keep the full physics state, resample only the goal.
-  respawn  tool not held: new random tool, rebuild model, copy robot state across, place tool.
-  full     re-home the arm, then respawn.
+  regrip   weld: new random tool and grasp every `regrip_every` goals; the arm stays where it is.
+  respawn  physical, tool not held: new random tool, rebuild model, copy robot state across, place tool.
+  full     re-home the arm, then a new tool (and grasp, for weld).
 
 Observations are a flat float32 vector (actor). Privileged critic features are returned in
 info["priv"] on every reset/step.
@@ -19,6 +32,7 @@ info["priv"] on every reset/step.
 from __future__ import annotations
 
 import functools
+import threading
 from typing import Optional
 
 import gymnasium as gym
@@ -28,11 +42,12 @@ from gymnasium import spaces
 from gymnasium.utils import seeding
 
 import mathutils as mu
-from config import EnvCfg
-from goals import Goal, GoalSampler, ReachMap, segment_point_distance
-from rewards import goal_potential, grasp_potential, phase_distance, step_reward, terminal_reward
+from config import EnvCfg, TrajCfg, check_goal_mode
+from goals import Goal, GoalSampler, ReachMap, plane_crossing
+from rewards import arm_vel_cost, grasp_potential, keypoint_distance, keypoint_offsets, step_terms, track_reward
 from scene import SceneBuilder
 from tool_gen import ToolParams, sample_tool
+from traces import Trace
 
 OBJ = mujoco.mjtObj
 
@@ -47,6 +62,36 @@ class PoseVelocityEnv(gym.Env):
     def __init__(self, cfg: Optional[EnvCfg] = None, render_mode: Optional[str] = None):
         super().__init__()
         self.cfg = cfg or EnvCfg()
+        if self.cfg.grip_mode not in ("weld", "physical"):
+            raise ValueError(f"grip_mode must be 'weld' or 'physical', got {self.cfg.grip_mode!r}")
+        if self.cfg.action_mode not in ("head_twist", "joint", "joint_vel"):
+            raise ValueError(f"action_mode must be 'head_twist', 'joint' or 'joint_vel', got {self.cfg.action_mode!r}")
+        if self.cfg.pose_success not in ("hold", "touch"):
+            raise ValueError(f"pose_success must be 'hold' or 'touch', got {self.cfg.pose_success!r}")
+        self.weld = self.cfg.grip_mode == "weld"
+        # Pose-only baseline (goal_velocity False): "hold" counts near steps (SimToolReal), "touch" ends on the first.
+        self.pose_hold = (not self.cfg.goal_velocity) and self.cfg.pose_success == "hold"
+        # Goal-velocity ablations (EnvCfg.velocity_obs / velocity_reward / pose_chain; getattr for older configs).
+        self.vel_obs = self.cfg.goal_velocity and getattr(self.cfg, "velocity_obs", True)
+        self.vel_reward = self.cfg.goal_velocity and getattr(self.cfg, "velocity_reward", True)
+        self.chain_n = int(getattr(self.cfg, "pose_chain", 0))
+        arm_vel_cost(np.zeros(1), getattr(self.cfg.reward, "smooth_norm", "l1"))  # ValueError on an unknown norm
+        if self.chain_n < 0:
+            raise ValueError(f"pose_chain must be >= 0, got {self.chain_n}")
+        if self.chain_n and (self.cfg.goal_velocity or self.cfg.pose_success != "touch"):
+            raise ValueError("pose_chain needs the pose-only baseline with pose_success 'touch'")
+        check_goal_mode(self.cfg)
+        # goal_mode "trajectory": a time-indexed reference into each goal (_build_reference). Named ref / ref_q, not
+        # trace / task_t, which TaskEnv uses for its task traces.
+        self.traj_mode = getattr(self.cfg, "goal_mode", "points") == "trajectory"
+        self.tcfg: TrajCfg = getattr(self.cfg, "traj", None) or TrajCfg()
+        self.ref: Optional[Trace] = None
+        self.ref_q = self.ref_qd = None  # (N, n_arm) joint reference and its velocity
+        self.ref_goal_idx = 0  # sample index at p_g
+        self.ref_fallback = False
+        self.sub_goals: list = []  # pose_chain: the current goal's sub-goals (self.goal is sub_goals[sub_idx])
+        self.sub_idx, self.t_sub, self.sub_budget = 0, 0, [float(self.cfg.max_steps)]
+        self.goal_full: Optional[Goal] = None  # the sampled goal (self.goal is its current sub-goal with pose_chain)
         self.render_mode = render_mode
         self._np_random, _ = seeding.np_random(self.cfg.seed)
         self.builder = SceneBuilder(self.cfg.scene)
@@ -56,11 +101,14 @@ class PoseVelocityEnv(gym.Env):
         self.data: Optional[mujoco.MjData] = None
         self._viewer = None
         self._viewer_model = None
+        self._viewer_thread: Optional[threading.Thread] = None
         self._renderer = None
         self._render_model = None
         self._forced_reset_kind: Optional[str] = "full"
+        self.goals_with_grip = 0
+        self._oracle = None
 
-        self.tool: ToolParams = sample_tool(self.np_random, self.cfg.tool)
+        self.tool: ToolParams = self._new_tool()
         self._load_model(self.tool, preserve=False)
         self._set_home(noise=False)
 
@@ -69,11 +117,16 @@ class PoseVelocityEnv(gym.Env):
                                      n_samples=self.cfg.goal.reach_samples, voxel=self.cfg.goal.reach_voxel)
         self.goal_sampler = GoalSampler(self.cfg.goal, self.rinfo, self.reach)
 
-        self.n_act = len(self.act_ids)
+        self.n_act = self.n_arm_act + (0 if self.weld else len(self.hand_jids))
         self.action_space = spaces.Box(-1.0, 1.0, (self.n_act,), np.float32)
+        self.prev_action = np.zeros(self.n_act)
+        self._a_filt = np.zeros(self.n_act)
+        self._ctrl_ref = None  # (arm targets, arm joints) at the last _apply_action
+        if self.weld:
+            self._weld_tool()
         self._update_contacts()
-        self._init_episode_state(keep_grasp=False)
-        self.start_type = "table"
+        self._init_episode_state(keep_grasp=self.weld)
+        self.start_type = "full" if self.weld else "table"
         self._sample_goal()
         obs = self._get_obs()
         self.observation_space = spaces.Box(-np.inf, np.inf, obs.shape, np.float32)
@@ -82,8 +135,9 @@ class PoseVelocityEnv(gym.Env):
     # ------------------------------------------------------------------ model management
     def _load_model(self, tool: ToolParams, preserve: bool) -> None:
         saved = self._save_robot_state() if (preserve and self.model is not None) else None
-        self.model = self.builder.compile(tool)
+        self.model = self.builder.compile(tool, weld=self.weld, fixtures=self._add_fixtures)
         self.data = mujoco.MjData(self.model)
+        self._scratch = mujoco.MjData(self.model)  # for goal sampling FK / collision checks
         self._index_model()
         if saved is not None:
             self._restore_robot_state(saved)
@@ -91,6 +145,13 @@ class PoseVelocityEnv(gym.Env):
             self.targets = self.data.qpos[self.act_qadr].copy()
             self.data.ctrl[self.act_ids] = self.targets
         mujoco.mj_forward(self.model, self.data)
+
+    def _new_tool(self) -> ToolParams:
+        """The tool for a new model (a random one here; task envs use a fixed tool)."""
+        return sample_tool(self.np_random, self.cfg.tool)
+
+    def _add_fixtures(self, spec) -> None:
+        """Hook for extra scene objects, added to each compiled model (none here; see tasks.TaskEnv)."""
 
     def _index_model(self) -> None:
         m, ri = self.model, self.rinfo
@@ -124,6 +185,14 @@ class PoseVelocityEnv(gym.Env):
         self.ctrl_lo, self.ctrl_hi = np.array(lo), np.array(hi)
         self.act_scale = np.array([self.cfg.arm_action_scale] * self.n_arm_act
                                   + [self.cfg.hand_action_scale] * len(self.hand_jids))
+        # Position servos are PD: force = kp*(target - q) - kv*qdot. With target = q + (kv/kp)*dq the force is
+        # kv*(dq - qdot), i.e. a velocity servo toward dq. Falls back to one control step if not a PD servo.
+        dt_ctrl = m.opt.timestep * self.cfg.frame_skip
+        lead = []
+        for a in self.act_ids[:self.n_arm_act]:
+            kp, kv = float(m.actuator_gainprm[a, 0]), -float(m.actuator_biasprm[a, 2])
+            lead.append(kv / kp if kp > 0 and kv > 0 else dt_ctrl)
+        self.arm_lead = np.array(lead)
         hlo, hhi = self.ctrl_lo[self.n_arm_act:], self.ctrl_hi[self.n_arm_act:]
         self.hand_open = np.clip(0.0, hlo, hhi)
         symmetric = np.abs(hlo + hhi) < 0.2 * (hhi - hlo)  # e.g. finger abduction joints
@@ -138,6 +207,7 @@ class PoseVelocityEnv(gym.Env):
                 self.finger_of_body[name2id(OBJ.mjOBJ_BODY, n)] = fi
         self.hand_body_set = {i for i in range(m.nbody) if m.body(i).name.startswith("hand/")}
         self.robot_body_set = {name2id(OBJ.mjOBJ_BODY, n) for n in ri.robot_bodies} - {-1}
+        self.arm_body_set = self.robot_body_set - self.hand_body_set
 
         self.tool_id = name2id(OBJ.mjOBJ_BODY, "tool")
         tool_jnt = name2id(OBJ.mjOBJ_JOINT, "tool_free")
@@ -148,10 +218,12 @@ class PoseVelocityEnv(gym.Env):
         self.table_gid = name2id(OBJ.mjOBJ_GEOM, "table")
         self.floor_gid = name2id(OBJ.mjOBJ_GEOM, "floor")
         self.env_geoms = {self.table_gid, self.floor_gid, name2id(OBJ.mjOBJ_GEOM, "pedestal")}
+        self.grip_eq = name2id(OBJ.mjOBJ_EQUALITY, "grip") if self.weld else -1
 
         self.goal_mocap = int(m.body_mocapid[name2id(OBJ.mjOBJ_BODY, "goal")])
         self.goal_vel_mocap = int(m.body_mocapid[name2id(OBJ.mjOBJ_BODY, "goal_vel")])
         self.goal_axis_mocap = int(m.body_mocapid[name2id(OBJ.mjOBJ_BODY, "goal_axis")])
+        self.goal_handle_mocap = int(m.body_mocapid[name2id(OBJ.mjOBJ_BODY, "goal_handle")])
         self.goal_vel_gid = name2id(OBJ.mjOBJ_GEOM, "goal_vel_geom")
 
     def _save_robot_state(self) -> dict:
@@ -233,6 +305,56 @@ class PoseVelocityEnv(gym.Env):
                 break
         self._settle(self.cfg.settle_time)
 
+    def _grip_frame(self):
+        """Grip center and handle direction for the hand's current finger pose, in the palm frame.
+
+        Center: halfway between the palm and the mean fingertip. Direction: across the fingers, i.e.
+        perpendicular to both the thumb -> fingers and palm -> fingertips directions.
+        """
+        d = self.data
+        tips = d.xpos[self.tip_ids]
+        thumb, others = tips[-1], tips[:-1].mean(0)
+        palm = d.xpos[self.palm_id]
+        center = 0.5 * (palm + tips.mean(0))
+        axis = np.cross(others - thumb, tips.mean(0) - palm)
+        if np.linalg.norm(axis) < 1e-6:
+            axis = mu.any_perpendicular(tips.mean(0) - palm)
+        R = d.xmat[self.palm_id].reshape(3, 3)
+        return R.T @ (center - palm), mu.normalize(R.T @ axis)
+
+    def _sample_grasp(self, center, axis):
+        """Random tool pose in the palm frame: handle along +-axis, slid along it, random roll."""
+        rng = self.np_random
+        axis = axis if rng.random() < 0.5 else -axis  # head on either side of the hand
+        slide = rng.uniform(-self.cfg.grasp_slide, self.cfg.grasp_slide) * 0.5 * self.tool.handle_len
+        quat = mu.quat_mul(mu.quat_from_two_vectors([0, 0, 1], axis), mu.yaw_quat(rng.uniform(-np.pi, np.pi)))
+        return center - slide * axis, quat
+
+    def _weld_tool(self) -> None:
+        """Freezes the fingers closed and welds a new grasp of the current tool to the palm.
+
+        Grasps whose tool touches the arm, table or floor are resampled (up to 20 times).
+        """
+        d = self.data
+        self._set_hand_targets(self.hand_closed)
+        d.qpos[self.hand_qadr] = self.hand_closed
+        d.qvel[self.hand_dadr] = 0.0
+        mujoco.mj_forward(self.model, d)
+        center, axis = self._grip_frame()
+        palm_p, palm_q = d.xpos[self.palm_id].copy(), d.xquat[self.palm_id].copy()
+        for _ in range(20):
+            rel_p, rel_q = self._sample_grasp(center, axis)
+            self._set_tool_pose(palm_p + mu.rotate(palm_q, rel_p), mu.quat_mul(palm_q, rel_q))
+            mujoco.mj_forward(self.model, d)
+            self._update_contacts()
+            if not (self._tool_touches_robot() or self.c_tool_table or self.c_tool_floor):
+                break
+        self.grasp_pos, self.grasp_quat = rel_p, rel_q
+        self.model.eq_data[self.grip_eq, 3:6] = rel_p
+        self.model.eq_data[self.grip_eq, 6:10] = rel_q
+        mujoco.mj_forward(self.model, d)
+        self.goals_with_grip = 0
+
     def _spawn_in_hand(self) -> bool:
         """Scripted grasp: open hand, place the handle between thumb and fingers, close, release."""
         rng, d = self.np_random, self.data
@@ -259,7 +381,7 @@ class PoseVelocityEnv(gym.Env):
         return self._grasp_condition()
 
     def _place_tool(self) -> str:
-        """Places the new tool; returns "in_hand" or "table" (where it actually started)."""
+        """Places the new tool (physical grip); returns "in_hand" or "table" (where it actually started)."""
         p_hand = _lerp(self.cfg.curriculum.start_in_hand_prob, self.level)
         if self.np_random.random() < p_hand and self._spawn_in_hand():
             return "in_hand"
@@ -282,7 +404,8 @@ class PoseVelocityEnv(gym.Env):
         self.tip_contact = np.zeros(self.n_tips)  # per finger: any link of that finger touches the tool
         self.tip_force = np.zeros(self.n_tips)
         self.palm_contact = 0.0  # any hand body that isn't part of a finger chain
-        self.c_hand_tool = self.c_tool_table = self.c_tool_floor = self.c_robot_env = False
+        self.c_hand_tool = self.c_tool_table = self.c_tool_floor = False
+        self.c_arm_env = self.c_hand_env = False
         f6 = np.zeros(6)
         g1s, g2s = d.contact.geom1, d.contact.geom2
         for i in range(d.ncon):
@@ -303,8 +426,34 @@ class PoseVelocityEnv(gym.Env):
                     self.c_tool_table = True
                 elif other_g == self.floor_gid:
                     self.c_tool_floor = True
-            elif (b1 in self.robot_body_set and g2 in self.env_geoms) or (b2 in self.robot_body_set and g1 in self.env_geoms):
-                self.c_robot_env = True
+            elif g1 in self.env_geoms or g2 in self.env_geoms:
+                other_b = b2 if g1 in self.env_geoms else b1
+                if other_b in self.hand_body_set:
+                    self.c_hand_env = True
+                elif other_b in self.arm_body_set:
+                    self.c_arm_env = True
+
+    def _env_contact(self) -> bool:
+        """Contact that costs reward: anything hitting the table/floor/pedestal with weld; arm links only for
+        physical grip (the hand has to touch the table to pick the tool up)."""
+        if self.weld:
+            return self.c_arm_env or self.c_hand_env or self.c_tool_table or self.c_tool_floor
+        return self.c_arm_env
+
+    def _env_contact_force(self) -> float:
+        """Net normal force of the contacts _env_contact counts: robot or tool on the table, pedestal or floor
+        (physical grip: arm links only)."""
+        m, d = self.model, self.data
+        pushers = (self.robot_body_set | {self.tool_id}) if self.weld else self.arm_body_set
+        f6, total = np.zeros(6), 0.0
+        for i in range(d.ncon):
+            g1, g2 = int(d.contact.geom1[i]), int(d.contact.geom2[i])
+            if g1 in self.env_geoms or g2 in self.env_geoms:
+                other = int(m.geom_bodyid[g2 if g1 in self.env_geoms else g1])
+                if other in pushers:
+                    mujoco.mj_contactForce(m, d, i, f6)
+                    total += abs(float(f6[0]))
+        return total
 
     def _tool_lift(self) -> float:
         return float(self.data.xpos[self.tool_id][2] - self._tool_rest_z())
@@ -314,8 +463,13 @@ class PoseVelocityEnv(gym.Env):
 
         Counts power grasps (tool squeezed against the palm by the fingers) as well as pinch grasps.
         """
+        if self.weld:
+            return True
         parts = float(self.tip_contact.sum() + self.palm_contact)
         return bool(parts >= self.cfg.grasp_min_parts and self._tool_lift() >= self.cfg.lift_threshold)
+
+    def _holding(self) -> bool:
+        return self.weld or (self.ever_grasped and self.c_hand_tool)
 
     def _head_state(self):
         m, d = self.model, self.data
@@ -325,11 +479,46 @@ class PoseVelocityEnv(gym.Env):
         axis = d.xmat[self.tool_id].reshape(3, 3) @ self.tool.head_axis
         return head, vel6[3:].copy(), vel6[:3].copy(), axis
 
+    def _tool_quat(self) -> np.ndarray:
+        return self.data.xquat[self.tool_id].copy()
+
+    def _rot_error(self) -> np.ndarray:
+        """World-frame rotation vector from the tool's orientation to the goal orientation (angle = its norm)."""
+        return mu.quat_error(self.goal.quat, self._tool_quat())
+
     def _physics_ok(self, bad_before: int) -> bool:
         d = self.data
         bad = int(d.warning[int(mujoco.mjtWarning.mjWARN_BADQACC)].number)
         return (bad == bad_before and np.all(np.isfinite(d.qpos)) and np.all(np.isfinite(d.qvel))
                 and float(np.max(np.abs(d.qvel))) < 1e3)
+
+    # ------------------------------------------------------------------ control
+    def _head_jacobian(self) -> np.ndarray:
+        """6 x n_arm Jacobian of the head (as a point rigidly attached to the palm): rows linear, then angular."""
+        m, d = self.model, self.data
+        jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
+        mujoco.mj_jac(m, d, jacp, jacr, d.site_xpos[self.head_site], self.palm_id)
+        return np.vstack([jacp[:, self.arm_dadr], jacr[:, self.arm_dadr]])
+
+    def _twist_dq(self, a: np.ndarray) -> np.ndarray:
+        """Arm joint velocities (damped least squares, unclipped) that move the head at the twist action a."""
+        J = self._head_jacobian()
+        twist = np.concatenate([a[:3] * self.cfg.head_v_max, a[3:6] * self.cfg.head_w_max])
+        lam2 = self.cfg.ik_damping ** 2
+        self._ik_J, self._ik_twist = J, twist  # for _ik_residual, after the targets are clipped to the joint limits
+        return J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), twist)
+
+    def _head_twist_targets(self, a: np.ndarray) -> np.ndarray:
+        """Arm targets that drive the head (as a point rigidly attached to the palm) at the commanded twist."""
+        dq = np.clip(self._twist_dq(a), -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
+        return self.data.qpos[self.arm_qadr] + dq * self.arm_lead
+
+    def _ik_residual(self) -> float:
+        """How far the clipped arm targets fall short of the commanded head twist, in action units (the linear part
+        over head_v_max, the angular part over head_w_max): 0 when the arm can follow the command exactly."""
+        dq = (self.targets[:self.n_arm_act] - self.data.qpos[self.arm_qadr]) / self.arm_lead
+        scale = np.repeat([self.cfg.head_v_max, self.cfg.head_w_max], 3)
+        return float(np.linalg.norm((self._ik_J @ dq - self._ik_twist) / scale))
 
     # ------------------------------------------------------------------ goals / curriculum
     def set_curriculum(self, level: float) -> None:
@@ -341,16 +530,338 @@ class PoseVelocityEnv(gym.Env):
         return (_lerp(cc.eps_p, self.level), _lerp(cc.eps_v_frac, self.level) * self.goal.speed,
                 np.deg2rad(_lerp(cc.eps_theta_deg, self.level)))
 
+    def eps_kp(self) -> float:
+        """Keypoint pose distance (m) within which the head makes its attempt at the goal."""
+        return _lerp(self.cfg.curriculum.eps_kp, self.level)
+
+    def kp_distance(self, head=None) -> float:
+        """Keypoint pose distance between the tool (keypoints around the head) and the goal pose."""
+        head = self.data.site_xpos[self.head_site] if head is None else head
+        return keypoint_distance(head, self._tool_quat(), self.goal.p, self.goal.quat,
+                                 keypoint_offsets(self.cfg.reward))
+
+    # Goal sampling works on a scratch MjData: the arm at a candidate q, the tool placed by the weld grasp.
+    def _scratch_pose(self, q: np.ndarray):
+        """Kinematics at arm joints q with the welded tool; returns (head_pos, head_axis, tool_quat, palm_pos)."""
+        m, sd = self.model, self._scratch
+        sd.qpos[:] = self.data.qpos
+        sd.qpos[self.arm_qadr] = q
+        mujoco.mj_kinematics(m, sd)
+        palm_p, palm_q = sd.xpos[self.palm_id].copy(), sd.xquat[self.palm_id].copy()
+        sd.qpos[self.tool_qadr:self.tool_qadr + 3] = palm_p + mu.rotate(palm_q, self.grasp_pos)
+        sd.qpos[self.tool_qadr + 3:self.tool_qadr + 7] = mu.quat_mul(palm_q, self.grasp_quat)
+        mujoco.mj_kinematics(m, sd)
+        axis = sd.xmat[self.tool_id].reshape(3, 3) @ self.tool.head_axis
+        return sd.site_xpos[self.head_site].copy(), axis, sd.xquat[self.tool_id].copy(), palm_p
+
+    def _scratch_collides(self) -> bool:
+        """Robot or tool touches the table/floor/pedestal, or the tool touches the arm (after _scratch_pose)."""
+        m, sd = self.model, self._scratch
+        mujoco.mj_collision(m, sd)
+        for i in range(sd.ncon):
+            g1, g2 = int(sd.contact.geom1[i]), int(sd.contact.geom2[i])
+            b1, b2 = int(m.geom_bodyid[g1]), int(m.geom_bodyid[g2])
+            if g1 in self.env_geoms or g2 in self.env_geoms:
+                other = b2 if g1 in self.env_geoms else b1
+                if other in self.robot_body_set or other == self.tool_id:
+                    return True
+            elif (b1 == self.tool_id and b2 in self.arm_body_set) or (b2 == self.tool_id and b1 in self.arm_body_set):
+                return True
+        return False
+
+    def _propose_goal_q(self, rng: np.random.Generator):
+        """Random collision-free arm configuration near the current pose (or home), with the welded tool.
+
+        Returns (q, head_pos, head_axis, tool_quat, palm_pos), or None if it collides.
+        """
+        if rng.random() < self.cfg.goal.goal_q_home_prob:
+            center = np.asarray(self.cfg.scene.arm_home[: self.n_arm_act], dtype=np.float64)
+        else:
+            center = self.data.qpos[self.arm_qadr]
+        q = np.clip(center + rng.normal(0.0, self._goal_q_std, self.n_arm_act),
+                    self.arm_range[:, 0], self.arm_range[:, 1])
+        head, axis, quat, palm = self._scratch_pose(q)
+        if self._scratch_collides():
+            return None
+        return q, head, axis, quat, palm
+
+    def _ik_reachable(self, q0: np.ndarray, target: np.ndarray, target_quat: np.ndarray, iters: int = 30) -> bool:
+        """Damped-least-squares IK from q0 for the head at `target` with the tool at orientation `target_quat`; True
+        if it converges (3 mm, ~1 deg) to a collision-free configuration within the joint limits."""
+        return self._ik_solve(q0, target, target_quat, iters) is not None
+
+    def _ik_solve(self, q0: np.ndarray, target: np.ndarray, target_quat: np.ndarray,
+                  iters: int = 30, pos_tol: float = 3e-3, rot_tol: float = 0.02) -> Optional[np.ndarray]:
+        """Like _ik_reachable, but returns the arm configuration it converged to (or None)."""
+        m, sd = self.model, self._scratch
+        q = np.asarray(q0, dtype=np.float64).copy()
+        jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
+        lam2 = self.cfg.ik_damping ** 2
+        for _ in range(iters):
+            head, _, quat, _ = self._scratch_pose(q)
+            e = np.concatenate([target - head, mu.quat_error(target_quat, quat)])
+            if np.linalg.norm(e[:3]) < pos_tol and np.linalg.norm(e[3:]) < rot_tol:
+                return None if self._scratch_collides() else q
+            mujoco.mj_comPos(m, sd)  # mj_jac needs cdof / subtree_com, which mj_kinematics doesn't compute
+            mujoco.mj_jac(m, sd, jacp, jacr, head, self.palm_id)
+            J = np.vstack([jacp[:, self.arm_dadr], jacr[:, self.arm_dadr]])
+            dq = J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), e)
+            q = np.clip(q + np.clip(dq, -0.3, 0.3), self.arm_range[:, 0], self.arm_range[:, 1])
+        return None
+
+    def _rehome_weld(self) -> None:
+        """Teleports the arm to home (with noise), keeping the grasp: the welded tool moves with the palm."""
+        d = self.data
+        q = np.asarray(self.cfg.scene.arm_home[: self.n_arm_act], dtype=np.float64)
+        q = q + self.np_random.uniform(-self.cfg.home_noise, self.cfg.home_noise, size=q.shape)
+        d.qpos[self.arm_qadr] = np.clip(q, self.arm_range[:, 0], self.arm_range[:, 1])
+        d.qvel[:] = 0.0
+        self.targets = np.clip(d.qpos[self.act_qadr], self.ctrl_lo, self.ctrl_hi)
+        d.ctrl[self.act_ids] = self.targets
+        mujoco.mj_kinematics(self.model, d)
+        palm_p, palm_q = d.xpos[self.palm_id].copy(), d.xquat[self.palm_id].copy()
+        self._set_tool_pose(palm_p + mu.rotate(palm_q, self.grasp_pos), mu.quat_mul(palm_q, self.grasp_quat))
+        mujoco.mj_forward(self.model, d)
+        self.prev_action[:] = 0.0
+        self._a_filt[:] = 0.0
+        self._prev_head = d.site_xpos[self.head_site].copy()  # the head jumped; don't count it as motion
+
+    def _sample_weld_goal(self, speed_max: float, vel_cone: float) -> Optional[Goal]:
+        for std_scale in (1.0, 0.5):  # a tighter joint spread finds goals in cramped postures
+            self._goal_q_std = self.cfg.goal.goal_q_std * std_scale
+            goal = self.goal_sampler.sample_from_grasp(self.np_random, speed_max, vel_cone, self._propose_goal_q,
+                                                       self._ik_reachable)
+            if goal is not None:
+                return goal
+        return None
+
     def _sample_goal(self) -> None:
         speed_max = _lerp(self.cfg.curriculum.speed_max, self.level)
-        self.goal: Goal = self.goal_sampler.sample(self.np_random, speed_max)
+        vel_cone = _lerp(self.cfg.curriculum.vel_cone_deg, self.level)
+        goal = None
+        self.goal_recovery = 0  # weld: 0 found near the current pose, 1 after re-homing, 2 after a new grasp too
+        if self.weld:
+            # Goals near the current pose; if none are reachable (an awkward posture), re-home the arm, then also
+            # try a new grasp. A weld goal is therefore always reachable with the current grasp: there is no way
+            # to dodge goals by parking the arm somewhere they can't be sampled.
+            goal = self._sample_weld_goal(speed_max, vel_cone)
+            if goal is None:
+                self.goal_recovery = 1
+                self._rehome_weld()
+                goal = self._sample_weld_goal(speed_max, vel_cone)
+            if goal is None:
+                self.goal_recovery = 2
+                self._weld_tool()
+                self._prev_head = self.data.site_xpos[self.head_site].copy()
+                goal = self._sample_weld_goal(speed_max, vel_cone)
+        # Last resort (never seen in testing for weld): the grasp-agnostic region sampler; may be unreachable.
+        self.goal_fallback = goal is None and self.weld
+        if goal is None:
+            goal = self.goal_sampler.sample(self.np_random, speed_max, vel_cone, self.tool.head_axis)
+        if self.traj_mode:
+            goal = self._sample_reference(goal, speed_max, vel_cone)
+        self.goal: Goal = goal
+        self.goal_full = goal
+        if self.chain_n:
+            self._build_chain(goal)
         self._update_goal_markers()
-        h, v, _, a = self._head_state()
-        self.d_start = phase_distance(h - self.goal.p, v - self.goal.v, mu.angle_between(a, self.goal.axis),
-                                      self.cfg.reward)
-        # Re-baseline the goal potential against the new goal: a goal change itself earns nothing.
-        self.phi_goal_prev = goal_potential(self.cfg.reward, holding=self.ever_grasped and self.c_hand_tool,
-                                            dp_norm=float(np.linalg.norm(h - self.goal.p)), phase_d=self.d_start)
+
+    # ------------------------------------------------------------------ trajectory goals (goal_mode "trajectory")
+    def _sample_reference(self, goal: Goal, speed_max: float, vel_cone: float, goal_tries: int = 4) -> Goal:
+        """Builds the reference into `goal`; if no valid one exists, tries other goals near the current pose. The
+        last resort keeps the last goal with an unchecked reference (no detour; ref_fallback)."""
+        self.ref_fallback = False
+        for _ in range(goal_tries - 1):
+            if self._build_reference(goal):
+                return goal
+            nxt = self._sample_weld_goal(speed_max, vel_cone) if self.weld else None
+            if nxt is None:
+                break
+            goal = nxt
+        if not self._build_reference(goal):
+            self._build_reference(goal, strict=False)
+            self.ref_fallback = True
+        return goal
+
+    def _build_reference(self, goal: Goal, strict: bool = True) -> bool:
+        """Time-indexed reference (one sample per control step, sample 0 = now) into the goal, in arm joint space.
+
+        1. Lead-in and follow-through: the head on the line p_g + s v_hat at v_g, the tool in the goal orientation,
+           solved by IK sample by sample (warm-started outward from the goal's joints q_ref).
+        2. Approach: a quintic from the current joints and joint velocity (zero acceleration) to the lead-in start
+           at its joint velocity, plus a random detour sin^3(pi tau) (c1 + c2 cos(pi tau)) that vanishes with its
+           first two derivatives at both ends.
+        3. Checks: joint limits, joint speeds within joint_v_max, no collisions (every check_every samples), the head
+           above the table. Up to TrajCfg.tries detours are drawn, then one without.
+        Returns False if no candidate passes (strict), or stores the last candidate anyway (not strict).
+        """
+        tc, gc, rng = self.tcfg, self.cfg.goal, self.np_random
+        dt = self.model.opt.timestep * self.cfg.frame_skip
+        q0 = self.data.qpos[self.arm_qadr].copy()
+        qd0 = self.data.qvel[self.arm_dadr].copy()
+        vmax = self._joint_v_max()
+        lo, hi = self.arm_range[:, 0], self.arm_range[:, 1]
+
+        q_goal = goal.q_ref
+        if q_goal is None:  # region-sampler fallback goal: no stored joints
+            q_goal = self._ik_solve(q0, goal.p, goal.quat, iters=100)
+        if q_goal is None:
+            return False if strict else self._set_hold_reference()
+        # 1. The straight part, tightly solved: the joint velocity is a finite difference of these solutions.
+        speed = max(goal.speed, 1e-6)
+        n_lead = max(1, int(round(gc.lead_in / (speed * dt))))
+        n_ft = max(1, int(round(gc.follow_through / (speed * dt))))
+        ik = functools.partial(self._ik_solve, iters=30, pos_tol=2e-4, rot_tol=2e-3)
+        back, q = [], np.asarray(q_goal, dtype=np.float64)
+        q_g = ik(q, goal.p, goal.quat)
+        if q_g is None:
+            return False if strict else self._set_hold_reference()
+        q = q_g
+        for k in range(1, n_lead + 1):
+            q = ik(q, goal.p - k * dt * goal.v, goal.quat)
+            if q is None:
+                return False if strict else self._set_hold_reference()
+            back.append(q)
+        fwd, q = [], q_g
+        for k in range(1, n_ft + 1):  # the follow-through may end early (it is after the attempt)
+            q = ik(q, goal.p + k * dt * goal.v, goal.quat)
+            if q is None:
+                break
+            fwd.append(q)
+        line = np.array(back[::-1] + [q_g] + fwd)
+        n_line = len(line)
+        k_line = np.arange(-n_lead, n_line - n_lead)
+        line_p = goal.p + (k_line * dt)[:, None] * goal.v
+        qd_line = np.gradient(line, dt, axis=0) if n_line > 1 else np.zeros_like(line)
+        q1, v1 = line[0], qd_line[0]
+
+        # 2. The approach.
+        dq = q1 - q0
+        T = max(tc.t_min, 1.875 * float(np.max(np.abs(dq) / (tc.qd_frac * vmax))))
+        bump_std = _lerp(tc.bump_rad, self.level)
+        cand = None
+        for attempt in range(tc.tries + 1):
+            std = bump_std if attempt < tc.tries else 0.0
+            n_app = int(round(T * rng.uniform(*tc.t_jitter) / dt))
+            n_app = min(max(n_app, 2), self.cfg.max_steps - n_line)
+            if n_app < 2:
+                return False if strict else self._set_hold_reference()
+            Ta = n_app * dt
+            tau = (np.arange(n_app) / n_app)[:, None]
+            t3, t4, t5 = tau ** 3, tau ** 4, tau ** 5
+            h00, h01 = 1 - 10 * t3 + 15 * t4 - 6 * t5, 10 * t3 - 15 * t4 + 6 * t5
+            h10, h11 = tau - 6 * t3 + 8 * t4 - 3 * t5, -4 * t3 + 7 * t4 - 3 * t5
+            app = h00 * q0 + h10 * (Ta * qd0) + h01 * q1 + h11 * (Ta * v1)
+            if std > 0:
+                c1, c2 = rng.normal(0.0, std, (2, self.n_arm_act))
+                app = app + np.sin(np.pi * tau) ** 3 * (c1 + c2 * np.cos(np.pi * tau))
+            q_all = np.vstack([app, line])
+            qd_all = np.gradient(q_all, dt, axis=0)
+            qd_all[0] = qd0
+            qd_all[n_app:] = qd_line
+            cand = (q_all, qd_all, n_app, line_p, n_lead)
+            if self._reference_ok(goal, q_all, qd_all, n_app, lo, hi, vmax):
+                self._store_reference(goal, *cand)
+                return True
+        if strict:
+            return False
+        self._store_reference(goal, *cand)
+        return True
+
+    def _reference_ok(self, goal: Goal, q_all, qd_all, n_app, lo, hi, vmax) -> bool:
+        """Joint limits and speeds on every sample; on the approach (the straight part was checked by the IK): table
+        clearance, collisions (every check_every samples), and staying out of the attempt region. An approach that
+        sweeps within eps_kp of the goal pose would make the attempt there, before lining up on the lead-in, so
+        it must keep 1.5 x eps_kp away (margin for tracking error)."""
+        if np.any(q_all < lo - 1e-6) or np.any(q_all > hi + 1e-6):
+            return False
+        if np.any(np.abs(qd_all[1:]) > vmax):
+            return False
+        min_z = self.rinfo.table_top + self.tcfg.min_clearance
+        step = max(1, int(self.tcfg.check_every))
+        offsets, keep_out = keypoint_offsets(self.cfg.reward), 1.5 * self.eps_kp()
+        for k in range(1, n_app):
+            head, _, quat, _ = self._scratch_pose(q_all[k])
+            if head[2] < min_z or keypoint_distance(head, quat, goal.p, goal.quat, offsets) < keep_out:
+                return False
+            if (k % step == 0 or k == n_app - 1) and self._scratch_collides():
+                return False
+        return True
+
+    def _store_reference(self, goal: Goal, q_all, qd_all, n_app, line_p, n_lead) -> None:
+        """FK of the approach, the exact line on the straight part; velocities by finite differences (the line's are
+        v_g, sample 0's the measured head velocity)."""
+        dt = self.model.opt.timestep * self.cfg.frame_skip
+        n = len(q_all)
+        p, quat = np.empty((n, 3)), np.empty((n, 4))
+        for k in range(n_app):
+            p[k], _, quat[k], _ = self._scratch_pose(q_all[k])
+        p[n_app:] = line_p
+        quat[n_app:] = goal.quat
+        v = np.gradient(p, dt, axis=0) if n > 1 else np.zeros((n, 3))
+        v[n_app:] = goal.v
+        v[0] = self._head_state()[1]
+        w = np.zeros((n, 3))
+        for k in range(1, n_app):
+            w[k] = mu.quat_error(quat[k + 1], quat[k - 1]) / (2 * dt)
+        self.ref = Trace(dt=dt, p=p, quat=quat, v=v, w=w, phase=np.zeros(n, np.int64), force_target=np.zeros(n),
+                         meta={"head_axis_tool": self.tool.head_axis.tolist()})
+        self.ref_q, self.ref_qd = q_all, qd_all
+        self.ref_goal_idx = n_app + n_lead
+
+    def _set_hold_reference(self) -> bool:
+        """Last resort: a one-sample reference that holds the current pose (the goal is unreachable from here)."""
+        dt = self.model.opt.timestep * self.cfg.frame_skip
+        head = self.data.site_xpos[self.head_site].copy()
+        self.ref = Trace(dt=dt, p=head[None], quat=self._tool_quat()[None], v=np.zeros((1, 3)), w=np.zeros((1, 3)),
+                         phase=np.zeros(1, np.int64), force_target=np.zeros(1),
+                         meta={"head_axis_tool": self.tool.head_axis.tolist()})
+        self.ref_q = self.data.qpos[self.arm_qadr].copy()[None]
+        self.ref_qd = np.zeros((1, self.n_arm_act))
+        self.ref_goal_idx = 0
+        return True
+
+    def ref_sample(self, k: int):
+        """Reference (head position, head velocity, tool orientation, arm joints, joint velocity) at step k; past the
+        end it holds the last pose at rest."""
+        n = len(self.ref)
+        if k < n:
+            return self.ref.p[k], self.ref.v[k], self.ref.quat[k], self.ref_q[k], self.ref_qd[k]
+        return self.ref.p[-1], np.zeros(3), self.ref.quat[-1], self.ref_q[-1], np.zeros(self.n_arm_act)
+
+    def _ref_obs(self, head: np.ndarray, lin: np.ndarray) -> list:
+        rp, rv, rq, rjq, rjqd = self.ref_sample(self.t)
+        out = [rp - head, rv - lin, rv, mu.quat_error(rq, self._tool_quat())]
+        for j in self.tcfg.preview:
+            pj, vj, _, _, _ = self.ref_sample(self.t + int(j))
+            out += [pj - head, vj]
+        if self.tcfg.joint_obs:
+            out += [rjq - self.data.qpos[self.arm_qadr], rjqd / self._joint_v_max()]
+        return out
+
+    def _build_chain(self, goal: Goal) -> None:
+        """pose_chain: sub-goal 0 at the lead-in point (untimed approach), then chain_n more along the strike line, the
+        last at p_g, all in the goal orientation and carrying v_g (pose-only never observes it; diagnostics use it).
+        Sub-goal k > 0 is due spacing / |v_g| after the previous one; sub-goal 0 gets the rest of max_steps."""
+        n, lead = self.chain_n, self.cfg.goal.lead_in
+        d = goal.direction
+        start = goal.p - lead * d
+        self.sub_goals = [Goal(p=start + (k * lead / n) * d, v=goal.v.copy(), quat=goal.quat, axis=goal.axis,
+                               q_ref=goal.q_ref if k == n else None) for k in range(n + 1)]
+        dt = self.model.opt.timestep * self.cfg.frame_skip
+        due = max(1.0, lead / n / max(goal.speed, 1e-6) / dt)
+        first = max(1.0, self.cfg.max_steps - n * self.cfg.pose_chain_slack * due)
+        self.sub_budget = [first] + [due] * n
+        self.sub_idx, self.t_sub = 0, 0
+        self.goal = self.sub_goals[0]
+
+    def chain_tol(self) -> float:
+        """pose_chain: keypoint distance that reaches an intermediate sub-goal; at most half their spacing, so
+        consecutive sub-goals stay distinct at loose curriculum tolerances. The last one uses eps_kp."""
+        return min(self.eps_kp(), 0.5 * self.cfg.goal.lead_in / self.chain_n)
+
+    def lead_point(self) -> np.ndarray:
+        return self.goal.p - self.cfg.goal.lead_in * self.goal.direction
 
     def _update_goal_markers(self) -> None:
         m, d, g = self.model, self.data, self.goal
@@ -359,28 +870,40 @@ class PoseVelocityEnv(gym.Env):
         d.mocap_quat[self.goal_vel_mocap] = mu.quat_from_two_vectors([0, 0, 1], g.direction)
         d.mocap_pos[self.goal_axis_mocap] = g.p
         d.mocap_quat[self.goal_axis_mocap] = mu.quat_from_two_vectors([0, 0, 1], g.axis)
+        d.mocap_pos[self.goal_handle_mocap] = g.p
+        d.mocap_quat[self.goal_handle_mocap] = g.quat  # the tool frame: its z is the handle direction
         half = 0.05 + 0.15 * g.speed  # arrow length scales with target speed
         m.geom_size[self.goal_vel_gid][1] = half
         m.geom_pos[self.goal_vel_gid][2] = half
+        if not self.cfg.goal_velocity:
+            m.geom_rgba[self.goal_vel_gid][3] = 0.0  # pose-only: the goal velocity is not part of the task
         mujoco.mj_forward(m, d)
 
     # ------------------------------------------------------------------ gym API
     def _init_episode_state(self, keep_grasp: bool) -> None:
         self.t = 0
-        self.prev_action = np.zeros(self.n_act) if hasattr(self, "n_act") else np.zeros(len(self.act_ids))
-        self._a_filt = np.zeros_like(self.prev_action)
         self.ever_grasped = bool(keep_grasp)
         self.no_contact = 0
-        self.d_best = np.inf
+        self.d_best = np.inf  # closest head-to-goal distance while holding (m)
         self.closest: dict = {}
+        self.pass_info: dict = {}
+        self.kp_best: Optional[float] = None  # closest keypoint pose distance while holding (the reward's d*)
+        self.near_steps = 0  # pose-only "hold": steps within the keypoint tolerance this episode
+        self.table_force = 0.0
         self.ep_return = 0.0
         self.ep_terms: dict = {}
+        self.ep_motion = {"qvel_l1": 0.0, "qvel_l2": 0.0, "qvel_l2sq": 0.0, "qvel_peak": 0.0, "qacc": 0.0, "da": 0.0}
+        self._prev_qvel = None
         self.diverged = False
+        self.d_ref = 0.0  # trajectory: keypoint distance to the reference sample now
+        self.track_err_sum = 0.0
         self._prev_head = self.data.site_xpos[self.head_site].copy()
         # Phi is continuous across a soft reset (same physical state), so shaping telescopes across episodes.
-        self.phi_prev = self._grasp_potential(self.ever_grasped and self.c_hand_tool)
+        self.phi_prev = self._grasp_potential(self._holding())
 
     def _grasp_potential(self, holding: bool) -> float:
+        if self.weld:
+            return 0.0
         tips = self.data.xpos[self.tip_ids]
         reach_dist = float(np.mean(np.linalg.norm(tips - self.data.site_xpos[self.handle_site], axis=1)))
         return grasp_potential(self.cfg.reward, reach_dist=reach_dist,
@@ -397,163 +920,438 @@ class PoseVelocityEnv(gym.Env):
             kind = options["kind"]
         elif self._forced_reset_kind is not None:
             kind = self._forced_reset_kind
+        elif self.weld:
+            kind = "regrip" if self.goals_with_grip >= self.cfg.regrip_every else "soft"
         else:
             kind = "soft" if (self.ever_grasped and self.c_hand_tool) else "respawn"
         self._forced_reset_kind = None
 
-        keep_grasp = False
         if kind == "soft":
-            keep_grasp = self.ever_grasped and self.c_hand_tool
+            keep_grasp = self._holding()
             start = "soft"
         else:
-            self.tool = sample_tool(self.np_random, self.cfg.tool)
-            self._load_model(self.tool, preserve=(kind == "respawn"))
-            if kind == "full":
+            self.tool = self._new_tool()
+            rehome = kind == "full" or (kind == "regrip" and self.cfg.regrip_rehome)
+            self._load_model(self.tool, preserve=not rehome)
+            if rehome:
                 self._set_home(noise=True)
+                self.prev_action[:] = 0.0
+                self._a_filt[:] = 0.0
             else:
                 self._hold_robot_pose()
-            start = self._place_tool()
+            if self.weld:
+                self._weld_tool()
+                start = kind
+            else:
+                start = self._place_tool()
             self._update_contacts()
             keep_grasp = self._grasp_condition()
         self._update_contacts()
         self._init_episode_state(keep_grasp)
-        self.start_type = start  # "soft" (continuing, tool still held), "in_hand" or "table"
+        self.start_type = start  # "soft", "regrip" or "full" (weld); "soft", "in_hand" or "table" (physical)
         self._sample_goal()
         info = {"priv": self._get_priv(), "reset_kind": kind}
         self._last_obs = self._get_obs()
         return self._last_obs, info
 
-    def step(self, action):
-        cfg, rc = self.cfg, self.cfg.reward
+    def _apply_action(self, action) -> np.ndarray:
+        """Smooths the action (EMA) and sets the actuator targets from it; returns the smoothed action."""
+        cfg = self.cfg
         a = np.clip(np.asarray(action, dtype=np.float64).reshape(-1), -1.0, 1.0)
         if cfg.action_ema > 0:
             a = cfg.action_ema * self._a_filt + (1.0 - cfg.action_ema) * a
             self._a_filt = a
-        self.targets = np.clip(self.targets + a * self.act_scale, self.ctrl_lo, self.ctrl_hi)
+        na = self.n_arm_act
+        if cfg.action_mode == "head_twist":
+            self.targets[:na] = self._head_twist_targets(a[:na])
+        elif cfg.action_mode == "joint_vel":
+            dq = np.clip(a[:na] * self._joint_v_max(), -cfg.max_joint_speed, cfg.max_joint_speed)
+            self.targets[:na] = self.data.qpos[self.arm_qadr] + dq * self.arm_lead
+        else:
+            self.targets[:na] = self.targets[:na] + a[:na] * self.act_scale[:na]
+        if not self.weld:
+            self.targets[na:] = self.targets[na:] + a[na:] * self.act_scale[na:]
+        self.targets = np.clip(self.targets, self.ctrl_lo, self.ctrl_hi)
         self.data.ctrl[self.act_ids] = self.targets
+        # The arm joints when these targets were set: prev_twist reads the commanded joint velocity off them.
+        self._ctrl_ref = (self.targets[:na].copy(), self.data.qpos[self.arm_qadr].copy())
+        self.ik_error =self._ik_residual() if cfg.action_mode == "head_twist" else 0.0
+        return a
+
+    def _physics_step(self) -> None:
+        """One control step of physics (task envs step substep by substep to measure contact forces)."""
+        mujoco.mj_step(self.model, self.data, nstep=self.cfg.frame_skip)
+
+    def step(self, action):
+        cfg, rc = self.cfg, self.cfg.reward
+        a = self._apply_action(action)
         prev_head = self._prev_head
         bad_before = int(self.data.warning[int(mujoco.mjtWarning.mjWARN_BADQACC)].number)
 
-        mujoco.mj_step(self.model, self.data, nstep=cfg.frame_skip)
+        self._physics_step()
         self.t += 1
 
         if not self._physics_ok(bad_before):
             self.diverged = True
             self._forced_reset_kind = "full"
             info = {"priv": np.zeros(self.priv_dim, np.float32), "success": False, "dropped": False,
-                    "diverged": True}
-            info["episode"] = self._episode_info(success=False, dropped=False, kind="full")
+                    "passed": False, "diverged": True}
+            info["episode"] = self._episode_info(success=False, dropped=False, passed=False, kind="full")
             return self._last_obs, 0.0, False, True, info
 
         self._update_contacts()
         head, lin, ang, axis = self._head_state()
         g = self.goal
         dp, dv = head - g.p, lin - g.v
-        theta = mu.angle_between(axis, g.axis)
-        phase_d = phase_distance(dp, dv, theta, rc)
+        theta = float(np.linalg.norm(self._rot_error()))
 
         if self._grasp_condition():
             self.ever_grasped = True
-        holding = self.ever_grasped and self.c_hand_tool
-        self.no_contact = 0 if self.c_hand_tool else self.no_contact + 1
+        holding = self._holding()
+        self.no_contact = 0 if (self.c_hand_tool or self.weld) else self.no_contact + 1
 
-        progress = 0.0
-        if holding:
-            if np.isfinite(self.d_best):
-                progress = max(0.0, self.d_best - phase_d)
-            if phase_d < self.d_best:
-                # Error components at the closest approach (diagnostics only).
-                self.closest = {"dp": float(np.linalg.norm(dp)), "dv": float(np.linalg.norm(dv)),
-                                "dv_frac": float(np.linalg.norm(dv) / max(g.speed, 1e-6)),
-                                "theta_deg": float(np.degrees(theta))}
-            self.d_best = min(self.d_best, phase_d)
+        if holding and np.linalg.norm(dp) < self.d_best:
+            self.d_best = float(np.linalg.norm(dp))
+            # Error components at the closest approach (diagnostics only).
+            self.closest = {"dp": self.d_best, "dv_frac": float(np.linalg.norm(dv) / max(g.speed, 1e-6)),
+                            "theta_deg": float(np.degrees(theta))}
 
         eps_p, eps_v, eps_th = self.tolerances()
-        seg_d = segment_point_distance(prev_head, head, g.p)
         held_ok = holding or not cfg.success_requires_grasp
-        success = bool(held_ok and seg_d < eps_p and np.linalg.norm(dv) < eps_v and theta < eps_th)
+        dv_norm = float(np.linalg.norm(dv))
+        d_kp = self.kp_distance(head)
+        near = bool(held_ok and d_kp <= self.eps_kp())
+        first_near = near and not self.pass_info
+        bonus_frac = None  # pose + velocity: q_v on the attempt (rewards.step_terms)
+        advanced = False  # pose_chain: reached an intermediate sub-goal this step
+        if self.chain_n:
+            self.t_sub += 1
+            if self.sub_idx < self.chain_n:
+                near = bool(held_ok and d_kp <= self.chain_tol())
+                first_near = False
+        if cfg.goal_velocity:
+            # The attempt: the first step within the keypoint tolerance (position and orientation). The episode ends
+            # there; it is a success if the head also moves at the goal velocity.
+            attempt = near
+            success = bool(attempt and dv_norm < eps_v)
+            if not self.vel_reward:  # ablation: flat bonus, velocity still decides success
+                bonus_frac = 1.0 if attempt else 0.0
+        elif self.pose_hold:
+            # SimToolReal: success after success_steps near steps (not necessarily consecutive), bonus per near step.
+            self.near_steps += int(near)
+            attempt = first_near  # diagnostics only
+            success = self.near_steps >= cfg.success_steps
+            bonus_frac = 1.0 / cfg.success_steps if near else 0.0
+        elif self.chain_n and self.sub_idx < self.chain_n:
+            # pose_chain: an intermediate sub-goal; reaching it moves on to the next (no bonus, no termination).
+            attempt = success = False
+            bonus_frac = 0.0
+            advanced = near
+        else:  # pose-only "touch": the first near step succeeds and ends the episode
+            attempt = success = near
+            bonus_frac = 1.0 if near else 0.0
+        passed = success if self.pose_hold else attempt
+        d_perp = plane_crossing(prev_head, head, g.p, g.direction)  # goal-plane crossing (diagnostics only)
+        lost = False
+        if self.traj_mode:
+            rp, rv, rq, _, _ = self.ref_sample(self.t)
+            self.d_ref = keypoint_distance(head, self._tool_quat(), rp, rq, keypoint_offsets(rc))
+            dv_ref = float(np.linalg.norm(lin - rv))
+            self.track_err_sum += self.d_ref
+            lost = bool(self.tcfg.lost_dist > 0 and not passed and self.d_ref > self.tcfg.lost_dist)
 
-        tool_z = self.data.xpos[self.tool_id][2]
-        lost = (self.c_tool_floor or tool_z < self.rinfo.table_top - 0.1
-                or np.linalg.norm(self.data.xpos[self.tool_id][:2]) > 1.5)
-        dropped = bool(not success and (lost or (self.ever_grasped and self.no_contact >= cfg.drop_no_contact_steps)))
+        dropped = False
+        if not self.weld:
+            tool_z = self.data.xpos[self.tool_id][2]
+            lost = (self.c_tool_floor or tool_z < self.rinfo.table_top - 0.1
+                    or np.linalg.norm(self.data.xpos[self.tool_id][:2]) > 1.5)
+            dropped = bool(not passed and (lost or (self.ever_grasped
+                                                    and self.no_contact >= cfg.drop_no_contact_steps)))
 
-        phi = self._grasp_potential(holding)
-        phi_goal = goal_potential(rc, holding=holding, dp_norm=float(np.linalg.norm(dp)), phase_d=phase_d)
-        terms = step_reward(
-            rc, phi=phi, phi_prev=self.phi_prev, phi_goal=phi_goal, phi_goal_prev=self.phi_goal_prev,
-            progress=progress, action=a, prev_action=self.prev_action,
-            arm_qvel=self.data.qvel[self.arm_dadr], robot_env_contact=self.c_robot_env)
-        self.phi_prev = phi
-        self.phi_goal_prev = phi_goal
+        self.table_force = self._env_contact_force()
+        pushed = bool(self.table_force > rc.table_force_limit)
+        # The arm can't follow the commanded head twist (singularity or joint limits): a failure, like a push.
+        ik_failed = bool(cfg.ik_fail_tol > 0 and not passed and self.ik_error > cfg.ik_fail_tol)
+        terminated = passed or dropped or pushed or ik_failed or lost
+        late = bool(self.chain_n and self.sub_idx > 0 and not advanced
+                    and self.t_sub >= cfg.pose_chain_slack * self.sub_budget[self.sub_idx])
+        truncated = (not terminated) and (self.t >= cfg.max_steps or late)
 
-        terminated = success or dropped
-        truncated = (not terminated) and self.t >= cfg.max_steps
-        if terminated or truncated:
-            terms.update(terminal_reward(rc, success=success, dropped=dropped,
-                                         time_frac_left=1.0 - self.t / cfg.max_steps, d_min=self.d_best))
+        # Keypoint progress counts only while holding (an empty hand moving the tool is no progress).
+        if holding:
+            d_star = d_kp if self.kp_best is None else self.kp_best
+            self.kp_best = min(d_star, d_kp)
+        else:
+            d_star = d_kp
+        # Motion diagnostics, the same whatever the reward's norm: joint speed, acceleration and action change.
+        qv = self.data.qvel[self.arm_dadr].copy()
+        m = self.ep_motion
+        m["qvel_l1"] += float(np.abs(qv).sum())
+        m["qvel_l2"] += float(np.linalg.norm(qv))
+        m["qvel_l2sq"] += float(qv @ qv)
+        m["qvel_peak"] = max(m["qvel_peak"], float(np.abs(qv).max()))
+        if self._prev_qvel is not None:
+            m["qacc"] += float(np.linalg.norm(qv - self._prev_qvel)) / (self.model.opt.timestep * cfg.frame_skip)
+            m["da"] += float(np.linalg.norm(a - self.prev_action))
+        self._prev_qvel = qv
+        terms, q_v = step_terms(rc, d=d_kp, d_star=d_star, attempt=attempt, dv=dv_norm, speed=g.speed,
+                                qvel_cost=arm_vel_cost(qv, getattr(rc, "smooth_norm", "l1")), bonus_frac=bonus_frac)
+        if self.traj_mode:  # tracking the reference replaces the keypoint progress toward the goal
+            del terms["keypoint"]
+            terms["track"] = track_reward(self.tcfg, d_ref=self.d_ref, dv_ref=dv_ref, speed=g.speed,
+                                          speed_min=cfg.goal.speed_min)
+        if attempt:
+            v_along = float(lin @ g.direction)
+            v_side = float(np.linalg.norm(lin - v_along * g.direction))
+            s = max(g.speed, 1e-6)
+            self.pass_info = {"d_kp": d_kp, "q_v": q_v, "dp": float(np.linalg.norm(dp)), "dv_frac": dv_norm / s,
+                              "v_along_frac": v_along / s, "v_side_frac": v_side / s,
+                              "theta_deg": float(np.degrees(theta)),
+                              # Angle between the goal velocity and the goal head axis: 0 = strike, 90 = swipe.
+                              "swipe_deg": float(np.degrees(mu.angle_between(g.v, g.axis))),
+                              "speed": g.speed, "down": bool(g.direction[2] <= cfg.goal.down_max_z)}
+        if not self.weld:
+            phi = self._grasp_potential(holding)
+            terms["grasp"] = phi - self.phi_prev
+            self.phi_prev = phi
+            terms["drop"] = -rc.drop_penalty if dropped else 0.0
+
         reward = float(sum(terms.values()))
         self.ep_return += reward
         for k, v in terms.items():
             self.ep_terms[k] = self.ep_terms.get(k, 0.0) + float(v)
 
+        if advanced and not (terminated or truncated):
+            self.sub_idx += 1
+            self.goal = self.sub_goals[self.sub_idx]
+            self.t_sub, self.kp_best = 0, None
+            self._update_goal_markers()
+
         self.prev_action = a
         self._prev_head = head
         obs = self._get_obs()
         self._last_obs = obs
-        info = {"priv": self._get_priv(), "success": success, "dropped": dropped, "holding": holding,
-                "seg_dist": seg_d, "phase_dist": phase_d}
+        info = {"priv": self._get_priv(), "success": success, "dropped": dropped, "passed": passed,
+                "holding": holding, "d_perp": d_perp, "d_kp": d_kp, "pushed": pushed, "ik_failed": ik_failed}
+        if self.traj_mode:
+            info.update(lost=lost, d_ref=self.d_ref)
         if terminated or truncated:
-            kind = "respawn" if dropped else ("soft" if holding else "respawn")
+            self.goals_with_grip += 1
+            if self.weld:
+                kind = "regrip" if self.goals_with_grip >= cfg.regrip_every else "soft"
+            else:
+                kind = "respawn" if dropped else ("soft" if holding else "respawn")
             self._forced_reset_kind = kind
-            info["episode"] = self._episode_info(success=success, dropped=dropped, kind=kind)
+            info["episode"] = self._episode_info(success=success, dropped=dropped, passed=passed, kind=kind,
+                                                 pushed=pushed, ik_failed=ik_failed)
+            if self.traj_mode:
+                info["episode"].update(lost=float(lost), track_err=self.track_err_sum / max(self.t, 1),
+                                       ref_fallback=float(self.ref_fallback))
         if self.render_mode == "human":
             self.render()
         return obs, reward, terminated, truncated, info
 
-    def _episode_info(self, success: bool, dropped: bool, kind: str) -> dict:
+    def _episode_info(self, success: bool, dropped: bool, passed: bool, kind: str, pushed: bool = False,
+                      ik_failed: bool = False) -> dict:
         return {"return": self.ep_return, "length": self.t, "success": float(success), "dropped": float(dropped),
-                "d_min": float(self.d_best) if np.isfinite(self.d_best) else float("nan"),
+                "passed": float(passed), "pushed": float(pushed), "ik_failed": float(ik_failed), "near_steps": self.near_steps,
+                "d_kp_min": float(self.kp_best) if self.kp_best is not None else float("nan"), "d_min": float(self.d_best) if np.isfinite(self.d_best) else float("nan"),
                 "ever_grasped": float(self.ever_grasped), "diverged": float(self.diverged),
-                "next_reset": kind, "level": self.level, "terms": dict(self.ep_terms),
-                "start": self.start_type, "closest": dict(self.closest)}
+                "goal_fallback": float(self.goal_fallback), "goal_recovery": float(self.goal_recovery),
+                "next_reset": kind, "level": self.level,
+                "terms": dict(self.ep_terms), "motion": self._motion_info(), "start": self.start_type, "closest": dict(self.closest),
+                "pass": dict(self.pass_info)}
+
+    def _motion_info(self) -> dict:
+        """Per-step means over the episode: arm |qdot|_1, |qdot|_2 (rad/s), sum qdot^2 (rad^2/s^2), |qddot|_2
+        (rad/s^2) and |a_t - a_t-1|_2 (action units, smoothed actions); and the peak |qdot| of any arm joint."""
+        m, n = self.ep_motion, max(self.t, 1)
+        return {"qvel_l1": m["qvel_l1"] / n, "qvel_l2": m["qvel_l2"] / n, "qvel_l2sq": m["qvel_l2sq"] / n,
+                "qvel_peak": m["qvel_peak"],
+                "qacc": m["qacc"] / max(n - 1, 1), "da": m["da"] / max(n - 1, 1)}
 
     # ------------------------------------------------------------------ observations
     def _get_obs(self) -> np.ndarray:
         d, g = self.data, self.goal
         palm = d.xpos[self.palm_id]
+        R_palm = d.xmat[self.palm_id].reshape(3, 3)
+        R_tool = d.xmat[self.tool_id].reshape(3, 3)
         head, lin, ang, axis = self._head_state()
-        holding = self.ever_grasped and self.c_hand_tool
-        obs = np.concatenate([
-            d.qpos[self.arm_qadr], d.qvel[self.arm_dadr],
-            d.qpos[self.hand_qadr], d.qvel[self.hand_dadr],
-            self.prev_action,
-            palm, mu.rot6d(d.xmat[self.palm_id]),
-            (d.xpos[self.tip_ids] - palm).ravel(),
-            self.tip_contact, [self.palm_contact],
-            head, mu.rot6d(d.xmat[self.tool_id]), lin, ang,
-            d.site_xpos[self.handle_site] - palm,
+        parts = [d.qpos[self.arm_qadr], d.qvel[self.arm_dadr]]
+        if not self.weld:
+            parts += [d.qpos[self.hand_qadr], d.qvel[self.hand_dadr]]
+        parts += [self.prev_action]
+        if self.cfg.action_mode == "joint":
+            # Joint actions move the servo targets, which then lead the joints; the gap drives the arm.
+            parts.append(self.targets[:self.n_arm_act] - d.qpos[self.arm_qadr])
+        if self.cfg.action_mode == "joint_vel" and self.cfg.kin_obs:
+            parts.append(self._kin_features(head, lin))
+        parts += [palm, mu.rot6d(R_palm)]
+        if not self.weld:
+            parts += [(d.xpos[self.tip_ids] - palm).ravel(), self.tip_contact, [self.palm_contact]]
+        eps_p, eps_v, eps_th = self.tolerances()
+        parts += [
+            head, mu.rot6d(R_tool), lin, ang,
+            # Tool pose in the palm frame (for weld this is the grasp).
+            R_palm.T @ (d.xpos[self.tool_id] - palm), mu.rot6d(R_palm.T @ R_tool),
             self.tool.features(),
-            g.p, g.v, g.axis,
-            head - g.p, lin - g.v, np.cross(axis, g.axis), [float(np.dot(axis, g.axis))],
-            [float(holding), float(self._grasp_condition()), 1.0 - self.t / self.cfg.max_steps],
-        ])
-        return obs.astype(np.float32)
+        ]
+        if self.vel_obs:
+            parts += [
+                g.p, g.v, mu.rot6d(mu.quat_to_mat(g.quat)),
+                head - g.p, lin - g.v, self._rot_error(),
+                self.lead_point() - head,
+                [eps_p, eps_v, eps_th],
+            ]
+        else:  # pose-only: nothing that depends on the goal velocity
+            parts += [g.p, mu.rot6d(mu.quat_to_mat(g.quat)), head - g.p, self._rot_error(), [eps_p, eps_th]]
+        if not self.weld:
+            parts.append([float(self._holding()), float(self._grasp_condition())])
+        if self.traj_mode:
+            parts += self._ref_obs(head, lin)
+        if self.chain_n:  # the current sub-goal's clock (goes negative when it is late)
+            parts.append([max(-1.0, 1.0 - self.t_sub / self.sub_budget[self.sub_idx])])
+        elif self.traj_mode:  # time until the reference reaches p_g (negative after)
+            parts.append([(self.ref_goal_idx - self.t) / self.cfg.max_steps])
+        else:
+            parts.append([1.0 - self.t / self.cfg.max_steps])
+        return np.concatenate(parts).astype(np.float32)
 
     def _get_priv(self) -> np.ndarray:
         m = self.model
         priv = np.concatenate([
             [m.body_mass[self.tool_id]], m.body_ipos[self.tool_id], [self.tool.friction, self.tool.density / 1000.0],
             np.minimum(self.tip_force, 50.0) / 10.0,
-            [min(self.d_best, 20.0) / 10.0 if np.isfinite(self.d_best) else 2.0, self.level,
+            [min(self.d_best, 1.0) if np.isfinite(self.d_best) else 1.0, self.level,
              float(self.ever_grasped), min(self.no_contact, 20) / 10.0, float(self.c_tool_table), self._tool_lift()],
-        ])
+        ] + ([[self.near_steps / self.cfg.success_steps]] if self.pose_hold else [])
+          # velocity_obs False: the critic still sees v_g, so it can value the velocity-scaled bonus.
+          + ([self.goal.v] if self.cfg.goal_velocity and not self.vel_obs else [])
+          + ([[min(self.d_ref, 1.0)]] if self.traj_mode else []))
         return priv.astype(np.float32)
 
+    def oracle_action(self) -> np.ndarray:
+        """The scripted oracle's action for the current state: behavior-cloning labels (see bc.py).
+
+        The oracle is stateful (approach, then strike), so call this once per step, before stepping.
+        The oracle plans head twists; in joint mode they are converted with joint_action_for_twist.
+        goal_mode "trajectory": traces.TraceFollower on the reference (it outputs joint_vel actions itself).
+        """
+        if self.traj_mode:
+            if self._oracle is None:
+                from traces import TraceFollower
+
+                self._oracle = TraceFollower()
+            return self._oracle(self, self.ref, self.t).astype(np.float32)
+        if self._oracle is None:
+            from oracle import ChainPoseOracle, Oracle, PoseOracle
+
+            if self.cfg.goal_velocity:
+                self._oracle = Oracle()
+            else:
+                self._oracle = ChainPoseOracle() if self.chain_n else PoseOracle()
+        a = self._oracle(self)
+        if self.cfg.action_mode == "joint":
+            a = self.joint_action_for_twist(a)
+        elif self.cfg.action_mode == "joint_vel":
+            a = self.joint_vel_action_for_twist(a)
+        return a.astype(np.float32)
+
+    def _joint_v_max(self) -> np.ndarray:
+        v = np.asarray(self.cfg.joint_v_max, dtype=np.float64)
+        if v.shape != (self.n_arm_act,):
+            raise ValueError(f"joint_v_max needs {self.n_arm_act} values, got {self.cfg.joint_v_max!r}")
+        return v
+
+    def _dls_pinv(self) -> np.ndarray:
+        """Damped pseudo-inverse of the head Jacobian (the map _twist_dq applies), n_arm x 6."""
+        J = self._head_jacobian()
+        return J.T @ np.linalg.inv(J @ J.T + self.cfg.ik_damping ** 2 * np.eye(6))
+
+    def _kin_features(self, head: np.ndarray, lin: np.ndarray) -> np.ndarray:
+        """Goal errors mapped into joint space (kin_obs, joint_vel): P([x; 0]) and P([0; w]) for the parts of
+        the oracle's twist, P = DLS pseudo-inverse of the head Jacobian over joint_v_max. P is linear, so the oracle's
+        joint velocity is close to a weighted sum of these, its gains, caps and strike blend as the weights; the policy
+        learns that weighting instead of the IK. Pose-only drops the goal-velocity terms. All of it is computable on a
+        real robot from its kinematics and the grasp."""
+        g = self.goal
+        P = self._dls_pinv() / self._joint_v_max()[:, None]
+        if self.traj_mode:  # the reference's feedback and feedforward terms (what TraceFollower combines)
+            rp, rv, rq, _, _ = self.ref_sample(self.t)
+            cols = [P[:, :3] @ x for x in (rp - head, rv, lin - rv)]
+            return np.concatenate(cols + [P[:, 3:] @ mu.quat_error(rq, self._tool_quat())])
+        lin_terms = [self.lead_point() - head if self.vel_obs else g.p - head]
+        if self.vel_obs:
+            rel = head - g.p
+            lin_terms += [g.v, rel - (rel @ g.direction) * g.direction, lin - g.v]
+        cols = [P[:, :3] @ x for x in lin_terms] + [P[:, 3:] @ self._rot_error()]
+        return np.concatenate(cols)
+
+    def joint_vel_action_for_twist(self, twist_action: np.ndarray) -> np.ndarray:
+        """joint_vel arm action for a head-twist action: the DLS joint velocity over joint_v_max (unsmoothed, so the
+        env's EMA smooths it as head_twist smooths the twist; they differ only by how much J changes in the EMA's
+        ~5-step window). No EMA inversion, so the label is a smooth function of the state."""
+        dq = self._twist_dq(np.clip(np.asarray(twist_action, dtype=np.float64)[:6], -1.0, 1.0))
+        dq = np.clip(dq, -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
+        return np.clip(dq / self._joint_v_max(), -1.0, 1.0)
+
+    def _commanded_dq(self) -> np.ndarray:
+        """The arm joint velocity the servo targets command (joint mode): (targets - q0) / lead.
+
+        Targets q0 + lead * dq make the PD servos a velocity servo toward dq (see _index_model), with q0 the joints
+        when the targets were set. q0 is not observed, but q - qvel * dt matches it to ~2% (targets - q is in the
+        joint-mode observation), so oracle labels are nearly a function of what the policy sees. The labels smooth
+        from this value, which multiplies a gain error by 1 / (1 - action_ema) = 5, hence q0 itself.
+        """
+        d, na = self.data, self.n_arm_act
+        ref = self._ctrl_ref
+        # Resets set the targets to the current joints (no command); then ref is stale and q0 = q gives dq = 0.
+        q0 = ref[1] if ref is not None and np.array_equal(ref[0], self.targets[:na]) else d.qpos[self.arm_qadr]
+        return (self.targets[:na] - q0) / self.arm_lead
+
+    def prev_twist(self) -> np.ndarray:
+        """The last step's smoothed head-twist command in action units (lin / head_v_max, ang / head_w_max).
+
+        head_twist: the previous action. joint: the head twist of the commanded joint velocity (_commanded_dq).
+        """
+        if self.cfg.action_mode == "head_twist":
+            return self.prev_action[:6].copy()
+        if self.cfg.action_mode == "joint_vel":
+            dq = np.clip(self.prev_action[:self.n_arm_act] * self._joint_v_max(),
+                         -self.cfg.max_joint_speed, self.cfg.max_joint_speed)
+        else:
+            dq = self._commanded_dq()
+        twist = self._head_jacobian() @ dq
+        return np.clip(np.concatenate([twist[:3] / self.cfg.head_v_max, twist[3:] / self.cfg.head_w_max]), -1.0, 1.0)
+
+    def joint_action_for_twist(self, twist_action: np.ndarray) -> np.ndarray:
+        """Joint-mode arm action that sets the servo targets as head_twist mode would for twist_action.
+
+        head_twist smooths the twist (action_ema), maps it to joint velocities dq and sets the targets to
+        q + lead * dq. Here the smoothing is done on dq instead, from the commanded dq: mapping dq back to a twist
+        loses gain to the IK damping, and smoothing multiplies that loss by 5 (strikes then fall short of the goal
+        speed). The result is the raw joint action whose smoothed value moves the targets there (the EMA inverted,
+        as in traces.TraceFollower). Exact unless it clips at +-1, i.e. when the targets have to move by more than
+        about arm_action_scale per step (fast changes of speed: lead is 10 control steps).
+        """
+        cfg, na = self.cfg, self.n_arm_act
+        ema = cfg.action_ema
+        dq = self._twist_dq(np.clip(np.asarray(twist_action, dtype=np.float64)[:6], -1.0, 1.0))
+        if ema > 0:
+            dq = ema * self._commanded_dq() + (1.0 - ema) * dq
+        dq = np.clip(dq, -cfg.max_joint_speed, cfg.max_joint_speed)
+        target = np.clip(self.data.qpos[self.arm_qadr] + dq * self.arm_lead, self.ctrl_lo[:na], self.ctrl_hi[:na])
+        smoothed = (target - self.targets[:na]) / self.act_scale[:na]
+        a = (smoothed - ema * self._a_filt[:na]) / (1.0 - ema) if ema > 0 else smoothed
+        return np.clip(a, -1.0, 1.0)
+
     # ------------------------------------------------------------------ test / debug helpers
-    def debug_set_head_state(self, head_pos, axis, lin_vel) -> None:
-        """Teleports the tool so its head center is at head_pos, head axis along `axis`, moving at lin_vel."""
-        q = mu.quat_from_two_vectors(self.tool.head_axis, axis)
+    def debug_set_head_state(self, head_pos, quat, lin_vel) -> None:
+        """Teleports the tool so its head center is at head_pos, the tool at orientation quat, moving at lin_vel.
+
+        Physical grip only: with weld the grip constraint would pull the tool back to the palm.
+        """
+        q = mu.normalize(quat)
         body_pos = np.asarray(head_pos) - mu.rotate(q, self.tool.head_pos)
         self._set_tool_pose(body_pos, q, linvel=lin_vel)
         mujoco.mj_forward(self.model, self.data)
@@ -574,10 +1372,13 @@ class PoseVelocityEnv(gym.Env):
             from mujoco import viewer  # `import mujoco.viewer` here would shadow the module-level mujoco
 
             if self._viewer is not None and (self._viewer_model is not self.model or not self._viewer.is_running()):
-                self._viewer.close()
-                self._viewer = None
+                self._close_viewer()
             if self._viewer is None:
+                before = set(threading.enumerate())
                 self._viewer = viewer.launch_passive(self.model, self.data)
+                # launch_passive runs the GUI in an un-joined daemon thread; keep it so close() can wait for it.
+                new = [t for t in threading.enumerate() if t not in before]
+                self._viewer_thread = new[0] if new else None
                 self._viewer_model = self.model
                 cam = self._camera()
                 self._viewer.cam.lookat[:] = cam.lookat
@@ -596,10 +1397,18 @@ class PoseVelocityEnv(gym.Env):
             return self._renderer.render()
         return None
 
-    def close(self):
+    def _close_viewer(self):
+        # Handle.close() only requests an exit. Wait for the render thread to finish tearing down its
+        # GL context, otherwise glfw.terminate() (an atexit hook) can run concurrently and segfault.
         if self._viewer is not None:
             self._viewer.close()
             self._viewer = None
+        if self._viewer_thread is not None:
+            self._viewer_thread.join(timeout=5.0)
+            self._viewer_thread = None
+
+    def close(self):
+        self._close_viewer()
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
